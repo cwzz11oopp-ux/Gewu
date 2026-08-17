@@ -1,0 +1,4 @@
+interface:
+  display_name: "假设与实验准入审查"
+  short_description: "Refine hypotheses and gate formal experiments"
+  default_prompt: "Use $hypothesis-experiment-gate to refine this hypothesis and decide whether it is ready for a formal experiment."

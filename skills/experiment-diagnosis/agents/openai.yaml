@@ -1,0 +1,4 @@
+interface:
+  display_name: "Experiment Diagnosis Expert"
+  short_description: "Diagnose failures and apply safe bounded experiment repairs"
+  default_prompt: "Use $experiment-diagnosis to diagnose this experiment failure and apply only safe, bounded repairs."

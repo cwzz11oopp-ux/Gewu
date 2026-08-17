@@ -1,0 +1,4419 @@
+from __future__ import annotations
+
+import inspect
+import hashlib
+import json
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock, RLock
+
+from backend.app.agents.critic import CriticAgent
+from backend.app.agents.diagnostic import ExperimentDiagnosticAgent
+from backend.app.agents.experiment import ExperimentAgent, ExperimentBundleCandidateError
+from backend.app.agents.idea import IdeaAgent
+from backend.app.agents.idea_selection import IdeaSelectionAgent
+from backend.app.agents.planner import PlanningAgent
+from backend.app.agents.reviewer import ValidationDecision
+from backend.app.agents.research import ResearchAgent
+from backend.app.agents.supervisor import Delegation, SupervisorAgent
+from backend.app.agents.writer import ReportFactAuditError, WriterAgent
+from backend.app.models.experiment import ExperimentBundle
+from backend.app.models.provider import EvidenceCard
+from backend.app.providers.experiment import ExperimentProvider
+from backend.app.providers.literature import LiteratureProvider
+from backend.app.providers.llm import LLMProvider, LLMRequestCancelled
+from backend.app.storage.repository import Repository
+from backend.app.storage.literature import LiteratureLibrary
+from backend.app.storage.research_wiki import ResearchWikiStore
+from backend.app.workflow.hypothesis_contract import (
+    MAX_HYPOTHESIS_CANDIDATES,
+    hypothesis_candidate_issues,
+    normalize_candidate,
+    normalize_candidates,
+    normalize_hypothesis_content,
+)
+from backend.app.workflow.idea_selection import (
+    WEIGHTS,
+    normalize_idea_review,
+    weighted_score,
+)
+from backend.app.workflow.dataset_catalog import (
+    canonical_dataset_name_from_text,
+    dataset_card,
+    dataset_display_name,
+    dataset_spec,
+    normalize_dataset_name,
+)
+from backend.app.workflow.dataset_inspection import (
+    contract_canonical_name,
+    dataset_option,
+    inspect_dataset_directory,
+)
+from backend.app.workflow.research_constraints import normalize_constraints
+from backend.app.workflow.phase2_evidence import (
+    baseline_profile,
+    dataset_profile as phase2_dataset_profile,
+    fair_experiment_contract,
+    progressive_protocol,
+    result_evidence,
+    route_result,
+)
+from backend.app.workflow.evidence_audit import (
+    build_evidence_audit,
+)
+from backend.app.workflow.evidence_pipeline import (
+    analyze_research_gaps,
+    candidate_evidence_map,
+    extract_claim_evidence,
+    targeted_queries as candidate_targeted_queries,
+)
+from backend.app.workflow.artifact_lineage import experiment_bundle_ids
+from backend.app.workflow.experiment_code import experiment_validation_issues
+from backend.app.workflow.scientific_integrity import (
+    compile_scientific_contract,
+    scientific_feedback,
+    validate_coverage,
+    validate_split_contract,
+)
+from backend.app.workflow.scientific_evolution import (
+    build_working_hypothesis,
+    detect_disagreement,
+    evolution_decision,
+    normalize_scientific_analysis,
+    synthesize_scientific_conclusion,
+    unavailable_secondary_review,
+)
+from backend.app.workflow.plan_contract import authoritative_plan_contract, normalize_plan
+from backend.app.workflow.policies import competition_export_allowed, normalize_feedback_verdict
+from backend.app.workflow.research_state import build_research_state
+from backend.app.workflow.knowledge import (
+    KnowledgeIntegrationService,
+)
+from backend.app.workflow.prompt_context import (
+    PromptContextBudget,
+    budget_instructions,
+    compact_problem,
+    literature_card,
+    select_units,
+    select_units_bounded,
+)
+from backend.app.workflow.research_synthesis import (
+    build_research_synthesis,
+    build_gap_processing_pipeline,
+    candidate_synthesis_provenance_issues,
+    candidate_code_evidence_provenance_issues,
+    normalize_candidate_code_evidence_provenance,
+    normalize_candidate_synthesis_provenance,
+    representative_paper_ids,
+    stable_paper_id,
+    synthesis_prompt_context,
+)
+from backend.app.workflow.github_source import GitHubSourceInspector
+from backend.app.workflow.scientific_stability import (
+    annotate_dataset_semantics,
+    build_world_state,
+    context_telemetry,
+    infer_research_profile,
+    merge_issue_ledger,
+    next_research_stage,
+    protocol_state,
+    readiness_state,
+    selected_hypothesis_digest,
+    failure_state_for,
+)
+from backend.app.workflow.skill_runtime import RuntimePackage, SkillRuntime, ToolRegistry
+from backend.app.workflow.skills import (
+    EXCLUDED_CATALOG_DIRECTORIES,
+    SkillCatalog,
+    SkillLoader,
+    SkillRegistry,
+)
+from backend.app.workflow.steps import ORDER
+
+
+_STEP_REQUIRED_INPUTS = {
+    "knowledge_integration": ("problem",),
+    "hypothesis_generation": ("problem", "evidence", "research_synthesis"),
+    "evidence_reasoning": ("problem", "evidence", "hypothesis"),
+    "experiment_task": ("plan",),
+    "experiment_run_analysis": ("plan", "experiment_task"),
+    "feedback_revision": ("plan", "experiment_result"),
+}
+
+EVIDENCE_REASONING_PROMPT_VERSION = "v2-claim-evidence-recovery"
+MAX_TARGETED_RETRIEVAL_ROUNDS = 2
+
+
+class WorkflowEngine:
+    universal_scientific_stability = True
+    def __init__(
+        self,
+        repository: Repository,
+        llm_provider: LLMProvider,
+        literature_provider: LiteratureProvider,
+        experiment_provider: ExperimentProvider,
+        skill_loader: SkillLoader | None = None,
+        skill_registry: SkillRegistry | None = None,
+        skill_catalog: SkillCatalog | None = None,
+        supervisor_agent: SupervisorAgent | None = None,
+        skill_runtime: SkillRuntime | None = None,
+        knowledge_service: KnowledgeIntegrationService | None = None,
+        competition_mode: bool = False,
+        max_feedback_iterations: int = 4,
+        max_deepseek_plan_revision: int = 2,
+        github_source_inspector: GitHubSourceInspector | None = None,
+    ) -> None:
+        self.repository = repository
+        self.llm_provider = llm_provider
+        self.literature_provider = literature_provider
+        self.experiment_provider = experiment_provider
+        self.competition_mode = competition_mode
+        self.max_feedback_iterations = max(1, int(max_feedback_iterations))
+        self.max_deepseek_plan_revision = max(0, int(max_deepseek_plan_revision))
+        self.github_source_inspector = github_source_inspector or GitHubSourceInspector()
+        self._run_locks: dict[str, RLock] = {}
+        self._run_locks_guard = Lock()
+        data_root = Path(self.repository.store.data_dir)
+        self.knowledge_service = knowledge_service or KnowledgeIntegrationService(
+            ResearchWikiStore(data_root / "research-wiki"),
+            LiteratureLibrary(data_root / "literature"),
+            literature_provider,
+        )
+        self._skill_loader = skill_loader or SkillLoader(Path(__file__).resolve().parents[3])
+        self.skill_registry = skill_registry or SkillRegistry()
+        self.skill_catalog = skill_catalog or SkillCatalog(self._skill_loader)
+        self.research_agent = ResearchAgent(llm_provider)
+        self.hypothesis_agent = IdeaAgent(llm_provider)
+        self.idea_selection_agent = IdeaSelectionAgent(llm_provider)
+        self.planning_agent = PlanningAgent(llm_provider)
+        self.experiment_agent = ExperimentAgent(experiment_provider, llm_provider)
+        self.diagnostic_agent = ExperimentDiagnosticAgent(llm_provider)
+        self.critic_agent = CriticAgent(llm_provider)
+        self.writer_agent = WriterAgent(llm_provider)
+        self.tool_registry = self._build_tool_registry()
+        self.configured_tools = self.tool_registry.names()
+        self.skill_runtime = skill_runtime or SkillRuntime(
+            self._skill_loader,
+            self.skill_registry,
+            self.tool_registry,
+        )
+        self.supervisor_agent = supervisor_agent or SupervisorAgent(self.skill_registry)
+
+    @property
+    def skill_loader(self) -> SkillLoader:
+        return self._skill_loader
+
+    @skill_loader.setter
+    def skill_loader(self, loader: SkillLoader) -> None:
+        self._skill_loader = loader
+        self.skill_catalog = SkillCatalog(loader)
+        self.skill_runtime = SkillRuntime(loader, self.skill_registry, self.tool_registry)
+        reviewer = getattr(self.supervisor_agent, "reviewer", None)
+        self.supervisor_agent = SupervisorAgent(self.skill_registry, reviewer)
+
+    def _run_lock(self, run_id: str) -> RLock:
+        with self._run_locks_guard:
+            return self._run_locks.setdefault(run_id, RLock())
+
+    def run_step(self, run_id: str, step_id: str):
+        with self._run_lock(run_id):
+            if step_id not in ORDER:
+                raise ValueError(f"UNKNOWN_WORKFLOW_STEP:{step_id}")
+            if step_id == "feedback_revision":
+                existing = self.repository.get_run(run_id)
+                latest = self._latest_by_type(existing.artifacts)
+                if self._result_already_reviewed(
+                    existing.artifacts, latest.get("experiment_result")
+                ):
+                    return existing
+            begin_run = getattr(self.llm_provider, "begin_run", None)
+            end_run = getattr(self.llm_provider, "end_run", None)
+            if callable(begin_run):
+                begin_run(run_id)
+            try:
+                self.repository.update_step_state(run_id, step_id, "running")
+                try:
+                    if self.repository.get_run(run_id).stop_requested:
+                        raise LLMRequestCancelled()
+                    self._run_step(run_id, step_id)
+                except LLMRequestCancelled as exc:
+                    self.repository.update_step_state(
+                        run_id,
+                        step_id,
+                        "interrupted",
+                        error={"code": "PIPELINE_STOPPED", "message": str(exc)},
+                    )
+                    raise
+                except Exception as exc:
+                    self.repository.update_step_state(
+                        run_id,
+                        step_id,
+                        "failed",
+                        error={"code": str(exc).split(":", 1)[0], "message": str(exc)},
+                    )
+                    raise
+                self.repository.update_step_state(run_id, step_id, "completed")
+                return self.repository.get_run(run_id)
+            finally:
+                if callable(end_run):
+                    end_run(run_id)
+
+    def cancel(self, run_id: str) -> bool:
+        cancel_run = getattr(self.llm_provider, "cancel_run", None)
+        return bool(cancel_run(run_id)) if callable(cancel_run) else False
+
+    def preflight_run(self, run_id: str) -> dict:
+        """Persist a secret-free admission result without running a workflow step."""
+        run = self.repository.get_run(run_id)
+        checks = []
+        def add(name, ok, code="", detail=""):
+            checks.append({"name": name, "ok": bool(ok), "code": code, "detail": detail})
+        settings = getattr(self.experiment_provider, "settings", None)
+        mode = getattr(self.llm_provider, "mode", "")
+        def provider_check(provider_id: str):
+            if mode == "mock":
+                add(provider_id, True, "MOCK_MODE", "Development mock provider; no external request was made.")
+                return
+            try:
+                result = self.llm_provider.preflight(provider_id)
+                add(provider_id, True, "AVAILABLE", f"model={result.get('model', 'configured')}; structured_request=passed")
+            except Exception as exc:
+                detail = str(exc)
+                for secret in (getattr(settings, "qwen_api_key", ""), getattr(settings, "deepseek_api_key", "")):
+                    if secret:
+                        detail = detail.replace(str(secret), "[REDACTED]")
+                add(provider_id, False, detail.split(":", 1)[0], detail[:500])
+        provider_check("qwen")
+        provider_check("deepseek")
+        try:
+            profile = self._inspect_configured_local_dataset(run)
+            add("dataset", True, detail=(profile or {}).get("contract_id", "configured"))
+        except Exception as exc:
+            add("dataset", False, str(exc).split(":", 1)[0], str(exc))
+        status = getattr(settings, "provider_status", lambda: {})()
+        experiment = status.get("experiment", {}) if isinstance(status, dict) else {}
+        add("experiment_environment", bool(experiment.get("ready", True)), str(experiment.get("code") or ""))
+        if run.github_repository_url:
+            inspected = self.github_source_inspector.inspect(run.github_repository_url)
+            add("repository", inspected.github_source_status == "parsed", inspected.github_source_status, "; ".join(inspected.warnings[:3]))
+        else:
+            add("repository", True, "NOT_PROVIDED")
+        payload = {"schema_version": 1, "run_id": run_id, "blocking": not all(item["ok"] for item in checks), "checks": checks}
+        self.repository.add_artifact(run_id, "run_preflight", "Run Preflight", payload, "preflight", "Foundation Preflight")
+        return payload
+
+    def _ensure_research_constraints(self, run_id: str):
+        run = self.repository.get_run(run_id)
+        if run.research_constraints_artifact_id:
+            return self.repository.get_artifact(run_id, run.research_constraints_artifact_id)
+        artifact = self.repository.add_artifact(run_id, "research_constraints", "Frozen Research Constraints", normalize_constraints(run.research_constraints, run.constraints), "preflight", "Foundation Preflight")
+        run = self.repository.get_run(run_id)
+        run.research_constraints_artifact_id = artifact.id
+        self.repository.save_run(run)
+        return artifact
+
+    def _set_artifact_fields(self, run_id: str, artifact_id: str, **fields) -> None:
+        """Persist post-creation lineage identities without replacing history."""
+        current = self.repository.get_run(run_id)
+        artifact = next(item for item in current.artifacts if item.id == artifact_id)
+        artifact.content.update(fields)
+        self.repository.save_run(current)
+
+    def _persist_scientific_world_state(self, run_id: str, run, profile: dict, dataset: dict,
+                                        protocol: dict, readiness: dict, stage: str,
+                                        issue_ledger: list[dict]) -> None:
+        world = build_world_state(run=run, profile=profile, dataset=dataset, protocol=protocol,
+                                  readiness=readiness, stage=stage, issue_ledger=issue_ledger)
+        current = self.repository.get_run(run_id)
+        current.scientific_world_state = world
+        self.repository.save_run(current)
+        self.repository.add_artifact(run_id, "scientific_world_state", "Scientific World State", world,
+                                     "research_plan", "Scientific Stability Engine")
+
+    def _run_step(self, run_id: str, step_id: str):
+        if step_id not in ORDER:
+            raise ValueError(f"UNKNOWN_WORKFLOW_STEP:{step_id}")
+        self.skill_registry.assignment_for(step_id)
+        run = self.repository.get_run(run_id)
+        if self._has_locked_output(run.artifacts, step_id):
+            self.repository.append_event(
+                run_id,
+                step_id,
+                self.supervisor_agent.name,
+                "Skipped step because locked artifacts already exist.",
+                provider_mode=self.llm_provider.mode,
+                fallback_used=self.llm_provider.fallback,
+                fallback_reason="Mock LLM development fallback." if self.llm_provider.fallback else "",
+            )
+            return self.repository.get_run(run_id)
+
+        latest = self._latest_by_type(run.artifacts)
+        if step_id == "feedback_revision" and self._result_already_reviewed(
+            run.artifacts, latest.get("experiment_result")
+        ):
+            return run
+        if step_id == "report_export":
+            if latest.get("report") is not None:
+                return run
+            self._require_report_readiness(run.artifacts, latest)
+        self._require_step_inputs(step_id, latest)
+        state = self._skill_state(step_id, latest)
+        delegation = self.supervisor_agent.delegate(step_id, state)
+        package = self.skill_runtime.prepare(
+            step_id,
+            delegation.agent_id,
+            self.configured_tools,
+            state,
+        )
+        instructions = package.instructions
+        skill_calls = [delegation.tool_call, self._runtime_call(package)]
+        if step_id == "problem_understanding":
+            self.supervisor_agent.require_agent(delegation, "research")
+            dataset_profile_artifact = latest.get("dataset_profile")
+            dataset_profile = (
+                dataset_profile_artifact.content
+                if dataset_profile_artifact is not None
+                else self._inspect_configured_local_dataset(run)
+            )
+            if dataset_profile is not None and dataset_profile.get("dataset_profile_version") != 2:
+                dataset_profile = phase2_dataset_profile(
+                    dataset_profile, normalize_constraints(run.research_constraints, run.constraints)
+                )
+            if dataset_profile is not None and dataset_profile_artifact is None:
+                dataset_profile_artifact = self.repository.add_artifact(
+                    run_id,
+                    "dataset_profile",
+                    "Verified Local Dataset Profile",
+                    dataset_profile,
+                    "dataset_inspection",
+                    "Dataset Inspector",
+                )
+                self.repository.lock_artifact(
+                    run_id, dataset_profile_artifact.id, True
+                )
+                self.repository.append_event(
+                    run_id,
+                    "dataset_inspection",
+                    "Dataset Inspector",
+                    "Inspected and locked the configured local dataset before hypothesis generation.",
+                    data={
+                        "contract_id": dataset_profile["contract_id"],
+                        "root": dataset_profile["root"],
+                        "file_count": dataset_profile["file_count"],
+                        "content_fingerprint": dataset_profile["content_fingerprint"],
+                    },
+                    output_summary={
+                        "inspection_status": dataset_profile["inspection_status"],
+                        "schemas": dataset_profile["schemas"],
+                    },
+                )
+            dataset_instruction = ""
+            if dataset_profile is not None:
+                dataset_instruction = (
+                    "\n\n## Authoritative local dataset\n"
+                    "The dataset_profile included with the structured problem was produced from "
+                    "the user's selected local directory. Treat it as immutable ground truth. "
+                    "Do not replace it with a public, synthetic, image, or fallback dataset."
+                )
+            content = self._produce_validated(
+                run_id,
+                step_id,
+                lambda revision: self.research_agent.structure_problem(
+                    run.problem_input,
+                    instructions=self._with_revision(
+                        f"{instructions}{dataset_instruction}", revision
+                    ),
+                ),
+            )
+            if dataset_profile is not None:
+                content["dataset_profile"] = dataset_profile
+            self.repository.add_artifact(
+                run_id, "problem", "Structured Problem", content, step_id, self.research_agent.name
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.research_agent.name,
+                "Structured problem input.",
+                {"problem_input": run.problem_input},
+                content,
+                skill_calls=skill_calls,
+            )
+        elif step_id == "knowledge_integration":
+            self.supervisor_agent.require_agent(delegation, "research")
+            self._require_tools(
+                package,
+                "query_wiki",
+                "search_local_literature",
+                "literature_search",
+            )
+            problem = latest["problem"].content
+            result_box = {}
+
+            def collect_evidence(_revision):
+                result_box["result"] = self.knowledge_service.collect(run_id, problem)
+                return result_box["result"].model_dump()
+
+            output = self._produce_validated(run_id, step_id, collect_evidence)
+            result = result_box["result"]
+            self.repository.add_artifact(
+                run_id, "evidence", "Verified Evidence", output, step_id, self.research_agent.name
+            )
+            # `references` is the complete exportable collection.  Older/mock
+            # providers may expose only core cards, so retain that historical
+            # compatibility without applying a new positional truncation.
+            synthesis_sources = list(result.references or result.core_references)
+            synthesis = build_research_synthesis(synthesis_sources)
+            synthesis["literature_coverage"] = deepcopy(result.literature_coverage)
+            github_source = None
+            if run.github_repository_url:
+                github_source = self.github_source_inspector.inspect(run.github_repository_url)
+                github_content = github_source.model_dump()
+                self.repository.add_artifact(
+                    run_id, "github_source", "GitHub Source Inspection", github_content,
+                    step_id, "GitHub Source Inspector",
+                )
+                if github_source.github_source_status == "parsed":
+                    synthesis["code_evidence"] = github_source.code_evidence
+                    self.repository.add_artifact(
+                        run_id, "code_evidence", "GitHub Code Evidence",
+                        {"repository_url": github_source.repository_url, "repository_commit": github_source.repository_commit,
+                         "items": github_source.code_evidence},
+                        step_id, "GitHub Source Inspector",
+                    )
+            synthesis["hypothesis_gap_processing"] = build_gap_processing_pipeline(synthesis)
+            self.repository.add_artifact(
+                run_id,
+                "research_synthesis",
+                "Research Synthesis",
+                synthesis,
+                step_id,
+                self.research_agent.name,
+            )
+            if result.wiki_changes.papers or result.wiki_changes.gaps or result.wiki_changes.edges:
+                self.supervisor_agent.commit_wiki_changes(
+                    result.wiki_changes, self.knowledge_service.wiki
+                )
+            self._trace(
+                run_id,
+                step_id,
+                self.research_agent.name,
+                f"Collected {len(result.references)} verified references.",
+                {"queries": problem.get("literature_queries") or [run.problem_input]},
+                {
+                    **output,
+                    "research_synthesis": {
+                        "paper_count": synthesis["source_collection"]["paper_count"],
+                        "theme_count": len(synthesis["themes"]),
+                        "gap_count": len(synthesis["research_gaps"]),
+                        "future_work_count": len(synthesis["future_work"]),
+                        "github_source_status": github_source.github_source_status if github_source else "not_provided",
+                        "code_evidence_count": len(synthesis.get("code_evidence") or []),
+                    },
+                },
+                tool_calls=[
+                    {
+                        "provider": call["source"],
+                        "method": "search" if call["source"] != "wiki" else "query",
+                        "query": call["query"],
+                    }
+                    for call in result.sources["calls"]
+                ],
+                skill_calls=skill_calls,
+            )
+        elif step_id == "hypothesis_generation":
+            self.supervisor_agent.require_agent(delegation, "idea")
+            problem = latest["problem"].content
+            dataset_profile = (
+                latest["dataset_profile"].content
+                if latest.get("dataset_profile")
+                else problem.get("dataset_profile")
+            )
+            evidence_content = latest["evidence"].content
+            synthesis = latest["research_synthesis"].content
+            source_cards = list(
+                evidence_content.get("references")
+                or evidence_content.get("core_references")
+                or []
+            )
+            cards_by_id = {
+                stable_paper_id(card, index): card
+                for index, card in enumerate(source_cards)
+                if isinstance(card, dict)
+            }
+            representative_ids = representative_paper_ids(synthesis)
+            representative_cards = [cards_by_id[paper_id] for paper_id in representative_ids if paper_id in cards_by_id]
+            # Historical/mock artifacts can legitimately lack cards that the new
+            # synthesis schema can identify.  This fallback is collection-wide,
+            # never an index pairing and never used when synthesis is available.
+            if not representative_cards and not (synthesis.get("source_collection") or {}).get("paper_count"):
+                representative_cards = source_cards
+            context_budget = PromptContextBudget()
+            evidence = select_units(
+                [literature_card(card) for card in representative_cards],
+                context_budget.max_reference_chars,
+            )
+            synthesis_context = synthesis_prompt_context(synthesis)
+            round_metadata = self._next_hypothesis_round(run, latest)
+            revision_context = self._hypothesis_revision_context(run, round_metadata)
+            if revision_context:
+                synthesis_context["revision_context"] = revision_context
+            raw_box = {}
+            hypothesis_instructions = budget_instructions(instructions, context_budget)
+            if dataset_profile:
+                hypothesis_instructions = (
+                    f"{instructions}\n\n## Mandatory dataset binding\n"
+                    f"Generate hypotheses only for dataset contract "
+                    f"{dataset_profile['contract_id']} at {dataset_profile['root']}. "
+                    "Every candidate must be compatible with the observed file schemas and must "
+                    "not propose another dataset or synthetic replacement."
+                )
+
+            def generate_hypothesis(revision):
+                raw = self.hypothesis_agent.generate(
+                    compact_problem(problem),
+                    evidence,
+                    research_synthesis=synthesis_context,
+                    instructions=self._with_revision(
+                        hypothesis_instructions, revision
+                    ),
+                )
+                raw_box["raw"] = raw
+                normalized = self._normalize_nonempty_hypothesis(raw)
+                code_provenance_issues = candidate_code_evidence_provenance_issues(
+                    normalized["candidates"], synthesis
+                )
+                normalized["candidates"] = [
+                    normalize_candidate_code_evidence_provenance(
+                        normalize_candidate_synthesis_provenance(candidate, synthesis), synthesis
+                    ) for candidate in normalized["candidates"]
+                ]
+                provenance_issues = candidate_synthesis_provenance_issues(
+                    normalized["candidates"], synthesis
+                ) + code_provenance_issues
+                if provenance_issues:
+                    normalized["_validation_issues"] = provenance_issues
+                return normalized
+
+            try:
+                hypothesis = self._produce_validated(run_id, step_id, generate_hypothesis)
+            except ValueError:
+                if "raw" in raw_box:
+                    self.repository.append_event(
+                        run_id,
+                        step_id,
+                        self.hypothesis_agent.name,
+                        "Hypothesis generation returned no usable candidates.",
+                        data={"raw_output": raw_box["raw"], "representative_evidence_count": len(evidence)},
+                        output_summary={"accepted": False},
+                        provider_mode=self.llm_provider.mode,
+                        fallback_used=self.llm_provider.fallback,
+                        fallback_reason=(
+                            "Mock LLM development fallback." if self.llm_provider.fallback else ""
+                        ),
+                    )
+                raise
+            hypothesis["hypothesis_round"] = {
+                **round_metadata,
+                "created_candidate_ids": [
+                    str(candidate.get("candidate_id") or "")
+                    for candidate in hypothesis["candidates"]
+                ],
+            }
+            hypothesis_artifact = self.repository.add_artifact(
+                run_id,
+                "hypothesis",
+                f"Candidate Hypothesis · Round {round_metadata['round_index']}",
+                hypothesis,
+                step_id,
+                self.hypothesis_agent.name,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.hypothesis_agent.name,
+                "Generated verifiable hypothesis.",
+                {
+                    "synthesis_paper_count": (synthesis.get("source_collection") or {}).get("paper_count", 0),
+                    "synthesis_theme_count": len(synthesis.get("themes") or []),
+                    "synthesis_gap_count": len(synthesis.get("research_gaps") or []),
+                    "gap_processing": synthesis_context.get("gap_processing") or {},
+                    "round": hypothesis["hypothesis_round"],
+                    "representative_evidence_count": len(evidence),
+                },
+                hypothesis,
+                skill_calls=skill_calls,
+            )
+        elif step_id == "evidence_reasoning":
+            self.supervisor_agent.require_agent(delegation, "critic")
+            problem = latest["problem"].content
+            candidates = normalize_candidates(
+                latest["hypothesis"].content.get("candidates") or []
+            )
+            if not candidates:
+                raise ValueError("HYPOTHESIS_CANDIDATES_EMPTY")
+            all_evidence = list(latest["evidence"].content["references"])
+            focused_evidence = self._focused_evidence_for_candidates(
+                all_evidence, candidates
+            )
+            context_budget = PromptContextBudget()
+            evidence = select_units(
+                [literature_card(card) for card in focused_evidence],
+                context_budget.max_reference_chars,
+            )
+            compact_scientific_problem = compact_problem(problem)
+            review_box = {}
+            evidence_set_hash = self._stable_hash(evidence)
+            candidate_ids = [self._stable_hash(candidate)[:16] for candidate in candidates]
+
+            def reason_about_evidence(revision):
+                evidence_audit = build_evidence_audit(evidence, candidates)
+                evidence_audit["policy"]["enforced"] = not self.llm_provider.fallback
+                registry_ids = [
+                    item["evidence_id"] for item in evidence_audit["registry"]
+                ]
+                candidate_audits = {
+                    item["candidate_index"]: {
+                        **item,
+                        "registry_evidence_ids": registry_ids,
+                    }
+                    for item in evidence_audit["candidate_audits"]
+                }
+                review_audit = {
+                    "policy": deepcopy(evidence_audit["policy"]),
+                    "registry": [
+                        {
+                            key: deepcopy(entry[key])
+                            for key in ("evidence_id", "title", "verified")
+                        }
+                        for entry in evidence_audit["registry"]
+                    ],
+                    "candidate_audits": deepcopy(evidence_audit["candidate_audits"]),
+                }
+                revised_instructions = budget_instructions(
+                    self._with_revision(instructions, revision), context_budget
+                )
+                review = self._load_idea_review_checkpoint(
+                    run_id, candidate_ids, evidence_set_hash, candidates
+                )
+                raw_review = None
+                issues: list[str] = []
+                for format_attempt in range(3 if review is None else 0):
+                    format_feedback = ""
+                    if issues:
+                        format_feedback = (
+                            "\n\n## Mandatory JSON shape correction\n"
+                            + "\n".join(f"- {issue}" for issue in issues)
+                            + f"\nReturn a top-level evaluations array with exactly "
+                            f"{len(candidates)} entries indexed 0..{len(candidates) - 1}. "
+                            "Do not wrap it in idea_selection_review. Do not return an "
+                            "active_hypothesis, recommendations, or a selected index."
+                        )
+                    raw_review = self.idea_selection_agent.review(
+                        compact_scientific_problem,
+                        run.constraints,
+                        evidence,
+                        candidates,
+                        review_audit,
+                        instructions=f"{revised_instructions}{format_feedback}",
+                    )
+                    try:
+                        review = normalize_idea_review(raw_review, candidates)
+                        self.repository.add_artifact(
+                            run_id,
+                            "idea_review_checkpoint",
+                            "Validated Idea Review Checkpoint",
+                            {
+                                "prompt_version": EVIDENCE_REASONING_PROMPT_VERSION,
+                                "evidence_set_hash": evidence_set_hash,
+                                "candidate_ids": candidate_ids,
+                                "review": review,
+                            },
+                            step_id,
+                            self.idea_selection_agent.name,
+                        )
+                        break
+                    except ValueError as exc:
+                        if not str(exc).startswith("IDEA_SELECTION_OUTPUT_INVALID"):
+                            raise
+                        issues = [
+                            str(exc),
+                            (
+                                f"Return exactly {len(candidates)} evaluations, one for each "
+                                "candidate_index, and make evidence_ledger/closest_prior_work/"
+                                "risks/unknowns arrays, gates/scores/mde objects."
+                            ),
+                        ]
+                        self.repository.append_event(
+                            run_id,
+                            step_id,
+                            self.idea_selection_agent.name,
+                            "Idea selection review returned invalid output.",
+                            data={
+                                "raw_review": raw_review,
+                                "candidate_count": len(candidates),
+                                "format_attempt": format_attempt + 1,
+                                "format_attempt_limit": 3,
+                            },
+                            output_summary={
+                                "accepted": False,
+                                "issues": issues,
+                                "retry_scope": "format",
+                            },
+                            provider_mode=self.llm_provider.mode,
+                            fallback_used=self.llm_provider.fallback,
+                            fallback_reason=(
+                                "Mock LLM development fallback."
+                                if self.llm_provider.fallback
+                                else ""
+                            ),
+                        )
+                if review is None:
+                    return {
+                        "_validation_issues": issues,
+                        "raw_review": raw_review,
+                    }
+                assessments = []
+                revision_issues: list[str] = []
+                for index, hypothesis in enumerate(candidates):
+                    candidate_issue_count = len(revision_issues)
+                    evaluation = review["evaluations"][index]
+                    decision = str(evaluation.get("decision") or "")
+                    candidate_audit = deepcopy(candidate_audits.get(index) or {})
+                    candidate_audit["registry"] = deepcopy(
+                        evidence_audit["registry"]
+                    )
+                    candidate_audit["candidate_audit"] = {
+                        key: deepcopy(value)
+                        for key, value in candidate_audit.items()
+                        if key != "registry"
+                    }
+                    revision_required = decision in {"REVISE", "PIVOT"}
+                    critic_instruction = (
+                        f"{revised_instructions}\n\n## Mandatory decision completion\n"
+                        f"The idea review decision for this candidate is {decision}. "
+                    )
+                    if revision_required:
+                        critic_instruction += (
+                            "Return a fully rewritten, directly selectable revised_hypothesis. "
+                            "It must materially change the claim and include non-empty claim, "
+                            "verifiability, novelty_basis, and risks. Apply every necessary "
+                            "change now; do not return recommendations for a future edit."
+                        )
+                    else:
+                        critic_instruction += (
+                            "Return the complete selectable hypothesis when it is verified. "
+                            "Do not leave unapplied editing recommendations."
+                        )
+                    checkpoint = self._load_candidate_checkpoint(
+                        run_id,
+                        index,
+                        candidate_ids[index],
+                        evidence_set_hash,
+                        hypothesis,
+                        evaluation,
+                    )
+                    if checkpoint is not None:
+                        assessments.append(checkpoint)
+                        continue
+                    critic_reasoning = self.critic_agent.evidence_reasoning(
+                        hypothesis,
+                        evidence,
+                        evidence_audit=candidate_audit,
+                        evaluation=evaluation,
+                        instructions=critic_instruction,
+                    )
+                    assessment = self._candidate_assessment(
+                        index,
+                        hypothesis,
+                        evaluation,
+                        critic_reasoning,
+                        candidate_audit,
+                        enforce_evidence_gate=not self.llm_provider.fallback,
+                    )
+                    assessment["recommendation"] = decision
+                    if revision_required:
+                        revised = assessment["revised_hypothesis"]
+                        missing_fields = []
+                        if not str(revised.get("claim") or "").strip():
+                            missing_fields.append("claim")
+                        if not str(revised.get("verifiability") or "").strip():
+                            missing_fields.append("verifiability")
+                        for field in ("novelty_basis", "risks"):
+                            if not isinstance(revised.get(field), list):
+                                missing_fields.append(field)
+                        if not assessment["was_revised"]:
+                            revision_issues.append(
+                                f"HYPOTHESIS_REVISION_REQUIRED:candidate={index}"
+                            )
+                        elif missing_fields:
+                            revision_issues.append(
+                                "HYPOTHESIS_REVISION_INCOMPLETE:"
+                                f"candidate={index}:missing={','.join(missing_fields)}"
+                            )
+                        elif not assessment["revision_reason"].strip():
+                            revision_issues.append(
+                                f"HYPOTHESIS_REVISION_REASON_REQUIRED:candidate={index}"
+                            )
+                    if len(revision_issues) == candidate_issue_count:
+                        self.repository.add_artifact(
+                            run_id,
+                            "candidate_reasoning_checkpoint",
+                            f"Candidate Reasoning Checkpoint {index + 1}",
+                            {
+                                "candidate_index": index,
+                                "candidate_id": candidate_ids[index],
+                                "prompt_version": EVIDENCE_REASONING_PROMPT_VERSION,
+                                "evidence_set_hash": evidence_set_hash,
+                                "assessment": assessment,
+                            },
+                            step_id,
+                            self.critic_agent.name,
+                        )
+                    assessments.append(assessment)
+                if revision_issues:
+                    return {
+                        "_validation_issues": revision_issues,
+                        "candidate_assessments": assessments,
+                    }
+                recovery = self._recover_candidate_evidence(
+                    run_id=run_id,
+                    candidates=candidates,
+                    assessments=assessments,
+                    evidence_cards=focused_evidence,
+                    instructions=revised_instructions,
+                )
+                assessments = recovery["assessments"]
+                recovered_cards = recovery["evidence_cards"]
+                claim_registry = extract_claim_evidence(recovered_cards)
+                research_gaps = analyze_research_gaps(claim_registry)
+                for index, assessment in enumerate(assessments):
+                    candidate = candidates[index]
+                    assessment["candidate_evidence_map"] = candidate_evidence_map(
+                        candidate, claim_registry, research_gaps
+                    )
+                    assessment["critic_decision"] = self._critic_decision(assessment)
+                    if assessment["critic_decision"] == "TARGETED_RETRIEVAL":
+                        assessment["recommendation"] = "TARGETED_RETRIEVAL"
+                review_box["review"] = review
+                return {
+                    "literature_registry": recovered_cards,
+                    "evidence_registry": claim_registry,
+                    "research_gaps": research_gaps,
+                    "evidence_policy": evidence_audit["policy"],
+                    "targeted_retrieval": recovery["summary"],
+                    "candidate_evidence_maps": [
+                        assessment["candidate_evidence_map"] for assessment in assessments
+                    ],
+                    "unverified_citations": [
+                        {
+                            "candidate_id": item["candidate_evidence_map"]["candidate_id"],
+                            "citations": item["candidate_evidence_map"]["unverified_claims"],
+                        }
+                        for item in assessments
+                        if item["candidate_evidence_map"]["unverified_claims"]
+                    ],
+                    "candidate_assessments": assessments,
+                    "selection_required": True,
+                    "selection_status": "awaiting_selection",
+                    "selection_guidance": (
+                        "Evidence reasoning is complete. A human must choose one candidate "
+                        "before research planning can continue."
+                    ),
+                }
+
+            reasoning = self._produce_validated(run_id, step_id, reason_about_evidence)
+            hypothesis_round = deepcopy((latest["hypothesis"].content.get("hypothesis_round") or {}))
+            reasoning["hypothesis_round"] = hypothesis_round
+            review = review_box["review"]
+            review_content = {"evaluations": review["evaluations"], "weights": WEIGHTS}
+            review_content["hypothesis_round"] = hypothesis_round
+            self.repository.add_artifact(
+                run_id,
+                "idea_review",
+                "Evidence-Reasoned Idea Review",
+                review_content,
+                step_id,
+                self.idea_selection_agent.name,
+            )
+            self.repository.add_artifact(
+                run_id,
+                "reasoning",
+                "Evidence Reasoning",
+                reasoning,
+                step_id,
+                self.critic_agent.name,
+                parent_artifact_id=latest["hypothesis"].id,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.critic_agent.name,
+                "Reviewed every candidate and paused for human hypothesis selection.",
+                {"candidate_count": len(candidates), "evidence_count": len(evidence)},
+                reasoning,
+                skill_calls=skill_calls,
+            )
+        elif step_id == "research_plan":
+            self.supervisor_agent.require_agent(delegation, "planning")
+            selection = self._require_evidence_reasoned_hypothesis_selection(latest)
+            reasoning_content = latest.get("reasoning").content if latest.get("reasoning") else {}
+            selected_index = (selection.get("selected_indexes") or [None])[0]
+            selected_id = str(((selection.get("selected") or [{}])[0]).get("candidate_id") or "")
+            selected_assessment = next(
+                (item for item in (reasoning_content.get("candidate_assessments") or [])
+                 if isinstance(item, dict) and (item.get("candidate_index") == selected_index or item.get("candidate_id") == selected_id)),
+                {},
+            )
+            dataset_profile = (
+                latest["dataset_profile"].content
+                if latest.get("dataset_profile")
+                else None
+            )
+            profile = infer_research_profile(
+                run.problem_input, dataset_present=dataset_profile is not None,
+                evidence=latest.get("evidence").content if latest.get("evidence") else None,
+            )
+            dataset_state = annotate_dataset_semantics(dataset_profile) if dataset_profile else {}
+            protocol = protocol_state(
+                objective=str(((selection.get("selected") or [{}])[0]).get("claim") or run.problem_input),
+                profile=profile,
+                literature=latest.get("evidence").content if latest.get("evidence") else {},
+                dataset=dataset_state,
+                code=latest.get("code_evidence").content if latest.get("code_evidence") else {},
+                stage="VERIFY",
+            )
+            readiness = readiness_state(assessment=selected_assessment, dataset=dataset_state, protocol=protocol, profile=profile)
+            stage = next_research_stage(readiness, profile)
+            if readiness["state"] in {"needs_evidence", "scientifically_infeasible"}:
+                requirement = {
+                    "readiness": readiness, "research_profile": profile, "protocol_state": protocol,
+                    "current_research_stage": stage, "selected_hypothesis": selection.get("selected") or [],
+                }
+                self.repository.add_artifact(run_id, "hypothesis_readiness", "Hypothesis Readiness Gate", requirement,
+                                             step_id, "Scientific Stability Gate", parent_artifact_id=latest["hypothesis_selection"].id)
+                self.repository.update_workflow_state(
+                    run_id,
+                    status="NEEDS_EVIDENCE" if readiness["state"] == "needs_evidence" else "HYPOTHESIS_REJECTED",
+                    current_step="research_plan", automatic=False, stop_requested=False,
+                )
+                self._persist_scientific_world_state(run_id, run, profile, dataset_state, protocol, readiness, stage, [])
+                return
+            dataset_options = (
+                [dataset_option(dataset_profile)]
+                if dataset_profile
+                else self._dataset_options()
+            )
+
+            def build_plan(revision):
+                candidate = normalize_plan(
+                    self.planning_agent.build_plan(
+                        selection,
+                        instructions=self._with_revision(instructions, revision),
+                        dataset_options=dataset_options,
+                        plan_context={
+                            "authoritative_plan_contract": authoritative_plan_contract(),
+                            "dataset_profile": dataset_profile or {},
+                            "run_constraints": run.constraints,
+                            "research_profile": profile,
+                            "protocol_state": protocol,
+                            "readiness_state": readiness,
+                            "current_research_stage": stage,
+                            "available_split_information": {
+                                "dataset_card": (dataset_options[0].get("card") if dataset_options else {}),
+                                "existing_split_contract": {},
+                            },
+                        },
+                    ),
+                    selection,
+                    provider_mode=self.llm_provider.mode,
+                    fallback_used=self.llm_provider.fallback,
+                )
+                if dataset_profile:
+                    candidate = self._bind_plan_to_dataset(
+                        candidate, dataset_profile
+                    )
+                candidate["scientific_contract"] = compile_scientific_contract(
+                    run.problem_input,
+                    selection.get("selected") or [],
+                    candidate,
+                )
+                candidate["scientific_integrity_issues"] = [
+                    *validate_coverage(candidate["scientific_contract"]),
+                    *validate_split_contract(candidate.get("split_contract") or (candidate.get("dataset") or {}).get("split_contract") or {}),
+                ]
+                candidate["research_profile"] = profile
+                candidate["protocol_state"] = protocol
+                candidate["readiness_state"] = readiness
+                candidate["research_stage"] = stage
+                issues = self._plan_dataset_issues(candidate, dataset_options)
+                if issues:
+                    return {**candidate, "_validation_issues": issues}
+                return self._attach_dataset_card(candidate, dataset_options)
+
+            plan = self._produce_validated(run_id, step_id, build_plan)
+            constraints_reference = {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1}
+            plan["research_constraints_artifact_id"] = constraints_reference["artifact_id"]
+            plan["research_constraints_reference"] = constraints_reference
+            plan_candidate = self.repository.add_artifact(
+                run_id, "research_plan_candidate", "Research Plan Candidate Round 1",
+                {"plan_id": "", "round_index": 1, "parent_plan_id": "", "research_stage": stage,
+                 "normalized_plan": deepcopy(plan), "research_constraints_reference": constraints_reference, "provider": self.llm_provider.mode,
+                 "model": "planning.build_plan", "request_chars": 0, "response_metadata": {}, "status": "review_pending"},
+                step_id, self.planning_agent.name, parent_artifact_id=latest["hypothesis_selection"].id,
+            )
+            # The generated artifact ID is the authoritative plan identity.
+            self._set_artifact_fields(run_id, plan_candidate.id, plan_id=plan_candidate.id)
+            review_context = self._research_plan_review_context(
+                run, latest, selection, plan, dataset_options
+            )
+            review = None
+            review_failure = None
+            issue_ledger: list[dict] = []
+            for review_round in range(self.max_deepseek_plan_revision + 1):
+                try:
+                    review = self._normalize_plan_review(
+                        self.planning_agent.review_plan(review_context, instructions=instructions)
+                    )
+                except LLMRequestCancelled:
+                    raise
+                except Exception as exc:
+                    review_failure = self._plan_review_failure(exc, review_round + 1)
+                    self.repository.add_artifact(
+                        run_id, "failure_record", "Research Plan Review Failure",
+                        review_failure, step_id, "ModelCallReliability",
+                    )
+                    self.repository.update_workflow_state(
+                        run_id, status="RECOVERABLE_PROVIDER_ERROR", current_step="research_plan",
+                        automatic=False, stop_requested=False,
+                    )
+                    # Preserve the validated candidate as a resumable plan
+                    # checkpoint.  A provider outage is not a scientific
+                    # rejection and must not discard the work already done.
+                    break
+                issue_ledger = merge_issue_ledger(issue_ledger, review, round_index=review_round + 1)
+                review["review_id"] = ""
+                review["plan_id"] = plan_candidate.id
+                review["research_constraints_reference"] = constraints_reference
+                review["round_index"] = review_round + 1
+                review["issue_ledger"] = issue_ledger
+                review_artifact = self.repository.add_artifact(
+                    run_id, "plan_review", f"DeepSeek Plan Review {review_round + 1}",
+                    review, step_id, "DeepSeek Research Plan Reviewer", parent_artifact_id=plan_candidate.id,
+                )
+                self._set_artifact_fields(run_id, review_artifact.id, review_id=review_artifact.id)
+                if review["verdict"] == "ACCEPT":
+                    break
+                if review["verdict"] == "REJECT" or review_round >= self.max_deepseek_plan_revision:
+                    review_failure = {
+                        "code": "MODEL_OUTPUT_VALIDATION_FAILURE",
+                        "message": "DeepSeek did not produce an acceptable plan within the bounded revision limit.",
+                        "attempt": review_round + 1,
+                        "scientific_state_mutated": False,
+                    }
+                    self.repository.add_artifact(run_id, "plan_revision_required", "Research Plan Revision Required",
+                                                 {**review_failure, "latest_plan_id": plan_candidate.id, "latest_review_id": review_artifact.id,
+                                                  "issue_ledger": issue_ledger, "recoverable": True}, step_id,
+                                                 "Scientific Stability Gate", parent_artifact_id=review_artifact.id)
+                    self.repository.update_workflow_state(run_id, status="NEEDS_PLAN_REVISION", current_step="research_plan",
+                                                          automatic=False, stop_requested=False)
+                    self._persist_scientific_world_state(run_id, run, profile, dataset_state, protocol, readiness, stage, issue_ledger)
+                    return
+                revision_context = {
+                    "selected_hypothesis": selection,
+                    "current_plan": plan,
+                    "issues": review["issues"],
+                    "required_changes": review["required_changes"],
+                    "suggested_fixes": review["suggested_fixes"],
+                    "revised_plan_guidance": review["revised_plan_guidance"],
+                    "experiment_feasibility": review["experiment_feasibility"],
+                    "dataset_options": dataset_options,
+                    "authoritative_plan_contract": authoritative_plan_contract(),
+                    "dataset_profile": dataset_profile or {},
+                    "run_constraints": run.constraints,
+                    "research_constraints_reference": constraints_reference,
+                }
+                plan = normalize_plan(
+                    self.planning_agent.revise_from_review(revision_context, instructions=instructions),
+                    selection, provider_mode=self.llm_provider.mode,
+                    fallback_used=self.llm_provider.fallback,
+                )
+                if dataset_profile:
+                    plan = self._bind_plan_to_dataset(plan, dataset_profile)
+                plan = self._attach_dataset_card(plan, dataset_options)
+                plan["research_profile"] = profile
+                plan["protocol_state"] = protocol
+                plan["readiness_state"] = readiness
+                plan["research_stage"] = stage
+                plan["research_constraints_artifact_id"] = constraints_reference["artifact_id"]
+                plan["research_constraints_reference"] = constraints_reference
+                next_candidate = self.repository.add_artifact(
+                    run_id, "research_plan_candidate", f"Research Plan Candidate Round {review_round + 2}",
+                    {"plan_id": "", "round_index": review_round + 2, "parent_plan_id": plan_candidate.id,
+                     "research_stage": stage, "normalized_plan": deepcopy(plan), "research_constraints_reference": constraints_reference, "provider": self.llm_provider.mode,
+                     "model": "planning.revise_from_review", "request_chars": 0, "response_metadata": {}, "status": "review_pending"},
+                    step_id, self.planning_agent.name, parent_artifact_id=plan_candidate.id,
+                )
+                self._set_artifact_fields(run_id, next_candidate.id, plan_id=next_candidate.id)
+                plan_candidate = next_candidate
+                review_context = self._research_plan_review_context(
+                    run, latest, selection, plan, dataset_options
+                )
+            plan["scientific_contract"] = compile_scientific_contract(
+                run.problem_input, selection.get("selected") or [], plan
+            )
+            plan["scientific_integrity_issues"] = [
+                *validate_coverage(plan["scientific_contract"]),
+                *validate_split_contract(plan.get("split_contract") or (plan.get("dataset") or {}).get("split_contract") or {}),
+            ]
+            plan["plan_candidate_id"] = plan_candidate.id
+            self.repository.add_artifact(run_id, "plan", "Research Plan", plan, step_id, self.planning_agent.name,
+                                         parent_artifact_id=plan_candidate.id)
+            self.repository.add_artifact(
+                run_id, "scientific_contract", "Scientific Coverage and Split Contract",
+                plan.get("scientific_contract") or {}, step_id, self.planning_agent.name,
+            )
+            # Phase 2 keeps the baseline and all comparison controls durable
+            # and independent from a model-generated experiment description.
+            phase2_constraints = normalize_constraints(run.research_constraints, run.constraints)
+            baseline = baseline_profile(
+                phase2_constraints, plan, dataset_profile or {}, run.github_repository_url
+            )
+            baseline_artifact = self.repository.add_artifact(
+                run_id, "baseline_profile", "Baseline Profile", baseline, step_id,
+                "Phase 2 Baseline Contract",
+            )
+            fair_contract = fair_experiment_contract(
+                dataset_profile or {}, baseline, phase2_constraints, plan
+            )
+            self.repository.add_artifact(
+                run_id, "fair_experiment_contract", "Frozen Fair Experiment Contract",
+                fair_contract, step_id, "Phase 2 Experiment Contract",
+                parent_artifact_id=baseline_artifact.id,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.planning_agent.name,
+                "Built experiment plan.",
+                {"hypothesis_selection": latest["hypothesis_selection"].content},
+                plan,
+                skill_calls=skill_calls,
+            )
+            self._persist_scientific_world_state(run_id, run, profile, dataset_state, protocol, readiness, stage, issue_ledger)
+        elif step_id == "experiment_task":
+            self.supervisor_agent.require_agent(delegation, "experiment")
+            self._require_tools(package, "build_experiment_bundle")
+            experiment_id = self.repository.next_experiment_id(run_id)
+            result_id = f"{experiment_id}_result"
+            python_command = self.experiment_provider.python_command()
+            base_task = {
+                **self.experiment_agent.build_task(latest["plan"].content),
+                "run_id": run_id,
+                "experiment_id": experiment_id,
+                "result_id": result_id,
+                "research_constraints_artifact_id": run.research_constraints_artifact_id or "",
+                "research_constraints_reference": {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1},
+            }
+            fair_contract = latest.get("fair_experiment_contract")
+            if fair_contract:
+                base_task["phase2_protocol"] = progressive_protocol(
+                    fair_contract.content, "smoke"
+                )
+            base_task["scientific_contract"] = compile_scientific_contract(
+                run.problem_input,
+                (latest.get("hypothesis_selection").content.get("selected") if latest.get("hypothesis_selection") else []),
+                latest["plan"].content,
+                base_task,
+            )
+            task_box = {}
+            bundle_box = {}
+            previous_bundle: ExperimentBundle | None = None
+            previous_candidate: dict | None = None
+            frozen_contract: dict | None = None
+            repair_history: list[dict] = []
+
+            def build_experiment(revision):
+                nonlocal previous_bundle, previous_candidate, frozen_contract
+                task = dict(base_task)
+                capture: dict = {}
+                origin = "generate" if previous_bundle is None and previous_candidate is None else "repair"
+
+                def attempt_evidence(bundle: ExperimentBundle | None = None) -> dict:
+                    normalized = capture.get("normalized_bundle")
+                    if normalized is None and bundle is not None:
+                        normalized = bundle.model_dump()
+                    normalized = deepcopy(normalized) if isinstance(normalized, dict) else None
+                    return {
+                        "candidate_origin": origin,
+                        "raw_model_output": deepcopy(capture.get("raw_model_output") or previous_candidate or {}),
+                        "normalized_bundle": normalized,
+                        "manifest": (normalized or {}).get("manifest") or {},
+                        "files": (normalized or {}).get("files") or [],
+                        "requirements": (normalized or {}).get("requirements") or [],
+                        "repair_history": deepcopy(repair_history),
+                        "skill_hash": package.audit.get("instruction_sha256", ""),
+                        "skill_invocations": deepcopy(package.audit.get("skill_invocations") or []),
+                        "plan_artifact_id": latest["plan"].id,
+                        "research_constraints_reference": task.get("research_constraints_reference"),
+                        "dataset_contract_reference": {
+                            "contract_id": str((latest["plan"].content.get("dataset") or {}).get("contract_id") or ""),
+                            "content_fingerprint": str((latest["plan"].content.get("dataset") or {}).get("content_fingerprint") or ""),
+                            "root": str((latest["plan"].content.get("dataset") or {}).get("root") or ""),
+                        },
+                    }
+                try:
+                    if previous_bundle is None and previous_candidate is None:
+                        bundle = self.experiment_agent.generate_bundle(
+                            run_id,
+                            experiment_id,
+                            latest["plan"].content,
+                            task,
+                            instructions,
+                            python_command,
+                            require_smoke_test=True,
+                            validate=False,
+                            capture=capture,
+                        )
+                    else:
+                        feedback = list((revision or {}).get("issues") or [])
+                        bundle = self.experiment_agent.repair_bundle(
+                            latest["plan"].content,
+                            task,
+                            previous_bundle,
+                            {
+                                "stage": "experiment_bundle_preflight",
+                                "validation_issues": feedback,
+                            },
+                            self._with_revision(instructions, revision),
+                            validation_feedback=feedback,
+                            repair_history=repair_history,
+                            validate=False,
+                            previous_candidate=previous_candidate,
+                            frozen_contract=frozen_contract,
+                            capture=capture,
+                        )
+                    previous_bundle = bundle
+                    previous_candidate = None
+                    if frozen_contract is None:
+                        frozen_contract = bundle.manifest.model_dump()
+                    if not self.llm_provider.fallback:
+                        self.experiment_agent.validate_bundle(
+                            latest["plan"].content,
+                            bundle,
+                            require_smoke_test=True,
+                        )
+                except ExperimentBundleCandidateError as exc:
+                    previous_bundle = None
+                    previous_candidate = dict(exc.candidate)
+                    if frozen_contract is None:
+                        frozen_contract = self.experiment_agent.frozen_contract_from_candidate(
+                            latest["plan"].content,
+                            task,
+                            previous_candidate,
+                        )
+                    issues = experiment_validation_issues(exc)
+                    if issues:
+                        repair_history.append(
+                            {
+                                "attempt": len(repair_history) + 1,
+                                "issues": list(issues),
+                            }
+                        )
+                        return {
+                            **task,
+                            "_validation_issues": issues,
+                            "_repair_history": deepcopy(repair_history),
+                            "_candidate_attempt": attempt_evidence(),
+                        }
+                    raise
+                except ValueError as exc:
+                    issues = experiment_validation_issues(exc)
+                    if issues:
+                        repair_history.append(
+                            {
+                                "attempt": len(repair_history) + 1,
+                                "issues": list(issues),
+                            }
+                        )
+                        return {
+                            **task,
+                            "_validation_issues": issues,
+                            "_repair_history": deepcopy(repair_history),
+                            "_candidate_attempt": attempt_evidence(bundle if "bundle" in locals() else None),
+                        }
+                    raise
+                task = {
+                    **task,
+                    "manifest": bundle.manifest.model_dump(),
+                    "repair_history": deepcopy(repair_history),
+                    "_candidate_attempt": attempt_evidence(bundle),
+                }
+                task_box["task"] = task
+                bundle_box["bundle"] = bundle
+                return task
+
+            task = self._produce_validated(run_id, step_id, build_experiment)
+            bundle = bundle_box["bundle"]
+            task_artifact = self.repository.add_artifact(
+                run_id,
+                "experiment_task",
+                f"Experiment Task {experiment_id}",
+                task,
+                step_id,
+                self.experiment_agent.name,
+                parent_artifact_id=latest["plan"].id,
+            )
+            bundle_artifact = self.repository.add_artifact(
+                run_id,
+                "experiment_bundle",
+                f"Experiment Bundle {experiment_id}",
+                bundle.model_dump(),
+                step_id,
+                self.experiment_agent.name,
+                parent_artifact_id=task_artifact.id,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.experiment_agent.name,
+                "Built executable experiment task.",
+                {"plan": latest["plan"].content},
+                {
+                    "task": task,
+                    "bundle": {
+                        "artifact_id": bundle_artifact.id,
+                        "experiment_id": experiment_id,
+                        "result_id": result_id,
+                        "entrypoint": bundle.manifest.entrypoint,
+                        "files": [item.path for item in bundle.files],
+                        "requirements": bundle.requirements,
+                    },
+                },
+                tool_calls=[
+                    {"provider": "experiment", "method": "plan"},
+                    {"provider": "experiment", "method": "generate_bundle"},
+                    *(
+                        [{"provider": "experiment", "method": "repair_bundle"}]
+                        if repair_history
+                        else []
+                    ),
+                ],
+                skill_calls=skill_calls,
+            )
+        elif step_id == "experiment_run_analysis":
+            self.supervisor_agent.require_agent(delegation, "experiment")
+            execution_tool = (
+                "ssh_run"
+                if type(self.experiment_provider).__name__ == "RemoteGpuExperimentProvider"
+                else "local_process_run"
+            )
+            self._require_tools(
+                package,
+                execution_tool,
+                "read_experiment_result",
+                "audit_result",
+            )
+            bundle_artifact = latest.get("experiment_bundle")
+            bundle = (
+                ExperimentBundle.model_validate(bundle_artifact.content)
+                if bundle_artifact
+                else None
+            )
+            if bundle is None:
+                raise ValueError(
+                    "EXPERIMENT_BUNDLE_REQUIRED:RERUN_EXPERIMENT_TASK"
+                )
+            previous_result = latest.get("experiment_result")
+            previous_attempts = []
+            experiment_id = latest["experiment_task"].content.get("experiment_id")
+            if previous_result and previous_result.content.get("experiment_id") == experiment_id:
+                previous_attempts = list(previous_result.content.get("attempts") or [])
+            current_attempts = []
+            active_task = dict(latest["experiment_task"].content)
+            runtime_candidate: dict | None = None
+            analysis_instructions = self.skill_runtime.instructions_for(
+                package, "analyze-results"
+            )
+            audit_instructions = self.skill_runtime.instructions_for(
+                package, "experiment-audit"
+            )
+
+            def run_experiment(_revision):
+                nonlocal runtime_candidate
+                if runtime_candidate is None:
+                    attempt_started_at = datetime.now(timezone.utc).isoformat()
+                    recover = getattr(
+                        self.experiment_provider, "recover_completed_result", None
+                    )
+                    force_new = experiment_id in run.force_new_attempt_experiment_ids
+                    raw_result = (
+                        recover(active_task, bundle)
+                        if callable(recover) and not force_new
+                        else None
+                    )
+                    if raw_result is None:
+                        raw_result = self.experiment_agent.run(active_task, bundle)
+                    current_attempts.append(
+                        {
+                            "attempt": len(previous_attempts) + len(current_attempts) + 1,
+                            "start_time": raw_result.get("start_time", attempt_started_at),
+                            "end_time": raw_result.get("end_time"),
+                            "status": "completed",
+                            "error_code": "",
+                            "log_path": raw_result.get("log_path", ""),
+                            "recovered": bool(
+                                raw_result.get("recovered_from_completed_attempt")
+                            ),
+                        }
+                    )
+                    runtime_candidate = {
+                        **raw_result,
+                        "attempts": [*previous_attempts, *current_attempts],
+                    }
+                candidate = deepcopy(runtime_candidate)
+                analysis = self.experiment_agent.analyze_result(
+                    latest["plan"].content,
+                    active_task,
+                    candidate,
+                    instructions=analysis_instructions,
+                )
+                audit = self.experiment_agent.audit_result(
+                    bundle,
+                    candidate,
+                    instructions=audit_instructions,
+                )
+                if audit["integrity_status"] != "passed" or (
+                    self.competition_mode and not audit["is_real_experiment"]
+                ):
+                    # An audit rejection is a validation failure, not a result
+                    # that may be passed downstream as merely non-real.  The
+                    # bounded diagnosis loop below retains the failed attempt
+                    # and repairs the same scientific Bundle lineage.
+                    raise RuntimeError(
+                        "EXPERIMENT_AUDIT_FAILED:"
+                        + " | ".join(str(item) for item in audit["issues"])
+                    )
+                return {
+                    **candidate,
+                    "analysis": analysis,
+                    "audit": audit,
+                    # The audit, not the provider's process-success flag, is
+                    # authoritative for downstream claim/export eligibility.
+                    "is_real_experiment": audit["is_real_experiment"],
+                }
+
+            result = None
+            final_error: RuntimeError | ValueError | None = None
+            latest_diagnosis: dict | None = None
+            max_auto_repairs = 5
+            repair_history: list[str] = []
+            for repair_index in range(max_auto_repairs + 1):
+                failure_started_at = datetime.now(timezone.utc).isoformat()
+                had_runtime_result = runtime_candidate is not None
+                try:
+                    result = self._produce_validated(
+                        run_id,
+                        step_id,
+                        run_experiment,
+                        diagnosis=True,
+                    )
+                    break
+                except (RuntimeError, ValueError) as exc:
+                    final_error = exc
+                    repair_history.append(str(exc))
+                    error_code = str(exc).split(":", 1)[0]
+                    if not had_runtime_result and runtime_candidate is None:
+                        current_attempts.append(
+                            {
+                                "attempt": len(previous_attempts) + len(current_attempts) + 1,
+                                "start_time": failure_started_at,
+                                "end_time": datetime.now(timezone.utc).isoformat(),
+                                "status": "failed",
+                                "error_code": error_code,
+                                "log_path": "",
+                            }
+                        )
+
+                    diagnosis_delegation = self.supervisor_agent.delegate(
+                        "experiment_diagnosis"
+                    )
+                    self.supervisor_agent.require_agent(
+                        diagnosis_delegation, "diagnostic"
+                    )
+                    diagnosis_package = self.skill_runtime.prepare(
+                        "experiment_diagnosis",
+                        diagnosis_delegation.agent_id,
+                        self.configured_tools,
+                    )
+                    diagnosis_calls = [
+                        diagnosis_delegation.tool_call,
+                        self._runtime_call(diagnosis_package),
+                    ]
+                    skill_calls.extend(diagnosis_calls)
+                    diagnosis = self.diagnostic_agent.diagnose(
+                        exc,
+                        task=active_task,
+                        bundle=bundle.model_dump(),
+                        attempts=[*previous_attempts, *current_attempts],
+                        instructions=diagnosis_package.instructions,
+                    )
+                    diagnosis["repair_attempt"] = repair_index + 1
+                    diagnosis["max_auto_repairs"] = max_auto_repairs
+                    can_repair = (
+                        diagnosis.get("auto_repairable") is True
+                        and repair_index < max_auto_repairs
+                    )
+                    repair_result = {
+                        "status": "not_attempted",
+                        "action": diagnosis.get("repair_action") or "none",
+                    }
+                    regenerated_bundle = None
+                    if can_repair:
+                        action = diagnosis.get("repair_action")
+                        try:
+                            if action == "quarantine_corrupt_dataset_download":
+                                self._require_tools(
+                                    diagnosis_package,
+                                    "repair_dataset_cache",
+                                    "retry_experiment",
+                                )
+                                repair = getattr(
+                                    self.experiment_provider,
+                                    "quarantine_failed_dataset_download",
+                                    None,
+                                )
+                                if not callable(repair):
+                                    raise RuntimeError(
+                                        "EXPERIMENT_DATASET_AUTO_REPAIR_UNAVAILABLE"
+                                    )
+                                repair_result = repair(bundle.manifest.dataset)
+                            elif action == "retry_stage":
+                                self._require_tools(
+                                    diagnosis_package, "retry_experiment"
+                                )
+                                repair_result = {
+                                    "status": "completed",
+                                    "action": action,
+                                    "reason": "retrying unchanged stage",
+                                }
+                            elif action == "repair_experiment_code":
+                                self._require_tools(
+                                    diagnosis_package,
+                                    "build_experiment_bundle",
+                                    "retry_experiment",
+                                )
+                                implementation_delegation = (
+                                    self.supervisor_agent.delegate("experiment_task")
+                                )
+                                implementation_package = self.skill_runtime.prepare(
+                                    "experiment_task",
+                                    implementation_delegation.agent_id,
+                                    self.configured_tools,
+                                )
+                                repair_instructions = self.skill_runtime.instructions_for(
+                                    implementation_package,
+                                    "experiment-implementation",
+                                )
+                                validation_feedback: list[str] = []
+                                repair_errors: list[str] = []
+                                runtime_parent_attempt_id = self._runtime_repair_parent_attempt_id(
+                                    run.artifacts,
+                                    experiment_id=experiment_id,
+                                    task_artifact=latest["experiment_task"],
+                                    fallback_id=(
+                                        bundle_artifact.id if bundle_artifact else None
+                                    ),
+                                )
+
+                                def persist_runtime_candidate(capture: dict, *, accepted: bool, issues: list[str]) -> str:
+                                    nonlocal runtime_parent_attempt_id
+                                    normalized = capture.get("normalized_bundle")
+                                    normalized = deepcopy(normalized) if isinstance(normalized, dict) else None
+                                    payload = {
+                                        "candidate_origin": "runtime_repair",
+                                        # A candidate can be rejected before it can be
+                                        # normalized into a Bundle (for example, after an
+                                        # interrupted model response).  Keep its ownership
+                                        # independent from the optional normalized payload so
+                                        # a persisted checkpoint can always rebuild lineage.
+                                        "experiment_id": experiment_id,
+                                        "task_artifact_id": latest["experiment_task"].id,
+                                        "normalization_status": (
+                                            "normalized"
+                                            if normalized is not None
+                                            else "unavailable"
+                                        ),
+                                        "raw_model_output": deepcopy(capture.get("raw_model_output") or {}),
+                                        "normalized_bundle": normalized,
+                                        "manifest": (normalized or {}).get("manifest") or {},
+                                        "files": (normalized or {}).get("files") or [],
+                                        "requirements": (normalized or {}).get("requirements") or [],
+                                        "repair_history": deepcopy(repair_history),
+                                        "skill_hash": implementation_package.audit.get("instruction_sha256", ""),
+                                        "skill_invocations": deepcopy(implementation_package.audit.get("skill_invocations") or []),
+                                        "plan_artifact_id": latest["plan"].id,
+                                        "dataset_contract_reference": {
+                                            "contract_id": str((latest["plan"].content.get("dataset") or {}).get("contract_id") or ""),
+                                            "content_fingerprint": str((latest["plan"].content.get("dataset") or {}).get("content_fingerprint") or ""),
+                                            "root": str((latest["plan"].content.get("dataset") or {}).get("root") or ""),
+                                        },
+                                        "attempt_id": "",
+                                        "parent_attempt_id": runtime_parent_attempt_id or "",
+                                        "attempt_number": candidate_index + 1,
+                                        "accepted": accepted,
+                                        "validation_issues": list(issues),
+                                    }
+                                    artifact = self.repository.add_artifact(
+                                        run_id,
+                                        "experiment_candidate_attempt",
+                                        f"Experiment Runtime Repair Candidate {candidate_index + 1}",
+                                        payload,
+                                        step_id,
+                                        self.experiment_agent.name,
+                                        parent_artifact_id=runtime_parent_attempt_id,
+                                    )
+                                    payload["attempt_id"] = artifact.id
+                                    stored_run = self.repository.get_run(run_id)
+                                    for index, stored in enumerate(stored_run.artifacts):
+                                        if stored.id == artifact.id:
+                                            stored_run.artifacts[index] = stored.model_copy(update={"content": payload})
+                                            self.repository.save_run(stored_run)
+                                            break
+                                    runtime_parent_attempt_id = artifact.id
+                                    return artifact.id
+
+                                for candidate_index in range(5):
+                                    capture: dict = {}
+                                    try:
+                                        regenerated_bundle = self.experiment_agent.repair_bundle(
+                                            latest["plan"].content,
+                                            active_task,
+                                            bundle,
+                                            diagnosis,
+                                            repair_instructions,
+                                            validation_feedback,
+                                            repair_history=list(
+                                                dict.fromkeys(repair_history)
+                                            ),
+                                            capture=capture,
+                                        )
+                                        persist_runtime_candidate(capture, accepted=True, issues=[])
+                                        repair_result = {
+                                            "status": "completed",
+                                            "action": action,
+                                            "candidate_attempts": candidate_index + 1,
+                                            "files": [
+                                                item.path for item in regenerated_bundle.files
+                                            ],
+                                            "scientific_contract_preserved": True,
+                                        }
+                                        break
+                                    except (RuntimeError, ValueError) as candidate_error:
+                                        message = str(candidate_error)
+                                        issues = experiment_validation_issues(candidate_error) or [message]
+                                        persist_runtime_candidate(capture, accepted=False, issues=issues)
+                                        repair_errors.append(message)
+                                        validation_feedback.extend(issues)
+                                if regenerated_bundle is None:
+                                    raise RuntimeError(
+                                        "EXPERIMENT_CODE_REPAIR_CANDIDATES_REJECTED:"
+                                        + " | ".join(repair_errors)
+                                    )
+                            elif action == "regenerate_experiment_bundle":
+                                self._require_tools(
+                                    diagnosis_package,
+                                    "build_experiment_bundle",
+                                    "retry_experiment",
+                                )
+                                implementation_delegation = (
+                                    self.supervisor_agent.delegate("experiment_task")
+                                )
+                                implementation_package = self.skill_runtime.prepare(
+                                    "experiment_task",
+                                    implementation_delegation.agent_id,
+                                    self.configured_tools,
+                                )
+                                repair_instructions = self.skill_runtime.instructions_for(
+                                    implementation_package,
+                                    "experiment-implementation",
+                                )
+                                repair_request = (
+                                    "## Diagnostic Repair Request\n"
+                                    + diagnosis["root_cause"]
+                                    + "\nCorrect these concrete errors:\n"
+                                    + "\n".join(
+                                        f"- {item}" for item in diagnosis["evidence"]
+                                    )
+                                )
+                                regenerated_bundle = self.experiment_agent.generate_bundle(
+                                    run_id,
+                                    experiment_id,
+                                    latest["plan"].content,
+                                    active_task,
+                                    "\n\n".join(
+                                        (repair_instructions, repair_request)
+                                    ),
+                                    self.experiment_provider.python_command(),
+                                    require_smoke_test=True,
+                                )
+                                repair_result = {
+                                    "status": "completed",
+                                    "action": action,
+                                    "files": [
+                                        item.path for item in regenerated_bundle.files
+                                    ],
+                                }
+                            else:
+                                repair_result = {
+                                    "status": "not_allowed",
+                                    "action": action or "none",
+                                }
+                        except (RuntimeError, ValueError) as repair_error:
+                            repair_result = {
+                                "status": "failed",
+                                "action": action or "none",
+                                "error": str(repair_error),
+                            }
+                            can_repair = False
+
+                    diagnosis["repair_result"] = repair_result
+                    diagnosis["resolved"] = False
+                    latest_diagnosis = diagnosis
+                    diagnosis_artifact = self.repository.add_artifact(
+                        run_id,
+                        "experiment_diagnosis",
+                        f"Experiment Diagnosis {repair_index + 1}",
+                        diagnosis,
+                        step_id,
+                        self.diagnostic_agent.name,
+                        parent_artifact_id=(
+                            bundle_artifact.id if bundle_artifact else None
+                        ),
+                    )
+                    if regenerated_bundle is not None:
+                        bundle = regenerated_bundle
+                        runtime_candidate = None
+                        active_task = {
+                            **active_task,
+                            "manifest": bundle.manifest.model_dump(),
+                        }
+                        bundle_artifact = self.repository.add_artifact(
+                            run_id,
+                            "experiment_bundle",
+                            f"Repaired Experiment Bundle {experiment_id}",
+                            bundle.model_dump(),
+                            step_id,
+                            self.diagnostic_agent.name,
+                            parent_artifact_id=diagnosis_artifact.id,
+                        )
+                    self.repository.append_event(
+                        run_id,
+                        step_id,
+                        self.diagnostic_agent.name,
+                        (
+                            "Diagnosed failure and applied a bounded repair."
+                            if can_repair
+                            else "Diagnosed failure; automatic repair is unavailable."
+                        ),
+                        data=diagnosis,
+                        output_summary=diagnosis,
+                        tool_calls=diagnosis_calls,
+                        provider_mode=self.llm_provider.mode,
+                        fallback_used=self.llm_provider.fallback,
+                    )
+                    if not can_repair:
+                        break
+
+            if result is None:
+                exc = final_error or RuntimeError("UNKNOWN_EXPERIMENT_FAILURE")
+                error_code = str(exc).split(":", 1)[0]
+                provider_class = type(self.experiment_provider).__name__
+                provider_name = {
+                    "LocalGpuExperimentProvider": "local_gpu",
+                    "RemoteGpuExperimentProvider": "remote_gpu",
+                    "MockExperimentProvider": "mock",
+                }.get(provider_class, provider_class)
+                failure = {
+                    "run_id": run_id,
+                    "experiment_id": experiment_id,
+                    "result_id": latest["experiment_task"].content.get("result_id"),
+                    "provider": provider_name,
+                    "is_real_experiment": False,
+                    "metrics": {},
+                    "parameters": bundle.manifest.parameters if bundle else {},
+                    "seeds": bundle.manifest.seeds if bundle else [],
+                    "environment": {},
+                    "attempts": [*previous_attempts, *current_attempts],
+                    "status": "failed",
+                    "verdict": "failed",
+                    "error": str(exc),
+                    "diagnosis": latest_diagnosis or {},
+                }
+                self.repository.add_artifact(
+                    run_id,
+                    "experiment_result",
+                    "Experiment Result (Failed)",
+                    failure,
+                    step_id,
+                    self.experiment_agent.name,
+                    parent_artifact_id=bundle_artifact.id if bundle_artifact else None,
+                )
+                self._clear_forced_experiment_attempt(run_id, experiment_id)
+                self._trace(
+                    run_id,
+                    step_id,
+                    self.experiment_agent.name,
+                    "Recorded failed experiment attempt.",
+                    {"task": active_task},
+                    failure,
+                    tool_calls=[
+                        {"provider": provider_name, "method": "run_and_analyze", "error": error_code}
+                    ],
+                    skill_calls=skill_calls,
+                )
+                return self.repository.get_run(run_id)
+            if latest_diagnosis is not None:
+                latest_diagnosis = {
+                    **latest_diagnosis,
+                    "resolved": True,
+                    "user_message": (
+                        latest_diagnosis.get("user_message", "")
+                        + " 修复后重试已成功。"
+                    ).strip(),
+                }
+                result["diagnosis"] = latest_diagnosis
+                self.repository.add_artifact(
+                    run_id,
+                    "experiment_diagnosis",
+                    "Experiment Diagnosis Resolved",
+                    latest_diagnosis,
+                    step_id,
+                    self.diagnostic_agent.name,
+                    parent_artifact_id=(
+                        bundle_artifact.id if bundle_artifact else None
+                    ),
+                )
+                self.repository.append_event(
+                    run_id,
+                    step_id,
+                    self.diagnostic_agent.name,
+                    "Verified automatic repair with a successful retry.",
+                    data=latest_diagnosis,
+                    output_summary=latest_diagnosis,
+                    tool_calls=[],
+                    provider_mode=self.llm_provider.mode,
+                    fallback_used=self.llm_provider.fallback,
+                )
+            result_artifact = self.repository.add_artifact(
+                run_id,
+                "experiment_result",
+                "Experiment Result",
+                result,
+                step_id,
+                self.experiment_agent.name,
+                parent_artifact_id=bundle_artifact.id if bundle_artifact else None,
+            )
+            # A result is only promoted to Phase 2 evidence when it supplies
+            # paired per-seed baseline and idea measurements.  Missing pairs
+            # remain explicit rather than being interpreted by an LLM.
+            fair_contract = latest.get("fair_experiment_contract")
+            primary = str((fair_contract.content if fair_contract else {}).get("primary_metric") or "accuracy")
+            baseline_rows = result.get("baseline_seed_metrics") or {}
+            idea_rows = result.get("idea_seed_metrics") or {}
+            try:
+                baseline_by_seed = {int(key): float(value) for key, value in baseline_rows.items()}
+                idea_by_seed = {int(key): float(value) for key, value in idea_rows.items()}
+            except (AttributeError, TypeError, ValueError):
+                baseline_by_seed, idea_by_seed = {}, {}
+            evidence = result_evidence(baseline_by_seed, idea_by_seed, primary)
+            evidence["stage"] = str((active_task.get("phase2_protocol") or {}).get("stage") or "smoke")
+            evidence["route"] = route_result(evidence, anomalies=list(result.get("anomalies") or []))
+            self.repository.add_artifact(
+                run_id, "result_evidence", "Deterministic Result Evidence", evidence,
+                step_id, "Phase 2 Result Analyzer", parent_artifact_id=result_artifact.id,
+            )
+            self._clear_forced_experiment_attempt(run_id, experiment_id)
+            self._trace(
+                run_id,
+                step_id,
+                self.experiment_agent.name,
+                "Recorded experiment result.",
+                {"task": latest["experiment_task"].content},
+                result,
+                tool_calls=[{"provider": result.get("provider"), "method": "run_and_analyze"}],
+                skill_calls=skill_calls,
+            )
+        elif step_id == "feedback_revision":
+            self.supervisor_agent.require_agent(delegation, "critic")
+            result_artifact = latest["experiment_result"]
+            result = result_artifact.content
+            historical_iteration = max(
+                [
+                    int(artifact.content.get("iteration") or 0)
+                    for artifact in run.artifacts
+                    if artifact.type == "revision"
+                ]
+                or [0]
+            )
+            iteration = max(run.feedback_iteration, historical_iteration) + 1
+            active_hypothesis = self._feedback_hypothesis(latest)
+            current_plan = latest["plan"].content
+            output_language = self._output_language(run)
+            claim_instructions = self.skill_runtime.instructions_for(
+                package, "experiment-iteration", "result-to-claim"
+            )
+            claim_instructions = self._with_output_language(
+                claim_instructions, output_language
+            )
+
+            def review_result(revision):
+                candidate = self.critic_agent.review_result(
+                    active_hypothesis,
+                    result,
+                    plan=current_plan,
+                    analysis=result.get("analysis") or {},
+                    audit=result.get("audit") or {},
+                    instructions=self._with_revision(claim_instructions, revision),
+                )
+                candidate.setdefault(
+                    "verdict",
+                    result.get("verdict") or result.get("status") or "partial",
+                )
+                verdict = normalize_feedback_verdict(candidate.get("verdict"))
+                candidate["verdict"] = verdict
+                candidate["iteration"] = iteration
+                candidate["requires_follow_up"] = (
+                    verdict in {"failed", "partial"}
+                    and iteration < self.max_feedback_iterations
+                )
+                candidate.setdefault("feedback", "")
+                candidate.setdefault("required_revision", "")
+                candidate.setdefault("supported_claims", [])
+                candidate.setdefault("unsupported_claims", [])
+                candidate.setdefault("revisions", [])
+                candidate.setdefault(
+                    "next_action",
+                    candidate.get("required_revision") or candidate.get("feedback") or "",
+                )
+                candidate.setdefault("evidence_links", [])
+                candidate.setdefault("overclaim_risks", [])
+                candidate["result_analysis"] = self._normalize_iteration_analysis(
+                    candidate.get("result_analysis"),
+                    result,
+                )
+                candidate["literature_queries"] = self._normalize_iteration_queries(
+                    candidate.get("literature_queries")
+                )
+                if (
+                    candidate["requires_follow_up"]
+                    and candidate["result_analysis"]["knowledge_gaps"]
+                    and not candidate["literature_queries"]
+                ):
+                    candidate["_validation_issues"] = [
+                        "ITERATION_LITERATURE_QUERIES_REQUIRED"
+                    ]
+                return candidate
+
+            review_context = {
+                "hypothesis": active_hypothesis,
+                "plan": current_plan,
+                "experiment_result": result,
+                "analysis": result.get("analysis") or {},
+                "audit": result.get("audit") or {},
+                "output_language": output_language,
+                "research_constraints_reference": {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1},
+            }
+            feedback = self._produce_validated(
+                run_id,
+                step_id,
+                review_result,
+                validation_context=review_context,
+            )
+            # Step 6: interpret a validated result through two independent model
+            # calls.  The secondary receives only shared evidence/result inputs,
+            # never Qwen reasoning.  All reconciliation below is deterministic.
+            literature_evidence = list((latest.get("evidence").content.get("core_references") or latest.get("evidence").content.get("references") or [])) if latest.get("evidence") else []
+            qwen_analysis = normalize_scientific_analysis(
+                self.critic_agent.scientific_result_analysis(
+                    active_hypothesis, result, plan=current_plan,
+                    evidence=literature_evidence, provider_id="qwen",
+                    instructions=claim_instructions,
+                ),
+                provider_id="qwen",
+            )
+            qwen_analysis_artifact = self.repository.add_artifact(
+                run_id, "qwen_scientific_analysis", f"Qwen Scientific Analysis {iteration}",
+                qwen_analysis, step_id, "Qwen Primary Scientific Analyst",
+                parent_artifact_id=result_artifact.id,
+            )
+            try:
+                deepseek_analysis = normalize_scientific_analysis(
+                    self.critic_agent.scientific_result_analysis(
+                        active_hypothesis, result, plan=current_plan,
+                        evidence=literature_evidence, provider_id="deepseek",
+                        instructions=claim_instructions,
+                    ),
+                    provider_id="deepseek",
+                )
+            except RuntimeError as exc:
+                if "DEEPSEEK" not in str(exc) and "SECONDARY_REVIEW_UNAVAILABLE" not in str(exc):
+                    raise
+                deepseek_analysis = unavailable_secondary_review(str(exc))
+            deepseek_analysis_artifact = self.repository.add_artifact(
+                run_id, "deepseek_scientific_review", f"DeepSeek Independent Scientific Review {iteration}",
+                deepseek_analysis, step_id, "DeepSeek Independent Scientific Critic",
+                parent_artifact_id=result_artifact.id,
+            )
+            # Phase 3 exposes the same independent review under a durable,
+            # explicit diagnosis Artifact for append-only Idea lineage.
+            scientific_diagnosis_artifact = self.repository.add_artifact(
+                run_id, "scientific_diagnosis", f"Scientific Diagnosis v{iteration}",
+                {**deepseek_analysis, "result_evidence_id": (latest.get("result_evidence").id if latest.get("result_evidence") else ""),
+                 "research_constraints_artifact_id": run.research_constraints_artifact_id or "", "diagnosis_provider": "deepseek"},
+                step_id, "DeepSeek Independent Scientific Critic", parent_artifact_id=deepseek_analysis_artifact.id,
+            )
+            disagreement = detect_disagreement(qwen_analysis, deepseek_analysis)
+            disagreement_artifact = self.repository.add_artifact(
+                run_id, "scientific_disagreement", f"Scientific Disagreement {iteration}",
+                disagreement, step_id, "Deterministic Scientific Disagreement Detector",
+                parent_artifact_id=qwen_analysis_artifact.id,
+            )
+            synthesis = synthesize_scientific_conclusion(qwen_analysis, deepseek_analysis, disagreement)
+            synthesis_artifact = self.repository.add_artifact(
+                run_id, "scientific_synthesis", f"Scientific Synthesis {iteration}",
+                synthesis, step_id, "Workflow Engine",
+                parent_artifact_id=disagreement_artifact.id,
+            )
+            conclusion = {
+                "research_question_id": (latest.get("problem").id if latest.get("problem") else ""),
+                "hypothesis_id": (latest.get("hypothesis_selection").id if latest.get("hypothesis_selection") else ""),
+                "claim": active_hypothesis.get("claim") or "",
+                "evidence_for": synthesis["supported_claims"], "evidence_against": synthesis["unsupported_claims"],
+                "limitations": synthesis["remaining_uncertainties"], "confounders": synthesis["confounders"],
+                "unresolved_questions": synthesis["remaining_uncertainties"], "confidence": synthesis["confidence"],
+                "derived_from": [result_artifact.id, qwen_analysis_artifact.id, deepseek_analysis_artifact.id, disagreement_artifact.id, synthesis_artifact.id],
+                "hypothesis_status": synthesis["hypothesis_status"], "current_conclusion": synthesis["current_conclusion"],
+            }
+            conclusion_artifact = self.repository.add_artifact(
+                run_id, "scientific_conclusion", f"Scientific Conclusion {iteration}", conclusion,
+                step_id, "Workflow Engine", parent_artifact_id=synthesis_artifact.id,
+            )
+            evolution = evolution_decision(synthesis, iteration=iteration, max_iterations=self.max_feedback_iterations)
+            evolution_artifact = self.repository.add_artifact(
+                run_id, "hypothesis_evolution_decision", f"Hypothesis Evolution Decision {iteration}", evolution,
+                step_id, "Workflow Engine", parent_artifact_id=conclusion_artifact.id,
+            )
+            feedback["scientific_conclusion_id"] = conclusion_artifact.id
+            feedback["hypothesis_evolution_decision_id"] = evolution_artifact.id
+            if evolution["create_working_hypothesis"]:
+                working = build_working_hypothesis(
+                    parent_hypothesis_id=conclusion["hypothesis_id"],
+                    parent_claim=conclusion["claim"], proposal=synthesis["proposed_hypothesis"],
+                    derived_from=conclusion["derived_from"], reason=evolution["reason"], revision=iteration,
+                )
+                working_artifact = self.repository.add_artifact(
+                    run_id, "working_hypothesis", f"Working Hypothesis v{iteration + 1}", working,
+                    step_id, "Workflow Engine", parent_artifact_id=conclusion_artifact.id,
+                )
+                feedback["working_hypothesis_id"] = working_artifact.id
+                self.repository.add_artifact(
+                    run_id, "idea_revision", f"Idea Revision v{iteration + 1}",
+                    {**working, "scientific_diagnosis_id": scientific_diagnosis_artifact.id,
+                     "research_constraints_artifact_id": run.research_constraints_artifact_id or ""},
+                    step_id, "Phase 3 Idea Evolution", parent_artifact_id=working_artifact.id,
+                )
+            iteration_analysis_artifact = self.repository.add_artifact(
+                run_id,
+                "iteration_analysis",
+                f"Iteration Analysis {iteration}",
+                feedback["result_analysis"],
+                step_id,
+                self.critic_agent.name,
+                parent_artifact_id=result_artifact.id,
+            )
+            verdict_package = package
+            if feedback["requires_follow_up"]:
+                verdict_state = {
+                    **state,
+                    "experiment_verdict": feedback["verdict"],
+                    "plan_refinement_enabled": True,
+                }
+                verdict_delegation = self.supervisor_agent.delegate(
+                    step_id, verdict_state
+                )
+                verdict_package = self.skill_runtime.prepare(
+                    step_id,
+                    verdict_delegation.agent_id,
+                    self.configured_tools,
+                    verdict_state,
+                )
+                if verdict_package.skill_ids != package.skill_ids:
+                    skill_calls.extend(
+                        [verdict_delegation.tool_call, self._runtime_call(verdict_package)]
+                    )
+
+            if feedback["requires_follow_up"]:
+                query_specs = feedback["literature_queries"]
+                self._require_tools(
+                    verdict_package,
+                    "query_wiki",
+                    "search_local_literature",
+                    "literature_search",
+                )
+                iteration_evidence = self._collect_iteration_evidence(
+                    run_id,
+                    query_specs,
+                )
+                iteration_evidence_artifact = self.repository.add_artifact(
+                    run_id,
+                    "iteration_evidence",
+                    f"Iteration Evidence {iteration}",
+                    iteration_evidence,
+                    step_id,
+                    self.critic_agent.name,
+                    parent_artifact_id=iteration_analysis_artifact.id,
+                )
+                self.repository.add_artifact(
+                    run_id, "targeted_literature_update", f"Targeted Literature Update {iteration}",
+                    {**iteration_evidence, "scientific_diagnosis_id": scientific_diagnosis_artifact.id},
+                    step_id, self.critic_agent.name, parent_artifact_id=iteration_evidence_artifact.id,
+                )
+                direction_instructions = self._with_output_language(
+                    self.skill_runtime.instructions_for(
+                        verdict_package, "experiment-iteration"
+                    ),
+                    output_language,
+                )
+                direction = {}
+                for direction_attempt in range(3):
+                    direction = self._normalize_iteration_direction(
+                        self.critic_agent.select_iteration_direction(
+                            active_hypothesis,
+                            current_plan,
+                            result,
+                            feedback,
+                            iteration_evidence,
+                            instructions=direction_instructions,
+                        )
+                    )
+                    direction_issues = self._iteration_direction_issues(
+                        direction, output_language
+                    )
+                    if not direction_issues:
+                        break
+                    direction_instructions += (
+                        "\n\n## 必须修正的方向决策输出\n"
+                        + "\n".join(f"- {issue}" for issue in direction_issues)
+                    )
+                else:
+                    raise ValueError(
+                        "ITERATION_DIRECTION_OUTPUT_INVALID:"
+                        + ",".join(direction_issues)
+                    )
+                self.repository.add_artifact(
+                    run_id,
+                    "iteration_decision",
+                    f"Iteration Decision {iteration}",
+                    direction,
+                    step_id,
+                    self.critic_agent.name,
+                    parent_artifact_id=iteration_evidence_artifact.id,
+                )
+                feedback["evidence_sufficiency"] = direction[
+                    "evidence_sufficiency"
+                ]
+                feedback["evidence_assessment"] = direction[
+                    "evidence_assessment"
+                ]
+                feedback["optimization_candidates"] = direction[
+                    "optimization_candidates"
+                ]
+                feedback["selected_direction"] = direction[
+                    "selected_direction"
+                ]
+                feedback["selection_reason"] = direction["selection_reason"]
+                if direction["next_action"] and (
+                    query_specs or not feedback.get("next_action")
+                ):
+                    feedback["next_action"] = direction["next_action"]
+                if (
+                    direction["evidence_sufficiency"]
+                    == "EVIDENCE_INSUFFICIENT"
+                    and not direction["selected_direction"]
+                ):
+                    feedback["requires_follow_up"] = False
+                    feedback["next_action"] = (
+                        "当前实验结果与定向检索均不足以支持安全的下一轮修改；"
+                        "停止自动迭代并保留当前结论。"
+                        if output_language == "zh-CN"
+                        else (
+                            "The experiment and targeted retrieval do not support "
+                            "a safe next revision; stop and preserve the result."
+                        )
+                    )
+                if feedback["requires_follow_up"]:
+                    selection = deepcopy(
+                        self._require_evidence_reasoned_hypothesis_selection(latest)
+                    )
+                    selection["selected"] = [deepcopy(active_hypothesis)]
+                    dataset_profile = (
+                        latest["dataset_profile"].content
+                        if latest.get("dataset_profile")
+                        else None
+                    )
+                    dataset_options = (
+                        [dataset_option(dataset_profile)]
+                        if dataset_profile
+                        else self._dataset_options()
+                    )
+                    refinement_skill_ids = [
+                        "experiment-iteration",
+                        "research-refine",
+                        "experiment-plan",
+                    ]
+                    if "ablation-planner" in verdict_package.skill_ids:
+                        refinement_skill_ids.append("ablation-planner")
+                    refinement_instructions = self.skill_runtime.instructions_for(
+                        verdict_package, *refinement_skill_ids
+                    )
+                    refinement_instructions = self._with_output_language(
+                        refinement_instructions, output_language
+                    )
+                    revised_plan = normalize_plan(
+                        self.planning_agent.refine_plan(
+                            selection,
+                            current_plan,
+                            result,
+                            feedback,
+                            instructions=refinement_instructions,
+                            dataset_options=dataset_options,
+                        ),
+                        selection,
+                        provider_mode=self.llm_provider.mode,
+                        fallback_used=self.llm_provider.fallback,
+                    )
+                    if dataset_profile:
+                        revised_plan = self._bind_plan_to_dataset(
+                            revised_plan, dataset_profile
+                        )
+                    revised_plan["iteration_contract"] = self._build_iteration_contract(
+                        iteration,
+                        current_plan,
+                        revised_plan,
+                        feedback,
+                    )
+                    feedback["revised_plan"] = self._attach_dataset_card(
+                        revised_plan, dataset_options
+                    )
+            revision_artifact = self.repository.add_artifact(
+                run_id,
+                "revision",
+                "Feedback Revision",
+                feedback,
+                step_id,
+                self.critic_agent.name,
+                parent_artifact_id=result_artifact.id,
+            )
+            integrity_contract = compile_scientific_contract(
+                run.problem_input,
+                (latest.get("hypothesis_selection").content.get("selected") if latest.get("hypothesis_selection") else []),
+                current_plan,
+                latest.get("experiment_task").content if latest.get("experiment_task") else {},
+            )
+            scientific_verdict = {
+                "supported": "supported", "failed": "unsupported", "partial": "inconclusive",
+            }.get(str(feedback.get("verdict") or ""), "inconclusive")
+            self.repository.add_artifact(
+                run_id,
+                "scientific_feedback",
+                "Scientific Experiment Feedback",
+                scientific_feedback(integrity_contract, result, scientific_verdict),
+                step_id,
+                self.critic_agent.name,
+                parent_artifact_id=revision_artifact.id,
+            )
+            iteration_run = self.repository.get_run(run_id)
+            iteration_run.feedback_iteration = max(
+                iteration_run.feedback_iteration, iteration
+            )
+            self.repository.save_run(iteration_run)
+            if feedback["requires_follow_up"]:
+                self.repository.add_artifact(
+                    run_id,
+                    "plan",
+                    f"Refined Research Plan (Feedback {iteration})",
+                    feedback["revised_plan"],
+                    "research_plan",
+                    self.planning_agent.name,
+                    parent_artifact_id=revision_artifact.id,
+                )
+            state_run = self.repository.get_run(run_id)
+            research_state = build_research_state(state_run.artifacts)
+            self.repository.add_artifact(
+                run_id,
+                "research_state",
+                f"Research State {iteration}",
+                research_state,
+                step_id,
+                self.critic_agent.name,
+                parent_artifact_id=revision_artifact.id,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.critic_agent.name,
+                (
+                    "Created feedback-based revision and refined the research plan."
+                    if feedback["requires_follow_up"]
+                    else "Created feedback-based revision without another plan."
+                ),
+                {"result": result},
+                feedback,
+                skill_calls=skill_calls,
+            )
+        elif step_id == "report_export":
+            self.supervisor_agent.require_agent(delegation, "writer")
+            self._require_tools(package, "render_report")
+            current_state = build_research_state(run.artifacts)
+            previous_state = next(
+                (
+                    artifact
+                    for artifact in reversed(run.artifacts)
+                    if artifact.type == "research_state"
+                ),
+                None,
+            )
+            if previous_state is None or previous_state.content != current_state:
+                self.repository.add_artifact(
+                    run_id,
+                    "research_state",
+                    "Final Research State",
+                    current_state,
+                    step_id,
+                    self.writer_agent.name,
+                    parent_artifact_id=(
+                        run.artifacts[-1].id if run.artifacts else None
+                    ),
+                )
+                run = self.repository.get_run(run_id)
+            try:
+                report = self._produce_validated(
+                    run_id,
+                    step_id,
+                    lambda revision: self.writer_agent.build_report(
+                        run.artifacts,
+                        instructions=self._with_revision(instructions, revision),
+                    ),
+                )
+            except ReportFactAuditError as exc:
+                draft_artifact = self.repository.add_artifact(
+                    run_id,
+                    "report_draft",
+                    "Report Draft Requiring Fact Repair",
+                    exc.draft,
+                    step_id,
+                    self.writer_agent.name,
+                )
+                audit_artifact = self.repository.add_artifact(
+                    run_id,
+                    "report_audit",
+                    "Internal Report Fact Audit",
+                    exc.audit,
+                    step_id,
+                    self.writer_agent.name,
+                    parent_artifact_id=draft_artifact.id,
+                )
+                failed_report_run = self.repository.get_run(run_id)
+                self.repository.add_artifact(
+                    run_id,
+                    "research_state",
+                    "Research State After Report Audit",
+                    build_research_state(failed_report_run.artifacts),
+                    step_id,
+                    self.writer_agent.name,
+                    parent_artifact_id=audit_artifact.id,
+                )
+                raise
+            if self.competition_mode:
+                allowed, reason = competition_export_allowed(report)
+                if not allowed:
+                    raise ValueError(f"COMPETITION_REPORT_BLOCKED:{reason}")
+            report_artifact = self.repository.add_artifact(
+                run_id,
+                "report",
+                "Competition Report",
+                report,
+                step_id,
+                self.writer_agent.name,
+            )
+            completed_report_run = self.repository.get_run(run_id)
+            self.repository.add_artifact(
+                run_id,
+                "research_state",
+                "Research State After Report Export",
+                build_research_state(completed_report_run.artifacts),
+                step_id,
+                self.writer_agent.name,
+                parent_artifact_id=report_artifact.id,
+            )
+            self._trace(
+                run_id,
+                step_id,
+                self.writer_agent.name,
+                "Created report artifact.",
+                {"artifact_count": len(run.artifacts)},
+                report,
+                skill_calls=skill_calls,
+            )
+        else:
+            raise ValueError(f"Unknown workflow step: {step_id}")
+        return self.repository.get_run(run_id)
+
+    def rerun_from(self, run_id: str, step_id: str):
+        # A no-selectable-candidate outcome is a scientific revision, not an
+        # invalidation of the previous scientific record.  It must append a new
+        # hypothesis/evidence round instead of routing through destructive
+        # ``_rerun_from`` cleanup.
+        if (
+            step_id == "hypothesis_generation"
+            and self.repository.get_run(run_id).status == "hypothesis_revision_required"
+        ):
+            self.repository.update_workflow_state(
+                run_id,
+                status="running",
+                current_step=step_id,
+                automatic=False,
+                stop_requested=False,
+            )
+            try:
+                with self._run_lock(run_id):
+                    self._append_hypothesis_revision_round(run_id)
+            except LLMRequestCancelled:
+                self.repository.update_workflow_state(
+                    run_id, status="paused", automatic=False, stop_requested=True
+                )
+                raise
+            except Exception as exc:
+                self.repository.update_workflow_state(run_id, status=failure_state_for(exc), automatic=False)
+                raise
+            return self.repository.update_workflow_state(
+                run_id, status="paused", current_step="evidence_reasoning",
+                automatic=False, stop_requested=False,
+            )
+        self.repository.update_workflow_state(
+            run_id,
+            status="running",
+            current_step=step_id,
+            automatic=False,
+            stop_requested=False,
+        )
+        try:
+            with self._run_lock(run_id):
+                self._rerun_from(run_id, step_id)
+        except LLMRequestCancelled:
+            self.repository.update_workflow_state(
+                run_id,
+                status="paused",
+                automatic=False,
+                stop_requested=True,
+            )
+            raise
+        except Exception as exc:
+            self.repository.update_workflow_state(
+                run_id,
+                status=failure_state_for(exc),
+                automatic=False,
+            )
+            raise
+        return self.repository.update_workflow_state(
+            run_id,
+            status="paused",
+            automatic=False,
+            stop_requested=False,
+        )
+
+    def _rerun_from(self, run_id: str, step_id: str):
+        run = self.repository.get_run(run_id)
+        start = ORDER.index(step_id)
+        preserve_requested_step = any(
+            artifact.locked and artifact.source_step == step_id
+            for artifact in run.artifacts
+        )
+        if step_id == "experiment_run_analysis":
+            # An experiment retry is another attempt of the current iteration.
+            # Keep the revision -> refined plan -> task -> bundle lineage intact;
+            # otherwise recursive cleanup silently falls back to the first task.
+            affected_steps = {"report_export"}
+        else:
+            affected_steps = set(
+                ORDER[start + 1 :] if preserve_requested_step else ORDER[start:]
+            )
+        removed_ids = {
+            artifact.id
+            for artifact in run.artifacts
+            if artifact.source_step in affected_steps
+        }
+        changed = True
+        while changed:
+            changed = False
+            for artifact in run.artifacts:
+                if (
+                    artifact.id not in removed_ids
+                    and artifact.parent_artifact_id in removed_ids
+                ):
+                    removed_ids.add(artifact.id)
+                    changed = True
+        if step_id == "experiment_run_analysis":
+            latest = self._latest_by_type(run.artifacts)
+            task = latest.get("experiment_task")
+            bundle = latest.get("experiment_bundle")
+            previous_result = latest.get("experiment_result")
+            experiment_id = str(task.content.get("experiment_id") or "") if task else ""
+            if experiment_id and experiment_id not in run.force_new_attempt_experiment_ids:
+                run.force_new_attempt_experiment_ids.append(experiment_id)
+            self.repository.save_run(run)
+            self.repository.append_event(
+                run_id,
+                step_id,
+                "Workflow Engine",
+                "Retrying the current experiment iteration with a new attempt.",
+                data={
+                    "retry_mode": "new_attempt_same_iteration",
+                    "experiment_id": experiment_id,
+                    "task_artifact_id": task.id if task else None,
+                    "bundle_artifact_id": bundle.id if bundle else None,
+                    "previous_result_artifact_id": (
+                        previous_result.id if previous_result else None
+                    ),
+                },
+                output_summary={
+                    "lineage_preserved": True,
+                    "report_invalidated": True,
+                },
+            )
+        else:
+            self.repository.save_run(run)
+        if removed_ids:
+            # Save any branch/attempt state first.  append_event reloads the
+            # durable run, so this event cannot be overwritten by a stale run.
+            self.repository.append_event(
+                run_id,
+                step_id,
+                "Workflow Engine",
+                "Superseded artifacts retained for append-only rerun.",
+                data={"superseded_artifact_ids": sorted(removed_ids), "mode": "append_only"},
+            )
+        return self.run_step(run_id, step_id)
+
+    def _append_hypothesis_revision_round(self, run_id: str):
+        """Run the next hypothesis/evidence pair without removing prior rounds."""
+        before = self.repository.get_run(run_id)
+        previous_hypotheses = [
+            artifact.id for artifact in before.artifacts if artifact.type == "hypothesis"
+        ]
+        previous_reasoning = [
+            artifact.id for artifact in before.artifacts if artifact.type == "reasoning"
+        ]
+        self.repository.append_event(
+            run_id,
+            "hypothesis_generation",
+            "Workflow Engine",
+            "Starting append-only hypothesis revision round.",
+            data={
+                "mode": "append_only_hypothesis_revision",
+                "preserved_hypothesis_artifact_ids": previous_hypotheses,
+                "preserved_reasoning_artifact_ids": previous_reasoning,
+            },
+            output_summary={"historical_artifacts_removed": 0},
+        )
+        self.run_step(run_id, "hypothesis_generation")
+        return self.run_step(run_id, "evidence_reasoning")
+
+    def _clear_forced_experiment_attempt(
+        self, run_id: str, experiment_id: str | None
+    ) -> None:
+        if not experiment_id:
+            return
+        refreshed = self.repository.get_run(run_id)
+        if experiment_id not in refreshed.force_new_attempt_experiment_ids:
+            return
+        refreshed.force_new_attempt_experiment_ids = [
+            item
+            for item in refreshed.force_new_attempt_experiment_ids
+            if item != experiment_id
+        ]
+        self.repository.save_run(refreshed)
+
+    def add_user_hypothesis(self, run_id: str, claim: str, replacement_index: int | None = None):
+        with self._run_lock(run_id):
+            # This endpoint is a recovery action: it persists a user-supplied
+            # candidate and immediately re-runs evidence reasoning.  A run that
+            # was intentionally paused still carries its cancellation marker;
+            # clear that marker before the nested step starts, otherwise
+            # ``run_step`` correctly (but incorrectly for this recovery path)
+            # cancels the new work before it can inspect the candidate.
+            if self.repository.get_run(run_id).stop_requested:
+                self.repository.update_workflow_state(run_id, stop_requested=False)
+            return self._add_user_hypothesis(run_id, claim, replacement_index)
+
+    def select_hypothesis(self, run_id: str, candidate_index: int):
+        with self._run_lock(run_id):
+            run = self.repository.get_run(run_id)
+            latest = self._latest_by_type(run.artifacts)
+            reasoning_artifact = latest.get("reasoning")
+            if (
+                reasoning_artifact is None
+                or reasoning_artifact.source_step != "evidence_reasoning"
+            ):
+                raise ValueError("HYPOTHESIS_REASONING_REQUIRED")
+            assessments = reasoning_artifact.content.get("candidate_assessments")
+            if not isinstance(assessments, list):
+                raise ValueError("HYPOTHESIS_REASONING_REQUIRED")
+            assessment = next(
+                (
+                    item
+                    for item in assessments
+                    if isinstance(item, dict)
+                    and item.get("candidate_index") == candidate_index
+                ),
+                None,
+            )
+            if assessment is None:
+                raise ValueError("HYPOTHESIS_SELECTION_INDEX_INVALID")
+            selected = assessment.get("revised_hypothesis") or assessment.get(
+                "original_hypothesis"
+            )
+            candidates = normalize_candidates(
+                latest["hypothesis"].content.get("candidates") or []
+            )
+            original_candidate = (
+                candidates[candidate_index]
+                if candidate_index < len(candidates)
+                else None
+            )
+            # A user-selected hypothesis is a problem-definition anchor.  The
+            # critic may add an evidence assessment, but may not silently swap
+            # its claim for a different, model-authored hypothesis.
+            if isinstance(original_candidate, dict) and original_candidate.get("source") == "user":
+                selected = deepcopy(original_candidate)
+            if not isinstance(selected, dict) or not str(selected.get("claim") or "").strip():
+                raise ValueError("HYPOTHESIS_SELECTION_CANDIDATE_INVALID")
+
+            downstream_steps = set(ORDER[ORDER.index("research_plan"):])
+            run.artifacts = [
+                artifact
+                for artifact in run.artifacts
+                if (
+                    artifact.locked
+                    or (
+                        artifact.type != "hypothesis_selection"
+                        and artifact.source_step not in downstream_steps
+                    )
+                )
+            ]
+            self.repository.save_run(run)
+            selection_content = {
+                "selected": [deepcopy(selected)],
+                "selected_indexes": [candidate_index],
+                "selection_mode": "user_selected_after_evidence_reasoning",
+                "selection_reason": "Selected by the user after reviewing model reasoning.",
+                "assessment_status": assessment.get("status") or "",
+                "evaluation": deepcopy(assessment.get("evaluation") or {}),
+            }
+            self.repository.add_artifact(
+                run_id,
+                "hypothesis_selection",
+                "User-Selected Hypothesis",
+                selection_content,
+                "evidence_reasoning",
+                "Human Researcher",
+                parent_artifact_id=reasoning_artifact.id,
+            )
+            self.repository.append_event(
+                run_id,
+                "evidence_reasoning",
+                "Human Researcher",
+                "Selected a hypothesis after reviewing evidence reasoning.",
+                data={
+                    "candidate_index": candidate_index,
+                    "reasoning_artifact_id": reasoning_artifact.id,
+                },
+                input_summary={"candidate_count": len(assessments)},
+                output_summary={
+                    "selected_index": candidate_index,
+                    "claim": selected.get("claim") or "",
+                },
+                provider_mode=self.llm_provider.mode,
+                fallback_used=False,
+            )
+            return self.repository.get_run(run_id)
+
+    def auto_select_hypothesis(self, run_id: str):
+        with self._run_lock(run_id):
+            run = self.repository.get_run(run_id)
+            latest = self._latest_by_type(run.artifacts)
+            reasoning = latest.get("reasoning")
+            assessments = (
+                reasoning.content.get("candidate_assessments")
+                if reasoning is not None
+                else None
+            )
+            if not isinstance(assessments, list):
+                raise ValueError("HYPOTHESIS_REASONING_REQUIRED")
+            candidate_count = len(
+                normalize_candidates(latest["hypothesis"].content.get("candidates") or [])
+            )
+            completed = {
+                item.get("candidate_index")
+                for item in assessments
+                if isinstance(item, dict)
+            }
+            if completed != set(range(candidate_count)):
+                raise ValueError(
+                    f"HYPOTHESIS_CANDIDATE_REVIEWS_INCOMPLETE:{len(completed)}/{candidate_count}"
+                )
+            viable = [item for item in assessments if self._assessment_selectable(item)]
+            if not viable:
+                revision_required = {
+                    "code": "NO_SELECTABLE_HYPOTHESIS",
+                    "message": "All reviewed hypotheses are rejected or evidence-insufficient.",
+                    "required_candidates": candidate_count,
+                    "completed_valid_candidates": len(completed),
+                    "reviewed_candidate_ids": [self._assessment_id(item) for item in assessments],
+                    "selectable_candidate_ids": [],
+                    "next_action": "hypothesis_revision_required",
+                    "candidate_assessments": deepcopy(assessments),
+                }
+                existing = [
+                    artifact for artifact in run.artifacts
+                    if artifact.type == "hypothesis_revision_required"
+                    and artifact.parent_artifact_id == reasoning.id
+                ]
+                if not existing:
+                    self.repository.add_artifact(
+                        run_id,
+                        "hypothesis_revision_required",
+                        "Hypothesis Revision Required",
+                        revision_required,
+                        "evidence_reasoning",
+                        "Workflow Engine",
+                        parent_artifact_id=reasoning.id,
+                    )
+                    self.repository.append_event(
+                        run_id,
+                        "evidence_reasoning",
+                        "Workflow Engine",
+                        "Evidence reasoning completed; hypothesis revision is required before selection.",
+                        data={"code": "NO_SELECTABLE_HYPOTHESIS", "status": "hypothesis_revision_required"},
+                        input_summary={"candidate_count": candidate_count},
+                        output_summary={"reviewed_candidates": len(completed), "selectable_candidates": 0, "recoverable": True},
+                        provider_mode=self.llm_provider.mode,
+                    )
+                return self.repository.update_workflow_state(
+                    run_id,
+                    status="hypothesis_revision_required",
+                    current_step="evidence_reasoning",
+                    automatic=False,
+                    stop_requested=False,
+                )
+
+            ranked = [
+                item for item in viable
+                if isinstance((item.get("evaluation") or {}).get("scores"), dict)
+                and set((item.get("evaluation") or {})["scores"]) == set(WEIGHTS)
+            ]
+            if ranked:
+                winner = min(
+                    ranked,
+                    key=lambda item: (
+                        -weighted_score(item["evaluation"]["scores"]),
+                        int(item["candidate_index"]),
+                    ),
+                )
+                mode = "automatic"
+                reason = "Highest server-computed weighted score among valid selectable candidates."
+            else:
+                winner = min(viable, key=lambda item: int(item["candidate_index"]))
+                mode = "automatic_fallback"
+                reason = "No reliable ranking was available; selected the first valid selectable candidate."
+            selected = winner.get("revised_hypothesis") or winner.get("original_hypothesis")
+            candidates = normalize_candidates(latest["hypothesis"].content.get("candidates") or [])
+            candidate_index = int(winner["candidate_index"])
+            original_candidate = (
+                candidates[candidate_index]
+                if candidate_index < len(candidates)
+                else None
+            )
+            if isinstance(original_candidate, dict) and original_candidate.get("source") == "user":
+                selected = deepcopy(original_candidate)
+            available_ids = [self._assessment_id(item) for item in viable]
+            selected_id = self._assessment_id(winner)
+            content = {
+                "selected": [deepcopy(selected)],
+                "selected_indexes": [winner["candidate_index"]],
+                "selection_mode": mode,
+                "selection_reason": reason,
+                "selected_hypothesis_id": selected_id,
+                "available_hypothesis_ids": available_ids,
+                "assessment_status": winner.get("status") or "",
+                "evaluation": deepcopy(winner.get("evaluation") or {}),
+            }
+            self.repository.add_artifact(
+                run_id, "hypothesis_selection", "Automatically Selected Hypothesis",
+                content, "evidence_reasoning", "Workflow Engine",
+                parent_artifact_id=reasoning.id,
+            )
+            self.repository.append_event(
+                run_id, "evidence_reasoning", "Workflow Engine",
+                "Automatically selected a fully reviewed hypothesis.",
+                data={
+                    "selection_mode": mode,
+                    "selection_reason": reason,
+                    "selected_hypothesis_id": selected_id,
+                    "available_hypothesis_ids": available_ids,
+                },
+                output_summary={"selected_index": winner["candidate_index"]},
+                provider_mode=self.llm_provider.mode,
+            )
+            return self.repository.get_run(run_id)
+
+    @staticmethod
+    def _assessment_selectable(assessment: dict) -> bool:
+        selected = assessment.get("revised_hypothesis") or assessment.get("original_hypothesis")
+        return (
+            isinstance(selected, dict)
+            and bool(str(selected.get("claim") or "").strip())
+            and assessment.get("status") in {"verified", "revised"}
+            and assessment.get("recommendation") in {"GO", "REVISE"}
+        )
+
+    @staticmethod
+    def _assessment_id(assessment: dict) -> str:
+        return f"hypothesis_{int(assessment.get('candidate_index', 0)) + 1}"
+
+    def _add_user_hypothesis(self, run_id: str, claim: str, replacement_index: int | None = None):
+        run = self.repository.get_run(run_id)
+        latest = self._latest_by_type(run.artifacts)
+        problem = latest["problem"].content
+        evidence_cards = latest["evidence"].content["references"]
+        evidence = [EvidenceCard.model_validate(card) for card in evidence_cards]
+        delegation = self.supervisor_agent.delegate("hypothesis_generation")
+        self.supervisor_agent.require_agent(delegation, "idea")
+        package = self.skill_runtime.prepare(
+            "hypothesis_generation",
+            delegation.agent_id,
+            self.configured_tools,
+        )
+        instructions = package.instructions
+        skill_calls = [delegation.tool_call, self._runtime_call(package)]
+        analyzed = self.hypothesis_agent.analyze_user_hypothesis(
+            claim,
+            problem,
+            evidence,
+            instructions=instructions,
+        )
+        # The user-provided claim defines the controlled research question.
+        # Analysis may enrich its method/evidence fields but must not replace
+        # that question with a model-generated alternative.
+        analyzed["claim"] = claim
+        analyzed["source"] = "user"
+        analyzed = normalize_candidate(analyzed)
+        current = latest.get("hypothesis")
+        existing = []
+        if current and isinstance(current.content.get("candidates"), list):
+            existing = normalize_candidates(current.content["candidates"])
+        if len(existing) >= MAX_HYPOTHESIS_CANDIDATES:
+            if replacement_index is None:
+                raise ValueError("HYPOTHESIS_REPLACEMENT_REQUIRED")
+            if replacement_index < 0 or replacement_index >= len(existing):
+                raise ValueError("HYPOTHESIS_REPLACEMENT_INDEX_INVALID")
+            candidates = list(existing)
+            candidates[replacement_index] = analyzed
+        else:
+            if replacement_index is not None:
+                if replacement_index < 0 or replacement_index >= MAX_HYPOTHESIS_CANDIDATES:
+                    raise ValueError("HYPOTHESIS_REPLACEMENT_INDEX_INVALID")
+                if replacement_index < len(existing):
+                    candidates = list(existing)
+                    candidates[replacement_index] = analyzed
+                else:
+                    candidates = existing + [analyzed]
+            else:
+                candidates = existing + [analyzed]
+        content = {
+            "candidates": candidates[:MAX_HYPOTHESIS_CANDIDATES],
+            "user_hypothesis": analyzed,
+        }
+        round_metadata = self._next_hypothesis_round(run, latest)
+        content["hypothesis_round"] = {
+            **round_metadata,
+            "created_candidate_ids": [
+                str(candidate.get("candidate_id") or "")
+                for candidate in content["candidates"]
+            ],
+        }
+        self.repository.add_artifact(
+            run_id,
+            "hypothesis",
+            f"Candidate Hypothesis with User Input · Round {round_metadata['round_index']}",
+            content,
+            "hypothesis_generation",
+            self.hypothesis_agent.name,
+        )
+        self._trace(
+            run_id,
+            "hypothesis_generation",
+            self.hypothesis_agent.name,
+            "Analyzed user-supplied hypothesis against verified evidence.",
+            {"claim": claim, "evidence_count": len(evidence)},
+            analyzed,
+            skill_calls=skill_calls,
+        )
+        # A user supplied revision is also an append-only scientific round.
+        # Earlier reasoning/evidence may be superseded for selection, but they
+        # remain immutable provenance records and must stay inspectable.
+        self.repository.append_event(
+            run_id,
+            "hypothesis_generation",
+            "Workflow Engine",
+            "Appended user-supplied hypothesis round without deleting prior evidence reasoning.",
+            data={"round_id": content["hypothesis_round"]["round_id"]},
+            output_summary={"historical_artifacts_removed": 0},
+        )
+        return self.run_step(run_id, "evidence_reasoning")
+
+    def _latest_by_type(self, artifacts):
+        latest = {}
+        for artifact in artifacts:
+            latest[artifact.type] = artifact
+        return latest
+
+    def _next_hypothesis_round(self, run, latest: dict) -> dict:
+        rounds: list[dict] = []
+        for artifact in run.artifacts:
+            if artifact.type != "hypothesis":
+                continue
+            value = artifact.content.get("hypothesis_round")
+            if isinstance(value, dict):
+                rounds.append(value)
+        prior = max(rounds, key=lambda item: int(item.get("round_index") or 0), default={})
+        round_index = int(prior.get("round_index") or 0) + 1
+        revision = latest.get("hypothesis_revision_required")
+        revision_content = revision.content if revision is not None else {}
+        reasoning = latest.get("reasoning")
+        assessments = (
+            reasoning.content.get("candidate_assessments")
+            if reasoning is not None and isinstance(reasoning.content.get("candidate_assessments"), list)
+            else []
+        )
+        feedback = [
+            {
+                "candidate_id": str(item.get("candidate_id") or self._assessment_id(item)),
+                "status": str(item.get("status") or item.get("verdict") or ""),
+                "reason": str(item.get("reasoning") or item.get("reason") or ""),
+            }
+            for item in assessments if isinstance(item, dict)
+        ]
+        return {
+            "round_id": f"HYPOTHESIS-ROUND-{round_index:03d}",
+            "round_index": round_index,
+            "parent_round_id": str(prior.get("round_id") or ""),
+            "revision_reason": str(
+                revision_content.get("code") or revision_content.get("message") or "initial_hypothesis_generation"
+            ),
+            "scientific_feedback": feedback,
+        }
+
+    def _hypothesis_revision_context(self, run, round_metadata: dict) -> dict:
+        if int(round_metadata.get("round_index") or 1) <= 1:
+            return {}
+        prior_hypothesis = next(
+            (artifact for artifact in reversed(run.artifacts) if artifact.type == "hypothesis"),
+            None,
+        )
+        if prior_hypothesis is None:
+            return {}
+        prior_round = prior_hypothesis.content.get("hypothesis_round")
+        return {
+            "parent_round_id": round_metadata.get("parent_round_id") or "",
+            "revision_reason": round_metadata.get("revision_reason") or "",
+            "scientific_feedback": deepcopy(round_metadata.get("scientific_feedback") or []),
+            "prior_candidates": [
+                {
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "claim": str(candidate.get("claim") or ""),
+                    "source_gap_ids": list(candidate.get("source_gap_ids") or []),
+                }
+                for candidate in prior_hypothesis.content.get("candidates") or []
+                if isinstance(candidate, dict)
+            ],
+            "instruction": (
+                "Do not repeat the prior candidates. Address the recorded evidence gaps, "
+                "support/contradiction/missing-evidence feedback, and cite valid GAP IDs."
+            ),
+            "prior_round": deepcopy(prior_round) if isinstance(prior_round, dict) else {"legacy_artifact_id": prior_hypothesis.id},
+        }
+
+    @staticmethod
+    def _runtime_repair_parent_attempt_id(
+        artifacts,
+        *,
+        experiment_id: str,
+        task_artifact,
+        fallback_id: str | None,
+    ) -> str | None:
+        """Resolve a repair-candidate parent across durable checkpoint versions.
+
+        ``normalized_bundle`` is intentionally nullable: failed candidates are
+        audit evidence even when the model response could not be normalized.
+        New candidate records carry task/experiment ownership independently;
+        the plan-artifact fallback preserves recovery for checkpoints written
+        before those fields were introduced.
+        """
+        task_id = task_artifact.id
+        plan_id = task_artifact.parent_artifact_id
+        for artifact in reversed(artifacts):
+            if artifact.type != "experiment_candidate_attempt":
+                continue
+            content = artifact.content
+            normalized = content.get("normalized_bundle")
+            manifest = (
+                normalized.get("manifest")
+                if isinstance(normalized, dict)
+                else {}
+            )
+            candidate_experiment_id = str(
+                content.get("experiment_id")
+                or manifest.get("experiment_id")
+                or (content.get("manifest") or {}).get("experiment_id")
+                or ""
+            )
+            if candidate_experiment_id == experiment_id:
+                return artifact.id
+            if content.get("task_artifact_id") == task_id:
+                return artifact.id
+            # Older checkpoints did not persist task/experiment ownership on
+            # runtime repair candidates.  Their durable plan reference is the
+            # authoritative lineage key; do not infer ownership from an
+            # optional normalized Bundle.
+            if (
+                not candidate_experiment_id
+                and plan_id
+                and content.get("plan_artifact_id") == plan_id
+            ):
+                return artifact.id
+        return fallback_id
+
+    def _build_tool_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        registry.register("read_run", self.repository.get_run)
+        registry.register("read_artifact", self._read_artifact)
+        registry.register("literature_search", self.literature_provider.search)
+        registry.register("query_wiki", self.knowledge_service.wiki.query)
+        registry.register("search_local_literature", self.knowledge_service.library.search)
+        registry.register("propose_wiki_changes", self._identity_tool)
+        registry.register("build_experiment_bundle", self.experiment_agent.generate_bundle)
+        registry.register("read_experiment_result", self._read_experiment_result)
+        registry.register("audit_evidence", self._identity_tool)
+        registry.register("audit_result", self._identity_tool)
+        repair_dataset_cache = getattr(
+            self.experiment_provider, "quarantine_failed_dataset_download", self._identity_tool
+        )
+        registry.register("repair_dataset_cache", repair_dataset_cache)
+        registry.register("retry_experiment", self.experiment_provider.run)
+        registry.register("render_report", self.writer_agent.build_report)
+        provider_name = type(self.experiment_provider).__name__
+        execution_tool = "ssh_run" if provider_name == "RemoteGpuExperimentProvider" else "local_process_run"
+        registry.register(execution_tool, self.experiment_provider.run)
+        return registry
+
+    def _read_artifact(self, run_id: str, artifact_id: str):
+        run = self.repository.get_run(run_id)
+        return next(
+            artifact for artifact in run.artifacts if artifact.id == artifact_id
+        )
+
+    def _read_experiment_result(self, run_id: str):
+        latest = self._latest_by_type(self.repository.get_run(run_id).artifacts)
+        return latest.get("experiment_result")
+
+    @staticmethod
+    def _identity_tool(value):
+        return value
+
+    @staticmethod
+    def _normalize_nonempty_hypothesis(raw: dict) -> dict:
+        hypothesis = normalize_hypothesis_content(raw)
+        if not hypothesis["candidates"]:
+            raise ValueError("HYPOTHESIS_CANDIDATES_EMPTY")
+        issues = hypothesis_candidate_issues(hypothesis)
+        if issues:
+            hypothesis["_validation_issues"] = issues
+        return hypothesis
+
+    @staticmethod
+    def _focused_evidence_for_candidates(
+        evidence: list[dict], candidates: list[dict], limit: int = 12
+    ) -> list[dict]:
+        referenced_titles: set[str] = set()
+        referenced_urls: set[str] = set()
+        for candidate in candidates:
+            for basis in candidate.get("evidence_basis") or []:
+                if not isinstance(basis, dict):
+                    continue
+                title = str(basis.get("source_title") or "").strip().casefold()
+                url = str(basis.get("source_url") or "").strip().casefold()
+                if title:
+                    referenced_titles.add(title)
+                if url:
+                    referenced_urls.add(url)
+
+        verified = [
+            item
+            for item in evidence
+            if isinstance(item, dict) and item.get("verified") is True
+        ]
+        scoped = [
+            item
+            for item in verified
+            if str(item.get("title") or "").strip().casefold() in referenced_titles
+            or str(item.get("url") or "").strip().casefold() in referenced_urls
+        ]
+        remaining = [item for item in verified if item not in scoped]
+        remaining.sort(
+            key=lambda item: (
+                -float(item.get("relevance") or 0.0),
+                -float(item.get("reliability") or 0.0),
+                str(item.get("title") or ""),
+            )
+        )
+        focused = scoped + remaining
+        return focused[: max(len(scoped), max(1, limit))]
+
+    @staticmethod
+    def _stable_hash(value) -> str:
+        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _load_idea_review_checkpoint(
+        self, run_id: str, candidate_ids: list[str], evidence_set_hash: str,
+        candidates: list[dict],
+    ) -> dict | None:
+        run = self.repository.get_run(run_id)
+        for artifact in reversed(run.artifacts):
+            if artifact.type != "idea_review_checkpoint":
+                continue
+            content = artifact.content
+            if (
+                content.get("prompt_version") != EVIDENCE_REASONING_PROMPT_VERSION
+                or content.get("evidence_set_hash") != evidence_set_hash
+                or content.get("candidate_ids") != candidate_ids
+            ):
+                continue
+            try:
+                return normalize_idea_review(content.get("review") or {}, candidates)
+            except ValueError:
+                continue
+        return None
+
+    def _load_candidate_checkpoint(
+        self, run_id: str, candidate_index: int, candidate_id: str,
+        evidence_set_hash: str, hypothesis: dict, evaluation: dict,
+    ) -> dict | None:
+        run = self.repository.get_run(run_id)
+        for artifact in reversed(run.artifacts):
+            if artifact.type != "candidate_reasoning_checkpoint":
+                continue
+            content = artifact.content
+            if (
+                content.get("candidate_index") != candidate_index
+                or content.get("candidate_id") != candidate_id
+                or content.get("prompt_version") != EVIDENCE_REASONING_PROMPT_VERSION
+                or content.get("evidence_set_hash") != evidence_set_hash
+            ):
+                continue
+            assessment = content.get("assessment")
+            if not isinstance(assessment, dict):
+                continue
+            try:
+                normalized = self._candidate_assessment(
+                    candidate_index,
+                    hypothesis,
+                    evaluation,
+                    assessment.get("critic_reasoning") or {},
+                    assessment.get("evidence_audit") or {},
+                    enforce_evidence_gate=not self.llm_provider.fallback,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            normalized["recommendation"] = str(evaluation.get("decision") or "")
+            if normalized.get("status") != assessment.get("status"):
+                continue
+            return assessment
+        return None
+
+    @staticmethod
+    def _targeted_retrieval_summary(retrieval: dict) -> dict:
+        return {
+            "attempted": bool(retrieval.get("attempted")),
+            "queries": list(retrieval.get("queries") or []),
+            "original_evidence_count": int(
+                retrieval.get("original_evidence_count") or 0
+            ),
+            "retrieved_count": int(retrieval.get("retrieved_count") or 0),
+            "new_evidence_count": int(retrieval.get("new_evidence_count") or 0),
+            "round_limit": MAX_TARGETED_RETRIEVAL_ROUNDS,
+        }
+
+    def _recover_candidate_evidence(
+        self,
+        *,
+        run_id: str,
+        candidates: list[dict],
+        assessments: list[dict],
+        evidence_cards: list[dict],
+        instructions: str,
+    ) -> dict:
+        """Perform bounded candidate-specific retrieval before declaring failure.
+
+        A failed first evidence pass is a recovery signal, not a terminal decision.
+        We only invoke the loop when no candidate is currently selectable, preserving
+        useful human review results and avoiding unnecessary external searches.
+        """
+        cards = [deepcopy(item) for item in evidence_cards]
+        history: list[dict] = []
+        initial_count = len(cards)
+        if any(self._assessment_selectable(item) for item in assessments):
+            return {
+                "assessments": assessments,
+                "evidence_cards": cards,
+                "summary": {
+                    "attempted": False, "queries": [], "original_evidence_count": initial_count,
+                    "retrieved_count": 0, "new_evidence_count": 0,
+                    "round_limit": MAX_TARGETED_RETRIEVAL_ROUNDS, "history": history,
+                },
+            }
+
+        all_queries: list[str] = []
+        retrieved_count = 0
+        for round_number in range(1, MAX_TARGETED_RETRIEVAL_ROUNDS + 1):
+            pending = [
+                item for item in assessments
+                if item.get("status") in {"evidence_insufficient", "revised"}
+                and not self._assessment_selectable(item)
+            ]
+            if not pending:
+                break
+            query_by_index: dict[int, list[str]] = {}
+            for assessment in pending:
+                index = int(assessment["candidate_index"])
+                evidence_map = candidate_evidence_map(
+                    candidates[index], extract_claim_evidence(cards), analyze_research_gaps(extract_claim_evidence(cards))
+                )
+                queries = candidate_targeted_queries(
+                    candidates[index], evidence_map, assessment.get("critic_reasoning") or {}
+                )
+                if queries:
+                    query_by_index[index] = queries
+                    all_queries.extend(queries)
+            queries = list(dict.fromkeys(all_queries))[-12:]
+            if not queries:
+                break
+            collected = self.knowledge_service.collect_queries(run_id, queries)
+            additions = [card.model_dump() for card in collected.references]
+            prior_keys = {
+                self._stable_hash({
+                    "title": card.get("title"), "url": card.get("url"),
+                    "identifiers": card.get("identifiers") or {},
+                })
+                for card in cards
+            }
+            new_cards = [
+                card for card in additions
+                if self._stable_hash({
+                    "title": card.get("title"), "url": card.get("url"),
+                    "identifiers": card.get("identifiers") or {},
+                }) not in prior_keys
+            ]
+            cards.extend(new_cards)
+            retrieved_count += len(additions)
+            if (
+                collected.wiki_changes.papers
+                or collected.wiki_changes.gaps
+                or collected.wiki_changes.edges
+            ):
+                self.supervisor_agent.commit_wiki_changes(
+                    collected.wiki_changes, self.knowledge_service.wiki
+                )
+            self.repository.add_artifact(
+                run_id,
+                "targeted_retrieval",
+                f"Targeted Retrieval Round {round_number}",
+                {
+                    "round": round_number,
+                    "queries": query_by_index,
+                    "new_papers": new_cards,
+                    "warnings": list(collected.warnings),
+                    "sources": deepcopy(collected.sources),
+                },
+                "evidence_reasoning",
+                self.research_agent.name,
+            )
+
+            evidence_audit = build_evidence_audit(cards, candidates)
+            registry_ids = [entry["evidence_id"] for entry in evidence_audit["registry"]]
+            for assessment in pending:
+                index = int(assessment["candidate_index"])
+                audit = deepcopy(evidence_audit["candidate_audits"][index])
+                audit["registry"] = deepcopy(evidence_audit["registry"])
+                audit["registry_evidence_ids"] = registry_ids
+                critic = self.critic_agent.evidence_reasoning(
+                    candidates[index],
+                    [literature_card(card) for card in cards],
+                    evidence_audit=audit,
+                    evaluation=assessment.get("evaluation") or {},
+                    instructions=(
+                        f"{instructions}\n\nThis is targeted retrieval round {round_number}. "
+                        "Decide GO, REVISE, TARGETED_RETRIEVAL, or REJECT. Do not require a paper "
+                        "to have already proved the novel final hypothesis; require evidence for motivation, "
+                        "component mechanism, and research gap."
+                    ),
+                )
+                refreshed = self._candidate_assessment(
+                    index,
+                    candidates[index],
+                    assessment.get("evaluation") or {},
+                    critic,
+                    audit,
+                    enforce_evidence_gate=not self.llm_provider.fallback,
+                )
+                refreshed["critic_decision"] = self._critic_decision(refreshed)
+                decision = refreshed["critic_decision"]
+                if decision == "REJECT":
+                    refreshed["status"] = "rejected"
+                    refreshed["recommendation"] = "REJECT"
+                elif refreshed["status"] in {"verified", "revised"}:
+                    refreshed["recommendation"] = "GO" if decision == "GO" else "REVISE" if decision == "REVISE" else "GO"
+                else:
+                    refreshed["recommendation"] = "TARGETED_RETRIEVAL"
+                assessments[index] = refreshed
+            history.append({
+                "round": round_number,
+                "queries": query_by_index,
+                "new_papers": len(new_cards),
+                "new_evidence": len(extract_claim_evidence(new_cards)),
+                "candidate_statuses": [item.get("status") for item in assessments],
+            })
+            if any(self._assessment_selectable(item) for item in assessments):
+                break
+
+        for assessment in assessments:
+            if assessment.get("status") == "evidence_insufficient" and not self._assessment_selectable(assessment):
+                assessment["recommendation"] = "REJECTED_EVIDENCE_UNAVAILABLE"
+        return {
+            "assessments": assessments,
+            "evidence_cards": cards,
+            "summary": {
+                "attempted": bool(history), "queries": list(dict.fromkeys(all_queries)),
+                "original_evidence_count": initial_count, "retrieved_count": retrieved_count,
+                "new_evidence_count": len(extract_claim_evidence(cards)) - len(extract_claim_evidence(evidence_cards)),
+                "round_limit": MAX_TARGETED_RETRIEVAL_ROUNDS, "history": history,
+            },
+        }
+
+    @staticmethod
+    def _critic_decision(assessment: dict) -> str:
+        """Normalize legacy and current Critic outputs at one production boundary."""
+        critic = assessment.get("critic_reasoning") or {}
+        raw_decision = str(critic.get("decision") or "").strip().upper()
+        if raw_decision in {"GO", "REVISE", "TARGETED_RETRIEVAL", "REJECT"}:
+            return raw_decision
+        if raw_decision in {"EVIDENCE_INSUFFICIENT", "INSUFFICIENT", "NEEDS_MORE_EVIDENCE", "RETRIEVE_MORE"}:
+            return "TARGETED_RETRIEVAL"
+        if assessment.get("status") in {"verified", "revised"}:
+            return "GO" if assessment.get("recommendation") == "GO" else "REVISE"
+        if assessment.get("status") == "rejected":
+            return "REJECT"
+        return "TARGETED_RETRIEVAL"
+
+    @staticmethod
+    def _candidate_assessment(
+        candidate_index: int,
+        original_hypothesis: dict,
+        evaluation: dict,
+        critic_reasoning: dict,
+        evidence_audit: dict | None = None,
+        enforce_evidence_gate: bool = True,
+    ) -> dict:
+        if not isinstance(critic_reasoning, dict):
+            raise ValueError("EVIDENCE_REASONING_OUTPUT_INVALID")
+
+        original = normalize_candidate(original_hypothesis)
+        revised = deepcopy(original)
+        was_revised = False
+        for field in ("revised_hypothesis", "active_hypothesis", "selected"):
+            candidate = critic_reasoning.get(field)
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("claim"), str)
+                and candidate["claim"].strip()
+                and candidate["claim"] != original.get("claim")
+            ):
+                revised = normalize_candidate(candidate)
+                was_revised = True
+                break
+
+        explicit_status = critic_reasoning.get("status")
+        explicit_decision = str(critic_reasoning.get("decision") or "").strip().upper()
+        if was_revised:
+            status = "revised"
+        elif explicit_decision == "REJECT":
+            status = "rejected"
+        elif explicit_decision in {
+            "TARGETED_RETRIEVAL",
+            "EVIDENCE_INSUFFICIENT",
+            "INSUFFICIENT",
+            "NEEDS_MORE_EVIDENCE",
+            "RETRIEVE_MORE",
+        }:
+            status = "evidence_insufficient"
+        elif explicit_status in {"verified", "evidence_insufficient", "rejected"}:
+            status = explicit_status
+        elif evaluation["decision"] == "GO":
+            status = "verified"
+        elif evaluation["decision"] == "STOP":
+            status = "rejected"
+        else:
+            status = "evidence_insufficient"
+        evidence_gate = str((evidence_audit or {}).get("gate") or "UNKNOWN")
+        claim_evidence_issues = []
+        if enforce_evidence_gate and evidence_gate in {"PASS", "FAIL"}:
+            claim_evidence_map = critic_reasoning.get("claim_evidence_map")
+            allowed_ids = set(
+                (evidence_audit or {}).get("registry_evidence_ids")
+                or (evidence_audit or {}).get("matched_evidence_ids")
+                or []
+            )
+            if not isinstance(claim_evidence_map, list) or not claim_evidence_map:
+                claim_evidence_issues.append("CLAIM_EVIDENCE_MAP_MISSING")
+            else:
+                mapped_items = [
+                    item for item in claim_evidence_map if isinstance(item, dict)
+                ]
+                used_ids = {
+                    str(item.get("evidence_id") or "") for item in mapped_items
+                }
+                invalid_ids = sorted(
+                    evidence_id
+                    for evidence_id in used_ids
+                    if not evidence_id or evidence_id not in allowed_ids
+                )
+                if invalid_ids:
+                    claim_evidence_issues.append(
+                        f"CLAIM_EVIDENCE_ID_INVALID:{','.join(invalid_ids)}"
+                    )
+                substantive_support = [
+                    item
+                    for item in mapped_items
+                    if item.get("stance") == "support"
+                    and item.get("relation") in {"DIRECT", "INDIRECT"}
+                    and str(item.get("evidence_id") or "") in allowed_ids
+                ]
+                if not substantive_support:
+                    claim_evidence_issues.append(
+                        "DIRECT_OR_INDIRECT_SUPPORT_MISSING"
+                    )
+            if claim_evidence_issues:
+                status = "evidence_insufficient"
+
+        revision_reason = critic_reasoning.get("revision_reason")
+        if not isinstance(revision_reason, str):
+            revision_reason = ""
+        if was_revised and not revision_reason:
+            revision_reason = "Critic evidence reasoning revised the candidate claim."
+
+        return {
+            "candidate_index": candidate_index,
+            "status": status,
+            "original_hypothesis": original,
+            "revised_hypothesis": revised,
+            "was_revised": was_revised,
+            "revision_reason": revision_reason,
+            "evaluation": deepcopy(evaluation),
+            "critic_reasoning": deepcopy(critic_reasoning),
+            "evidence_audit": deepcopy(evidence_audit or {}),
+            "claim_evidence_issues": claim_evidence_issues,
+        }
+
+    @staticmethod
+    def _require_evidence_reasoned_hypothesis_selection(latest: dict) -> dict:
+        artifact = latest.get("hypothesis_selection")
+        if artifact is None or artifact.source_step != "evidence_reasoning":
+            raise ValueError("HYPOTHESIS_SELECTION_REQUIRED")
+        selection = artifact.content
+        selected = selection.get("selected") if isinstance(selection, dict) else None
+        if (
+            selection.get("selection_mode")
+            not in {
+                "user_selected_after_evidence_reasoning",
+                "evidence_reasoned_weighted_review",
+                "automatic",
+                "automatic_fallback",
+            }
+            or not isinstance(selected, list)
+            or len(selected) != 1
+        ):
+            raise ValueError("HYPOTHESIS_SELECTION_REQUIRED")
+        return selection
+
+    @classmethod
+    def _feedback_hypothesis(cls, latest: dict) -> dict:
+        reasoning = latest.get("reasoning")
+        active = reasoning.content.get("active_hypothesis") if reasoning else None
+        if isinstance(active, dict) and active:
+            hypothesis = deepcopy(active)
+        else:
+            selection = cls._require_evidence_reasoned_hypothesis_selection(latest)
+            hypothesis = deepcopy(selection["selected"][0])
+        plan = latest.get("plan")
+        objective = (
+            str(plan.content.get("objective") or "").strip()
+            if (
+                plan is not None
+                and isinstance(plan.content, dict)
+                # A Round 7 plan may be parented by its immutable candidate.
+                # Only feedback-refined plans may supersede the active claim.
+                and bool(plan.content.get("iteration_contract"))
+            )
+            else ""
+        )
+        if objective:
+            hypothesis["original_claim"] = hypothesis.get("claim") or ""
+            hypothesis["claim"] = objective
+            hypothesis["status"] = "active"
+        return hypothesis
+
+    @staticmethod
+    def _result_already_reviewed(artifacts, result_artifact) -> bool:
+        if result_artifact is None:
+            return False
+        revision = next(
+            (
+                artifact
+                for artifact in reversed(artifacts)
+                if artifact.type == "revision"
+                and artifact.parent_artifact_id == result_artifact.id
+            ),
+            None,
+        )
+        if revision is None:
+            return False
+        if revision.content.get("requires_follow_up") is not True:
+            return True
+        return any(
+            artifact.type == "plan" and artifact.parent_artifact_id == revision.id
+            for artifact in artifacts
+        )
+
+    @staticmethod
+    def _reviewed_result_count(artifacts) -> int:
+        revisions = [artifact for artifact in artifacts if artifact.type == "revision"]
+        reviewed_ids = {
+            artifact.parent_artifact_id
+            for artifact in revisions
+            if artifact.parent_artifact_id is not None
+        }
+        legacy_rounds = sum(
+            artifact.parent_artifact_id is None for artifact in revisions
+        )
+        return len(reviewed_ids) + legacy_rounds
+
+    @staticmethod
+    def _build_iteration_contract(
+        iteration: int,
+        previous_plan: dict,
+        revised_plan: dict,
+        feedback: dict,
+    ) -> dict:
+        tracked_fields = (
+            "method", "dataset", "comparisons", "evaluations", "procedure",
+            "parameters", "seeds", "success_criteria", "failure_criteria",
+            "stop_conditions", "optional_ablations",
+        )
+        changed_fields = [
+            field for field in tracked_fields
+            if previous_plan.get(field) != revised_plan.get(field)
+        ]
+        required_changes = []
+        for value in (
+            feedback.get("required_revision"),
+            feedback.get("next_action"),
+            feedback.get("feedback"),
+        ):
+            if isinstance(value, str) and value.strip() and value.strip() not in required_changes:
+                required_changes.append(value.strip())
+        for item in feedback.get("revisions") or []:
+            value = str(item).strip()
+            if value and value not in required_changes:
+                required_changes.append(value)
+        metrics = [
+            str(item.get("metric") or "").strip()
+            for item in revised_plan.get("evaluations") or []
+            if isinstance(item, dict) and str(item.get("metric") or "").strip()
+        ]
+        comparisons = []
+        for item in revised_plan.get("comparisons") or []:
+            if not isinstance(item, dict):
+                continue
+            baseline = str(item.get("baseline") or "").strip()
+            variant = str(item.get("variant") or "").strip()
+            label = " vs ".join(value for value in (baseline, variant) if value)
+            if label:
+                comparisons.append(label)
+        return {
+            "feedback_iteration": iteration,
+            "required_changes": required_changes,
+            "required_metrics": list(dict.fromkeys(metrics)),
+            "required_comparisons": list(dict.fromkeys(comparisons)),
+            "changed_fields": changed_fields,
+            "contract_status": "changed" if changed_fields else "needs_attention",
+        }
+
+    @staticmethod
+    def _output_language(run) -> str:
+        configured = str(getattr(run, "language", "") or "").strip()
+        if configured in {"zh-CN", "en"}:
+            return configured
+        text = " ".join(
+            str(value or "")
+            for value in (run.title, run.domain, run.problem_input, run.constraints)
+        )
+        return "zh-CN" if any("\u4e00" <= char <= "\u9fff" for char in text) else "en"
+
+    @staticmethod
+    def _with_output_language(instructions: str, output_language: str) -> str:
+        if output_language != "zh-CN":
+            return instructions
+        return (
+            f"{instructions}\n\n## 强制输出语言\n"
+            "本次研究使用中文。所有面向用户的分析、原因、限制、修改建议、"
+            "候选方向、选择理由和下一步动作必须使用简体中文。机器枚举、"
+            "JSON 字段名、错误码、原始指标键和英文学术检索式保持英文。"
+        )
+
+    @staticmethod
+    def _normalize_iteration_analysis(value, result: dict) -> dict:
+        analysis = value if isinstance(value, dict) else {}
+        source_analysis = (
+            result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+        )
+
+        def strings(field: str, fallback=()):
+            raw = analysis.get(field)
+            if not isinstance(raw, list):
+                raw = fallback
+            return [str(item).strip() for item in raw if str(item).strip()]
+
+        return {
+            "measured_facts": strings(
+                "measured_facts", source_analysis.get("observations") or []
+            ),
+            "failed_criteria": strings("failed_criteria"),
+            "improved_metrics": strings("improved_metrics"),
+            "degraded_metrics": strings("degraded_metrics"),
+            "uncertainties": strings(
+                "uncertainties", source_analysis.get("limitations") or []
+            ),
+            "methodological_issues": strings("methodological_issues"),
+            "causal_hypotheses": strings("causal_hypotheses"),
+            "knowledge_gaps": strings("knowledge_gaps"),
+        }
+
+    @staticmethod
+    def _normalize_iteration_queries(value) -> list[dict]:
+        if not isinstance(value, list):
+            return []
+        queries = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            query = str(item.get("query") or "").strip()
+            if not query:
+                continue
+            queries.append(
+                {
+                    "question": str(item.get("question") or "").strip(),
+                    "query": query,
+                    "trigger_metric": str(item.get("trigger_metric") or "").strip(),
+                    "observed_value": item.get("observed_value", ""),
+                    "reason": str(item.get("reason") or "").strip(),
+                }
+            )
+        return queries[:3]
+
+    def _collect_iteration_evidence(
+        self,
+        run_id: str,
+        query_specs: list[dict],
+    ) -> dict:
+        queries = [item["query"] for item in query_specs]
+        if not queries:
+            return {
+                "status": "EVIDENCE_INSUFFICIENT",
+                "query_specs": [],
+                "references": [],
+                "warnings": ["未生成需要外部资料回答的科学知识缺口。"],
+                "sources": {"calls": [], "wiki": 0, "local": 0, "external": 0},
+            }
+        collected = self.knowledge_service.collect_queries(run_id, queries)
+        references = []
+        for index, card in enumerate(collected.references[:12], start=1):
+            references.append(
+                {
+                    **card.model_dump(),
+                    "evidence_id": f"iteration-evidence-{index}",
+                }
+            )
+        if (
+            collected.wiki_changes.papers
+            or collected.wiki_changes.gaps
+            or collected.wiki_changes.edges
+        ):
+            self.supervisor_agent.commit_wiki_changes(
+                collected.wiki_changes, self.knowledge_service.wiki
+            )
+        return {
+            "status": "SUFFICIENT" if references else "EVIDENCE_INSUFFICIENT",
+            "query_specs": deepcopy(query_specs),
+            "references": references,
+            "warnings": list(collected.warnings),
+            "sources": deepcopy(collected.sources),
+        }
+
+    @staticmethod
+    def _normalize_iteration_direction(value) -> dict:
+        direction = value if isinstance(value, dict) else {}
+        assessments = direction.get("evidence_assessment")
+        candidates = direction.get("optimization_candidates")
+        selected = direction.get("selected_direction")
+        return {
+            "evidence_sufficiency": (
+                direction.get("evidence_sufficiency")
+                if direction.get("evidence_sufficiency")
+                in {"SUFFICIENT", "EVIDENCE_INSUFFICIENT"}
+                else "EVIDENCE_INSUFFICIENT"
+            ),
+            "evidence_assessment": [
+                deepcopy(item)
+                for item in (assessments if isinstance(assessments, list) else [])
+                if isinstance(item, dict)
+            ],
+            "optimization_candidates": [
+                deepcopy(item)
+                for item in (candidates if isinstance(candidates, list) else [])[:4]
+                if isinstance(item, dict)
+            ],
+            "selected_direction": deepcopy(selected) if isinstance(selected, dict) else {},
+            "selection_reason": str(direction.get("selection_reason") or "").strip(),
+            "next_action": str(direction.get("next_action") or "").strip(),
+        }
+
+    @staticmethod
+    def _iteration_direction_issues(
+        direction: dict, output_language: str
+    ) -> list[str]:
+        issues = []
+        candidates = direction.get("optimization_candidates") or []
+        if direction.get("evidence_sufficiency") == "SUFFICIENT" and not (
+            2 <= len(candidates) <= 4
+        ):
+            issues.append("需要返回 2 至 4 个可比较的候选优化方向")
+        selected = direction.get("selected_direction") or {}
+        if candidates and not selected:
+            issues.append("必须从候选方向中明确选择一个方向")
+        if output_language == "zh-CN":
+            narrative_values = [
+                direction.get("selection_reason"),
+                direction.get("next_action"),
+                selected.get("name"),
+                selected.get("success_rule"),
+                selected.get("failure_rule"),
+                selected.get("stop_rule"),
+            ]
+            narrative_values.extend(
+                item.get("name") for item in candidates if isinstance(item, dict)
+            )
+            for value in narrative_values:
+                text = str(value or "").strip()
+                if text and not any("\u4e00" <= char <= "\u9fff" for char in text):
+                    issues.append("中文研究的候选方向、选择理由和动作必须使用简体中文")
+                    break
+        return issues
+
+    def _require_report_readiness(self, artifacts, latest: dict) -> None:
+        evidence = latest.get("evidence")
+        references = evidence.content.get("references") if evidence else None
+        if (
+            not isinstance(references, list)
+            or not references
+            or not any(reference.get("verified") for reference in references)
+        ):
+            raise ValueError("REPORT_EXPORT_NOT_READY:verified_evidence")
+        result = latest.get("experiment_result")
+        if result is None:
+            raise ValueError("REPORT_EXPORT_NOT_READY:experiment_result")
+        task = latest.get("experiment_task")
+        if task is not None and result.content.get("experiment_id") != task.content.get("experiment_id"):
+            raise ValueError("REPORT_EXPORT_NOT_READY:latest_experiment_result")
+        bundle_ids = (
+            experiment_bundle_ids(artifacts, task.id) if task is not None else set()
+        )
+        if bundle_ids and result.parent_artifact_id not in bundle_ids:
+            raise ValueError("REPORT_EXPORT_NOT_READY:experiment_lineage")
+        if self.competition_mode and not result.content.get("is_real_experiment"):
+            raise ValueError("REPORT_EXPORT_NOT_READY:real_experiment_result")
+        revision = latest.get("revision")
+        if revision is None or revision.parent_artifact_id != result.id:
+            raise ValueError("REPORT_EXPORT_NOT_READY:feedback_revision")
+        revision_iteration = int(revision.content.get("iteration") or 0)
+        if (
+            revision.content.get("requires_follow_up") is True
+            and revision_iteration < self.max_feedback_iterations
+        ):
+            raise ValueError("REPORT_EXPORT_NOT_READY:feedback_follow_up")
+
+    @staticmethod
+    def _skill_state(step_id: str, latest: dict) -> dict:
+        state: dict = {}
+        return state
+
+    @staticmethod
+    def _runtime_call(package: RuntimePackage) -> dict:
+        return {
+            "provider": "skill_runtime",
+            "method": "invoke",
+            "step_id": package.step_id,
+            "agent_id": package.agent_id,
+            "skills": list(package.skill_ids),
+            "skill_invocations": package.audit["skill_invocations"],
+            "authorized_tools": list(package.authorized_tools),
+            "instruction_sha256": package.audit["instruction_sha256"],
+            "denied_tools": package.audit["denied_tools"],
+            "omitted_sections": list(package.omitted_sections),
+        }
+
+    @staticmethod
+    def _require_tools(package: RuntimePackage, *tool_names: str) -> None:
+        authorized = set(package.authorized_tools)
+        for tool_name in tool_names:
+            if tool_name not in authorized:
+                raise ValueError(
+                    f"SKILL_TOOL_UNAUTHORIZED:{package.step_id}:{tool_name}"
+                )
+
+    def _produce_validated(
+        self,
+        run_id: str,
+        step_id: str,
+        producer,
+        *,
+        diagnosis: bool = False,
+        validation_context: dict | None = None,
+    ) -> dict:
+        revision = None
+        revision_limit = self.supervisor_agent.revision_limit(
+            step_id, diagnosis=diagnosis
+        )
+        previous_attempt_artifact_id: str | None = None
+        for revision_number in range(revision_limit + 1):
+            candidate = producer(revision)
+            if not isinstance(candidate, dict):
+                candidate = {"value": candidate}
+            attempt_evidence = candidate.pop("_candidate_attempt", None)
+            decision = self._validate_candidate(
+                run_id,
+                step_id,
+                candidate,
+                validation_context=validation_context,
+            )
+            if step_id == "experiment_task" and isinstance(attempt_evidence, dict):
+                attempt_payload = {
+                    **deepcopy(attempt_evidence),
+                    "attempt_id": "",
+                    "parent_attempt_id": previous_attempt_artifact_id or "",
+                    "attempt_number": revision_number + 1,
+                    "accepted": bool(decision.accepted),
+                    "validation_issues": list(decision.issues),
+                }
+                attempt_artifact = self.repository.add_artifact(
+                    run_id,
+                    "experiment_candidate_attempt",
+                    f"Experiment Candidate Attempt {revision_number + 1}",
+                    attempt_payload,
+                    step_id,
+                    self.experiment_agent.name,
+                    parent_artifact_id=(
+                        previous_attempt_artifact_id
+                        or str(attempt_evidence.get("plan_artifact_id") or "")
+                        or None
+                    ),
+                )
+                attempt_payload["attempt_id"] = attempt_artifact.id
+                # Preserve the immutable Artifact record while making its own id
+                # available in its persisted content for artifact-only recovery.
+                run = self.repository.get_run(run_id)
+                for index, artifact in enumerate(run.artifacts):
+                    if artifact.id == attempt_artifact.id:
+                        run.artifacts[index] = artifact.model_copy(
+                            update={"content": attempt_payload}
+                        )
+                        self.repository.save_run(run)
+                        break
+                previous_attempt_artifact_id = attempt_artifact.id
+            if decision.accepted:
+                return candidate
+            if revision_number >= revision_limit:
+                final_rejection = {
+                    "step_id": step_id,
+                    "attempt": revision_number + 1,
+                    "limit": revision_limit,
+                    "diagnosis": diagnosis,
+                    "issues": list(decision.issues),
+                    "status": "revision_limit_exceeded",
+                }
+                repair_history = candidate.get("_repair_history")
+                if isinstance(repair_history, list):
+                    final_rejection["repair_history"] = deepcopy(repair_history)
+                self.repository.append_event(
+                    run_id,
+                    step_id,
+                    self.supervisor_agent.name,
+                    "Rejected candidate output after revision limit.",
+                    data=final_rejection,
+                    output_summary={"accepted": False, "issues": list(decision.issues)},
+                    tool_calls=[
+                        {
+                            "provider": "supervisor_agent",
+                            "method": "revision_limit",
+                            **final_rejection,
+                        }
+                    ],
+                    provider_mode=self.llm_provider.mode,
+                    fallback_used=self.llm_provider.fallback,
+                    fallback_reason=(
+                        "Mock LLM development fallback." if self.llm_provider.fallback else ""
+                    ),
+                )
+                self.supervisor_agent.require_revision(
+                    step_id,
+                    revision_number + 1,
+                    decision.issues,
+                    diagnosis=diagnosis,
+                )
+            revision = self.supervisor_agent.require_revision(
+                step_id,
+                revision_number + 1,
+                decision.issues,
+                diagnosis=diagnosis,
+            )
+            repair_history = candidate.get("_repair_history")
+            if isinstance(repair_history, list):
+                revision["repair_history"] = deepcopy(repair_history)
+            self.repository.append_event(
+                run_id,
+                step_id,
+                self.supervisor_agent.name,
+                "Rejected candidate output and requested revision.",
+                data=revision,
+                output_summary={"accepted": False, "issues": list(decision.issues)},
+                tool_calls=[
+                    {
+                        "provider": "supervisor_agent",
+                        "method": "request_revision",
+                        **revision,
+                    }
+                ],
+                provider_mode=self.llm_provider.mode,
+                fallback_used=self.llm_provider.fallback,
+                fallback_reason=(
+                    "Mock LLM development fallback." if self.llm_provider.fallback else ""
+                ),
+            )
+        raise AssertionError("unreachable supervisor revision loop")
+
+    def _validate_candidate(
+        self,
+        run_id: str,
+        step_id: str,
+        candidate: dict,
+        *,
+        validation_context: dict | None = None,
+    ):
+        internal_issues = candidate.get("_validation_issues")
+        if isinstance(internal_issues, list) and internal_issues:
+            return ValidationDecision(
+                False,
+                tuple(str(issue) for issue in internal_issues),
+            )
+        staging_dir = self.repository.store.data_dir / "staging" / run_id / step_id
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        candidate_path = staging_dir / "candidate.json"
+        candidate_path.write_text(
+            json.dumps(candidate, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        wiki_root = self.knowledge_service.wiki.root
+        wiki_paths = tuple(
+            path
+            for path in (wiki_root / "query_pack.md", wiki_root / "index.md")
+            if path.is_file()
+        )
+        try:
+            validation_kwargs = {
+                "artifact_path": candidate_path,
+                "wiki_paths": wiki_paths,
+            }
+            validate_parameters = inspect.signature(
+                self.supervisor_agent.validate
+            ).parameters
+            if validation_context is not None and "review_context" in validate_parameters:
+                validation_kwargs["review_context"] = validation_context
+            return self.supervisor_agent.validate(step_id, candidate, **validation_kwargs)
+        finally:
+            candidate_path.unlink(missing_ok=True)
+            for path in (staging_dir, staging_dir.parent, staging_dir.parent.parent):
+                try:
+                    path.rmdir()
+                except OSError:
+                    break
+
+    @staticmethod
+    def _require_step_inputs(step_id: str, latest: dict) -> None:
+        required = _STEP_REQUIRED_INPUTS.get(step_id, ())
+        missing = [
+            artifact_type for artifact_type in required if artifact_type not in latest
+        ]
+        if missing:
+            raise ValueError(
+                f"STEP_INPUT_MISSING:{step_id}:required={','.join(required)}:"
+                f"missing={','.join(missing)}"
+            )
+
+    def _dataset_options(self) -> list[dict]:
+        probe = getattr(self.experiment_provider, "dataset_availability", None)
+        if not callable(probe):
+            return []
+        try:
+            return list(probe())
+        except Exception:
+            return []
+
+    def _inspect_configured_local_dataset(self, run=None) -> dict | None:
+        settings = getattr(self.experiment_provider, "settings", None)
+        if settings is None or getattr(settings, "dataset_source", "") != "local":
+            return None
+        dataset_dir = str(getattr(settings, "dataset_dir", "") or "").strip()
+        if not dataset_dir:
+            raise ValueError("DATASET_DIRECTORY_REQUIRED")
+        canonical = canonical_dataset_name_from_text(
+            str(getattr(run, "problem_input", "") or "")
+        ) or canonical_dataset_name_from_text(str(getattr(run, "constraints", "") or ""))
+        configured_root = Path(dataset_dir).expanduser().resolve()
+        resolved_root = configured_root
+        if canonical:
+            marker_root = Path(*dataset_spec(canonical).marker.split("/")).parts[0]
+            candidates = (
+                configured_root / marker_root,
+                configured_root / canonical.replace("-", ""),
+                configured_root / canonical,
+            )
+            resolved_root = next((path for path in candidates if path.is_dir()), configured_root)
+            if resolved_root == configured_root:
+                raise ValueError(
+                    f"DATASET_SELECTED_DIRECTORY_NOT_FOUND:{canonical}:under={configured_root}"
+                )
+        return inspect_dataset_directory(
+            str(resolved_root),
+            canonical_name=canonical,
+            display_name=dataset_display_name(canonical),
+        )
+
+    @staticmethod
+    def _bind_plan_to_dataset(plan: dict, profile: dict) -> dict:
+        return {
+            **plan,
+            "dataset": {
+                "canonical_name": contract_canonical_name(profile),
+                "display_name": profile.get("display_name") or profile["name"],
+                "directory_name": profile.get("directory_name") or Path(profile["root"]).name,
+                # Kept for legacy readers; it is never used for semantic validation.
+                "name": profile.get("display_name") or profile["name"],
+                "source": "local",
+                "root": profile["root"],
+                "contract_id": profile["contract_id"],
+                "content_fingerprint": profile["content_fingerprint"],
+                "inspection_status": profile["inspection_status"],
+                "file_count": profile["file_count"],
+                "file_types": profile["file_types"],
+                "files": list(profile.get("files") or []),
+                "schemas": profile["schemas"],
+                "limitations": list(profile.get("limitations") or []),
+                "semantic_facts": deepcopy(profile.get("semantic_facts") or {}),
+                "preprocessing": list(
+                    (plan.get("dataset") or {}).get("preprocessing") or []
+                ),
+                "split": str((plan.get("dataset") or {}).get("split") or ""),
+            },
+        }
+
+    @staticmethod
+    def _plan_dataset_issues(plan: dict, dataset_options: list[dict]) -> list[str]:
+        dataset = plan.get("dataset") or {}
+        contract_id = str(dataset.get("contract_id") or "")
+        if contract_id:
+            option = next(
+                (
+                    item
+                    for item in dataset_options
+                    if item.get("contract_id") == contract_id
+                    and item.get("status") == "bound"
+                ),
+                None,
+            )
+            if option is None:
+                return [f"PLAN_DATASET_CONTRACT_UNKNOWN:{contract_id}"]
+            if dataset.get("content_fingerprint") != option.get("content_fingerprint"):
+                return [f"PLAN_DATASET_FINGERPRINT_MISMATCH:{contract_id}"]
+            return []
+        normalized = contract_canonical_name(plan.get("dataset") or {})
+        if not normalized:
+            return []
+        status = next(
+            (option["status"] for option in dataset_options if option["name"] == normalized),
+            "",
+        )
+        if status != "missing":
+            return []
+        usable = [
+            option["name"]
+            for option in dataset_options
+            if option["status"] in {"cached", "downloadable"}
+        ]
+        return [
+            f"PLAN_DATASET_UNAVAILABLE:{normalized}. The dataset source is local and the files "
+            "are not in the dataset cache. Choose a dataset from: "
+            f"{', '.join(usable) if usable else '(none cached)'} or design a synthetic-data experiment."
+        ]
+
+    @staticmethod
+    def _attach_dataset_card(plan: dict, dataset_options: list[dict]) -> dict:
+        contract_id = str((plan.get("dataset") or {}).get("contract_id") or "")
+        if contract_id:
+            option = next(
+                (
+                    item
+                    for item in dataset_options
+                    if item.get("contract_id") == contract_id
+                ),
+                None,
+            )
+            if option is None:
+                raise ValueError(f"PLAN_DATASET_CONTRACT_UNKNOWN:{contract_id}")
+            dataset = dict(plan.get("dataset") or {})
+            dataset["card"] = option["card"]
+            dataset["availability"] = "bound"
+            return {**plan, "dataset": dataset}
+        normalized = contract_canonical_name(plan.get("dataset") or {})
+        if not normalized:
+            return plan
+        option = next(
+            (option for option in dataset_options if option["name"] == normalized), None
+        )
+        dataset = dict(plan.get("dataset") or {})
+        dataset["normalized_name"] = normalized
+        dataset["card"] = option["card"] if option else dataset_card(normalized)
+        if option:
+            dataset["availability"] = option["status"]
+        return {**plan, "dataset": dataset}
+
+    @staticmethod
+    def _with_revision(instructions: str, revision: dict | None) -> str:
+        if not revision:
+            return instructions
+        issues = list(revision["issues"])
+        request = (
+            "## Supervisor Revision Request\n"
+            f"Revision {revision['attempt']} of {revision['limit']}. Correct all issues:\n"
+            + "\n".join(f"- {issue}" for issue in issues)
+        )
+        if any(issue.startswith("EXPERIMENT_LOCAL_DATASET_SUBSTITUTION_FORBIDDEN") for issue in issues):
+            request += (
+                "\n\nThe dataset is locked by the research plan. The issue above states the "
+                "expected canonical name, declared canonical name, contract ID, and required "
+                "DATA_ROOT. Do not select or download another dataset; generate code that uses "
+                "the locked contract through DATA_ROOT only."
+            )
+        return "\n\n".join(part for part in (instructions, request) if part)
+
+    @staticmethod
+    def _normalize_plan_review(value: dict) -> dict:
+        verdict = str(value.get("verdict") or "").upper()
+        feasibility = str(value.get("experiment_feasibility") or "").upper()
+        if verdict not in {"ACCEPT", "REVISE", "REJECT"}:
+            raise ValueError("MODEL_OUTPUT_VALIDATION_FAILURE:invalid review verdict")
+        if feasibility not in {"FEASIBLE", "FEASIBLE_AFTER_REVISION", "NOT_FEASIBLE"}:
+            raise ValueError("MODEL_OUTPUT_VALIDATION_FAILURE:invalid experiment feasibility")
+        normalized = {
+            "verdict": verdict,
+            "issues": list(value.get("issues") or []),
+            "required_changes": list(value.get("required_changes") or []),
+            "suggested_fixes": list(value.get("suggested_fixes") or []),
+            "revised_plan_guidance": list(value.get("revised_plan_guidance") or []),
+            "experiment_feasibility": feasibility,
+            "provider_mode": str(value.get("provider_mode") or "deepseek"),
+            "model_used": str(value.get("model_used") or ""),
+        }
+        if verdict == "REVISE" and (not normalized["issues"] or not normalized["suggested_fixes"]):
+            raise ValueError("MODEL_OUTPUT_VALIDATION_FAILURE:REVISE requires issues and suggested fixes")
+        return normalized
+
+    @staticmethod
+    def _plan_review_failure(exc: Exception, attempt: int) -> dict:
+        message = str(exc)
+        code = "MODEL_OUTPUT_VALIDATION_FAILURE"
+        if "TIMEOUT" in message.upper() or "Timeout" in type(exc).__name__:
+            code = "MODEL_CALL_TIMEOUT"
+        elif "VALIDATION" not in message.upper() and isinstance(exc, RuntimeError):
+            code = "MODEL_PROVIDER_FAILURE"
+        return {
+            "code": code,
+            "message": message,
+            "attempt": attempt,
+            "scientific_state_mutated": False,
+            "hypothesis_rejected": False,
+        }
+
+    @staticmethod
+    def _research_plan_review_context(run, latest: dict, selection: dict,
+                                      plan: dict, dataset_options: list[dict]) -> dict:
+        problem = compact_problem(latest["problem"].content)
+        evidence_content = latest.get("evidence").content if latest.get("evidence") else {}
+        references = evidence_content.get("core_references") or evidence_content.get("references") or []
+        evidence, evidence_telemetry = select_units_bounded(
+            [literature_card(card) for card in references],
+            PromptContextBudget().max_reference_chars,
+        )
+        reasoning = latest.get("reasoning").content if latest.get("reasoning") else {}
+        selected = (selection.get("selected") or [{}])[0] if isinstance(selection, dict) else selection
+        profile = problem.get("dataset_profile") or {}
+        selected_digest, selected_telemetry = selected_hypothesis_digest(selection, reasoning, budget=12_000)
+        result = {
+            "research_problem_summary": problem,
+            "research_profile": profile,
+            "selected_hypothesis": selected,
+            "selected_hypothesis_rationale": selection.get("selection_reason", "") if isinstance(selection, dict) else "",
+            "evidence_literature_compact_summary": evidence,
+            "evidence_reasoning_critic_summary": {
+                "selection_guidance": reasoning.get("selection_guidance", ""),
+                "selected_hypothesis_evidence_digest": selected_digest,
+            },
+            "current_research_plan": plan,
+            "authoritative_plan_contract": authoritative_plan_contract(),
+            "dataset_profile": profile,
+            "available_split_information": {
+                "dataset_card": ((plan.get("dataset") or {}).get("card") or {}),
+                "bound_split_contract": plan.get("split_contract") or ((plan.get("dataset") or {}).get("split_contract") or {}),
+            },
+            "experiment_capability_constraints": dataset_options,
+            "repository_dataset_resource_constraints": {
+                "run_constraints": run.constraints,
+                "research_constraints_reference": {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1},
+                "dataset_options": dataset_options,
+            },
+            "context_policy": "compact_summaries_only_no_unbounded_artifact_injection",
+        }
+        result["context_telemetry"] = context_telemetry(
+            [("research_problem_summary", problem), ("literature", evidence),
+             ("selected_hypothesis_digest", selected_digest), ("current_research_plan", plan)],
+            PromptContextBudget().max_total_chars,
+        )
+        result["context_telemetry"]["literature"] = evidence_telemetry
+        result["context_telemetry"]["selected_hypothesis_digest"] = selected_telemetry
+        return result
+
+    def _has_locked_output(self, artifacts, step_id: str) -> bool:
+        has_locked = any(
+            artifact.locked and artifact.source_step == step_id for artifact in artifacts
+        )
+        if not has_locked:
+            return False
+        latest = self._latest_by_type(artifacts)
+        if step_id == "feedback_revision":
+            result = latest.get("experiment_result")
+            return result is not None and any(
+                artifact.type == "revision"
+                and artifact.locked
+                and artifact.source_step == step_id
+                and artifact.parent_artifact_id == result.id
+                for artifact in artifacts
+            )
+        if step_id != "evidence_reasoning":
+            return has_locked
+        reasoning = latest.get("reasoning")
+        hypothesis = latest.get("hypothesis")
+        try:
+            self._require_evidence_reasoned_hypothesis_selection(latest)
+        except ValueError:
+            return False
+        # A locked reasoning Artifact only locks its own hypothesis round.  A
+        # later append-only revision must still evaluate the newly created
+        # hypothesis rather than being silently skipped by historic evidence.
+        return bool(
+            reasoning is not None
+            and reasoning.locked
+            and reasoning.source_step == "evidence_reasoning"
+            and hypothesis is not None
+            and reasoning.parent_artifact_id == hypothesis.id
+        )
+
+    def _trace(
+        self,
+        run_id: str,
+        step_id: str,
+        actor: str,
+        message: str,
+        input_summary: dict,
+        output_summary: dict,
+        tool_calls: list[dict] | None = None,
+        skill_calls: list[dict] | None = None,
+    ):
+        trace_calls = tool_calls if tool_calls is not None else [
+            {"provider": self.llm_provider.mode, "method": "generate_json"}
+        ]
+        call_metadata = {}
+        if any(call.get("method") == "generate_json" for call in trace_calls):
+            consume_metadata = getattr(self.llm_provider, "consume_call_metadata", None)
+            if callable(consume_metadata):
+                call_metadata = consume_metadata()
+            if call_metadata:
+                trace_calls = [
+                    {**call, **call_metadata}
+                    if call.get("method") == "generate_json"
+                    else call
+                    for call in trace_calls
+                ]
+        self.repository.append_event(
+            run_id,
+            step_id,
+            actor,
+            message,
+            data={"llm_call": call_metadata} if call_metadata else {},
+            input_summary=input_summary,
+            output_summary=output_summary,
+            tool_calls=trace_calls + (skill_calls or []),
+            provider_mode=self.llm_provider.mode,
+            fallback_used=self.llm_provider.fallback,
+            fallback_reason="Mock LLM development fallback." if self.llm_provider.fallback else "",
+        )

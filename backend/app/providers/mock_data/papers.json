@@ -1,0 +1,38 @@
+[
+  {
+    "title": "Deep Residual Learning for Image Recognition",
+    "authors": ["Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun"],
+    "year": 2015,
+    "source": "arxiv",
+    "claim": "Residual connections enable deeper convolutional networks and improve image recognition accuracy.",
+    "url": "https://arxiv.org/abs/1512.03385",
+    "identifiers": {"arxiv": "1512.03385"},
+    "verified": true,
+    "relevance": 0.86,
+    "reliability": 0.95
+  },
+  {
+    "title": "Dropout: A Simple Way to Prevent Neural Networks from Overfitting",
+    "authors": ["Nitish Srivastava", "Geoffrey Hinton", "Alex Krizhevsky", "Ilya Sutskever", "Ruslan Salakhutdinov"],
+    "year": 2014,
+    "source": "jmlr",
+    "claim": "Dropout reduces overfitting by preventing co-adaptation of hidden units. Future work should evaluate robustness under distribution shift.",
+    "url": "https://jmlr.org/papers/v15/srivastava14a.html",
+    "identifiers": {"official_url": "https://jmlr.org/papers/v15/srivastava14a.html"},
+    "verified": true,
+    "relevance": 0.82,
+    "reliability": 0.94
+  },
+  {
+    "title": "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift",
+    "authors": ["Sergey Ioffe", "Christian Szegedy"],
+    "year": 2015,
+    "source": "arxiv",
+    "claim": "Batch normalization stabilizes and accelerates deep network training. Future work should evaluate robustness under distribution shift.",
+    "url": "https://arxiv.org/abs/1502.03167",
+    "identifiers": {"arxiv": "1502.03167"},
+    "verified": true,
+    "relevance": 0.8,
+    "reliability": 0.93
+  }
+]

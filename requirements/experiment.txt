@@ -1,0 +1,15 @@
+# The local Experiment Agent emits and runs PyTorch experiment bundles.
+# These are therefore part of the reproducible development/runtime environment,
+# rather than machine-local, untracked additions.
+numpy==2.5.1
+scipy==1.18.0
+# Official PyTorch CUDA wheel index. The version suffix is reproducible from
+# this declared index; it is not copied from a legacy virtual environment.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.13.0+cu132
+torchvision==0.28.0+cu132
+torchinfo==1.8.0
+# Used by common scientific experiment bundles and required by the runtime
+# preflight checks documented for this project.
+pandas==2.3.3
+matplotlib==3.10.8
