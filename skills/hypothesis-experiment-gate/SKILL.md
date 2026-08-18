@@ -63,6 +63,10 @@ The smoke or pilot gate must require decreasing loss, performance clearly above 
 
 Define positive, negative, and inconclusive outcomes before execution. Use a minimum meaningful effect rather than an arbitrary large promised gain. Require uncertainty reporting and seed-level consistency; do not select favorable seeds or repeatedly alter thresholds.
 
+## 7. Bound reviewer veto power
+
+Apply `../shared-references/bounded-scientific-review.md`. Scientific review may be adversarial, but only adjudicated blockers from the frozen review policy may prevent formal execution. Classify other concerns as warnings or suggestions. Do not reopen resolved blockers without concrete regression evidence. After the first review round, a newly proposed blocker must arise from regression or new evidence. When validated open blockers reach zero, the plan is review-ready even if non-blocking concerns remain.
+
 ## Output contract
 
 Return:
@@ -79,4 +83,4 @@ Return:
 - `positive_negative_inconclusive_rules`;
 - `remaining_unknowns`.
 
-Do not authorize a formal experiment while the diagnosis is `revise` or `blocked`.
+When diagnosis is `revise` or `blocked`, emit a finding under the frozen policy with concrete Plan evidence. The diagnosis does not directly authorize or reject the plan; only validated `OPEN` blocker state in the governance ledger controls acceptance.

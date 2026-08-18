@@ -12,27 +12,93 @@ _PLANNING_FIELDS = (
 )
 _NOT_PROVIDED = "未提供"
 
-# This is the single authoring/reviewing vocabulary for Research Plans.  It is
-# intentionally descriptive rather than Fashion-MNIST-specific: the runtime
-# still validates the actual dataset, split, Bundle, Harness, and result.
-AUTHORITATIVE_PLAN_CONTRACT = {
-    "research_question": "The question and scoped population/task being tested.",
-    "hypothesis": "The selected hypothesis; preserve user-owned claim text.",
-    "treatment_and_control": "Intervention, executable control, and fixed controls.",
-    "dataset_identity": "Bound dataset contract, fingerprint, preprocessing, and loader verification.",
-    "split_identity": "Reproducible train/validation/test identity, seed, disjointness, and test isolation.",
-    "training_and_validation_policy": "Budget, optimizer, checkpoint selection, and early-stopping policy.",
-    "metrics_and_statistics": "Primary/secondary metrics, aggregation, uncertainty, and preregistered interpretation.",
+# This is the single authoring/reviewing/diff vocabulary for Research Plans.
+# Every key is an actual normalized-plan field.  Historical semantic labels are
+# accepted only at the input boundary through FIELD_ALIAS_TO_CANONICAL.
+CANONICAL_PLAN_CONTRACT_FIELDS = {
+    "objective": "The question and scoped population/task being tested.",
+    "hypotheses": "The selected hypotheses; preserve user-owned claim text.",
+    "primary_claim": "The exact claim directly tested by the selected hypothesis.",
+    "original_question_link": "How the primary claim answers, narrows, or partially addresses the original question.",
+    "secondary_endpoints": "Only the minimal secondary controls or endpoints needed to preserve that interpretation.",
+    "method": "The intervention and its implementable mechanism.",
+    "dataset": "Bound dataset contract, fingerprint, preprocessing, and loader verification.",
+    "comparisons": "Executable baselines, variants, and fixed controls.",
+    "evaluations": "Primary/secondary metrics, directions, and decision methods.",
+    "procedure": "Reproducible execution and validation procedure.",
+    "parameters": "Training budget, optimizer, and other fixed parameters.",
+    "seeds": "Preregistered random seeds and seed policy.",
+    "statistical_summary": "Aggregation, uncertainty, and statistical interpretation.",
+    "success_criteria": "Conditions that support the scoped primary claim.",
+    "failure_criteria": "Conditions that refute or limit the scoped primary claim.",
+    "expected_artifacts": "Durable outputs required to audit the experiment.",
+    "stop_conditions": "Early-stop and execution-blocking conditions.",
+    "primary_experiment": "The smallest primary experiment that tests the claim.",
+    "optional_ablations": "Optional diagnostics kept outside the primary inference.",
+    "traceability": "Claim-to-mechanism-to-metric decision traceability.",
+    "resources": "Frozen compute, time, data, and runtime constraints.",
+    "risks": "Known scientific and execution risks with boundaries.",
+    "additional_sections": "Explicit supplementary design fields that do not fit another canonical field.",
+    "diagnosis": "Readiness diagnosis emitted as a finding, never as an executable verdict.",
+    "revised_hypothesis": "A scoped revision that preserves the user-owned claim boundary.",
+    "mechanism_and_evidence": "Mechanism, supporting evidence, and limitations.",
+    "boundary_conditions": "Conditions delimiting interpretation and generalization.",
+    "alignment_contract": "Claim, dataset, control, metric, and decision-rule alignment.",
+    "baseline_and_controls": "Intervention, executable control, and fixed controls.",
+    "feasibility_risks": "Feasibility risks and their mitigations.",
+    "staged_gates": "Static, overfit, smoke, pilot, and formal execution gates.",
+    "formal_experiment_entry_conditions": "Conditions required before formal execution.",
+    "positive_negative_inconclusive_rules": "Preregistered outcome interpretation rules.",
+    "remaining_unknowns": "Unknowns retained without silently becoming blockers.",
     "capacity_confounder": "Capacity confounder, control strategy, and justified claim boundary.",
-    "effect_size_justification": "Minimum meaningful effect/effect-size rationale and stopping criteria.",
-    "execution_gates": "Loader verification and static/overfit/smoke/pilot/formal entry gates.",
-    "outcome_rules": "Positive, negative, and inconclusive rules plus remaining unknowns.",
+    "local_dataset_loader_verification": "Loader verification procedure and failure policy.",
+    "iteration_contract": "Bounded follow-up iteration contract.",
+    "split_contract": "Reproducible split identity, disjointness, and test isolation.",
+    "progressive_experiment": "Progressive experiment staging without changing formal inference.",
+}
+
+AUTHORITATIVE_PLAN_CONTRACT = CANONICAL_PLAN_CONTRACT_FIELDS
+
+FIELD_ALIAS_TO_CANONICAL = {
+    "research_question": "objective",
+    "hypothesis": "hypotheses",
+    "treatment_and_control": "baseline_and_controls",
+    "dataset_identity": "dataset",
+    "data_split": "split_contract",
+    "split_identity": "split_contract",
+    "training_and_validation_policy": "procedure",
+    "metrics": "evaluations",
+    "metrics_and_statistics": "evaluations",
+    "baseline": "comparisons",
+    "stopping_rule": "stop_conditions",
+    "hypothesis_link": "original_question_link",
+    "effect_size_justification": "statistical_summary",
+    "execution_gates": "staged_gates",
+    "outcome_rules": "positive_negative_inconclusive_rules",
 }
 
 
 def authoritative_plan_contract() -> dict[str, str]:
     """Return a copy safe to place in generator and reviewer prompt context."""
     return dict(AUTHORITATIVE_PLAN_CONTRACT)
+
+
+def canonical_contract_field(value: object) -> str:
+    field = str(value or "").strip()
+    return FIELD_ALIAS_TO_CANONICAL.get(field, field)
+
+
+def canonical_contract_fields(values: object) -> list[str]:
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return []
+    allowed = set(CANONICAL_PLAN_CONTRACT_FIELDS)
+    return list(
+        dict.fromkeys(
+            canonical
+            for item in values
+            if (canonical := canonical_contract_field(item)) in allowed
+        )
+    )
 
 
 def normalize_plan(
@@ -63,6 +129,9 @@ def normalize_plan(
     return {
         "objective": objective,
         "hypotheses": hypotheses,
+        "primary_claim": _first_string(plan.get("primary_claim"), hypotheses[0] if hypotheses else ""),
+        "original_question_link": _first_string(plan.get("original_question_link")),
+        "secondary_endpoints": _string_list(plan.get("secondary_endpoints")),
         "method": _as_dict(plan.get("method")),
         "dataset": _dataset(plan.get("dataset")),
         "comparisons": comparisons,
@@ -94,6 +163,7 @@ def normalize_plan(
         "remaining_unknowns": _string_list(plan.get("remaining_unknowns")),
         "capacity_confounder": _as_dict(plan.get("capacity_confounder")),
         "local_dataset_loader_verification": _as_dict(plan.get("local_dataset_loader_verification")),
+        "fix_map": _as_dict(plan.get("fix_map")),
         "iteration_contract": _as_dict(plan.get("iteration_contract")),
         "split_contract": _as_dict(plan.get("split_contract")),
         "progressive_experiment": _as_dict(plan.get("progressive_experiment")),

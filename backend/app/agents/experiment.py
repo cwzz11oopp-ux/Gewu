@@ -17,6 +17,31 @@ _BUNDLE_TRANSPORT_INSTRUCTIONS = (
     "use a content field, Markdown fence, or explanation. Treat dataset_card as "
     "structured runtime input when it is supplied."
 )
+
+_CLASSIFICATION_SMOKE_INSTRUCTIONS = (
+    "Smoke-test rule: load the complete verified dataset and use exactly the same "
+    "split, preprocessing, labels/targets, and validation code as scientific runs. "
+    "Never create a smoke subset or resample data: no X[:N], y[:N], Subset, random "
+    "sampling, class reduction, anomaly-ratio reduction, or alternate split. Smoke "
+    "uses one Harness-selected seed and stops only after one real train batch and one "
+    "real validation/evaluation batch with prediction and metric computation. Read "
+    "GEWU_EXECUTION_STAGE and GEWU_EXECUTION_EPOCHS from the environment for the "
+    "system-bound execution budget; do not redefine them. If the frozen split has "
+    "fewer than two train classes, raise a clear data error instead. "
+    "For IPIX17, load DATA_ROOT/IPIX17/clutter.mat and DATA_ROOT/IPIX17/mubiao.mat, "
+    "construct complete X/y in clutter-to-target order, and keep stratify=y for the "
+    "shared classification split. "
+    "When repairing a failure containing 'The number of classes has to be greater "
+    "than one', inspect and correct the shared split/label handling; do not add a "
+    "smoke-only data subset."
+)
+
+_OBSERVED_STRUCTURE_INSTRUCTIONS = (
+    "observed_structure comes from a read-only inspection of the real local data files. "
+    "Implement loading from its actual keys, shapes, dtypes, and columns; never assume a key "
+    "that is absent. Do not put data values into code or prompts, and never change or truncate "
+    "the dataset scale for Smoke."
+)
 from backend.app.workflow.experiment_code import (
     ExperimentBundleValidationError,
     default_mock_experiment_bundle,
@@ -110,7 +135,11 @@ class ExperimentAgent:
                 "metrics_path": "results/run_seed_7.json",
                 "log_path": "logs/run_seed_7.log",
             },
-            instructions="\n\n".join(part for part in [instructions, output_contract] if part),
+            instructions="\n\n".join(
+                part
+                for part in (instructions, _CLASSIFICATION_SMOKE_INSTRUCTIONS, output_contract)
+                if part
+            ),
         )
         return normalize_experiment_code(raw, task, python_command)
 
@@ -174,6 +203,7 @@ class ExperimentAgent:
                     "content_fingerprint": locked_dataset.get("content_fingerprint") or "",
                 },
                 "dataset_card": card,
+                "observed_structure": self._observed_structure_for(plan, task),
             },
             {
                 "files": [
@@ -199,6 +229,7 @@ class ExperimentAgent:
                 for part in (
                     instructions,
                     self._local_dataset_layout_instructions(plan),
+                    _OBSERVED_STRUCTURE_INSTRUCTIONS,
                     (
                         "Locked Dataset\n"
                         f"Canonical Name: {contract_canonical_name(locked_dataset) or '(generic local dataset)'}\n"
@@ -210,6 +241,7 @@ class ExperimentAgent:
                         if local_contract
                         else ""
                     ),
+                    _CLASSIFICATION_SMOKE_INSTRUCTIONS,
                     output_contract,
                 )
                 if part
@@ -233,6 +265,7 @@ class ExperimentAgent:
                 plan,
                 bundle,
                 require_smoke_test=require_smoke_test,
+                task=task,
             )
         if capture is not None:
             capture["normalized_bundle"] = bundle.model_dump()
@@ -302,6 +335,7 @@ class ExperimentAgent:
                 "diagnosis": diagnosis,
                 "validation_feedback": feedback,
                 "repair_history": history,
+                "observed_structure": self._observed_structure_for(plan, task),
             },
             {
                 "files": [
@@ -321,6 +355,8 @@ class ExperimentAgent:
                 for part in (
                     instructions,
                     self._local_dataset_layout_instructions(plan),
+                    _OBSERVED_STRUCTURE_INSTRUCTIONS,
+                    _CLASSIFICATION_SMOKE_INSTRUCTIONS,
                     "Return only the schema-conforming repaired files and requirements. "
                     "The accepted manifest is immutable and will be enforced by the runtime.",
                     (
@@ -364,7 +400,7 @@ class ExperimentAgent:
         except ValueError as exc:
             raise ExperimentBundleCandidateError(exc, raw) from exc
         if validate:
-            self.validate_bundle(plan, repaired)
+            self.validate_bundle(plan, repaired, task=task)
         if capture is not None:
             capture["normalized_bundle"] = repaired.model_dump()
         return repaired
@@ -378,7 +414,7 @@ class ExperimentAgent:
             "experiment_id": str(task.get("experiment_id") or ""),
             "result_id": str(task.get("result_id") or ""),
             "requires_gpu": bool(candidate.get("requires_gpu")),
-            "dataset": str(candidate.get("dataset") or contract_canonical_name(dataset) or ""),
+            "dataset": contract_canonical_name(dataset) or "",
             "dataset_contract_id": str(dataset.get("contract_id") or ""),
             "dataset_fingerprint": str(dataset.get("content_fingerprint") or ""),
             "expected_metrics": [str(item) for item in candidate.get("expected_metrics") or []],
@@ -396,6 +432,7 @@ class ExperimentAgent:
         bundle: ExperimentBundle,
         *,
         require_smoke_test: bool = False,
+        task: dict | None = None,
     ) -> None:
         """Run the unchanged Bundle gates after generation or repair.
 
@@ -413,7 +450,7 @@ class ExperimentAgent:
                 "set supports_smoke_test=true and implement --smoke-test"
             )
         issues.extend(ExperimentAgent._bundle_against_plan_issues(plan, bundle))
-        compiled = compile_bundle_runtime_contract(plan, {}, bundle).runtime_contract
+        compiled = compile_bundle_runtime_contract(plan, task or {}, bundle).runtime_contract
         if bundle.runtime_contract != compiled:
             issues.append("EXPERIMENT_RUNTIME_CONTRACT_MISMATCH")
         if issues:
@@ -429,6 +466,15 @@ class ExperimentAgent:
             if name:
                 return dataset_card(name)
         return {}
+
+    @staticmethod
+    def _observed_structure_for(plan: dict, task: dict) -> list[dict]:
+        dataset = (plan or {}).get("dataset") or {}
+        observed = dataset.get("observed_structure")
+        if isinstance(observed, list):
+            return deepcopy(observed)
+        card = ExperimentAgent._dataset_card_for(plan, task)
+        return deepcopy(card.get("observed_structure") or [])
 
     @staticmethod
     def _local_dataset_layout_instructions(plan: dict) -> str:
@@ -550,17 +596,22 @@ class ExperimentAgent:
             issues.append("EXPERIMENT_EXIT_NOT_SUCCESSFUL")
 
         runtime = result.get("runtime") if isinstance(result.get("runtime"), dict) else {}
-        # The compiled harness is the formal multi-seed execution boundary.
+        # The compiled harness is the scientific execution boundary.
         # Legacy Bundles keep their established provider contract, while a
         # runtime-bound Bundle must prove its complete per-seed result set.
-        formal_runtime = bundle.runtime_contract is not None and bool(
+        runtime_bound = bundle.runtime_contract is not None and bool(
             result.get("is_real_experiment")
         )
-        if formal_runtime and runtime.get("mode") != "full":
+        execution_contract = bundle.runtime_contract
+        if runtime_bound and runtime.get("mode") != "full":
             issues.append("FORMAL_RUNTIME_MODE_REQUIRED")
-        if formal_runtime and manifest.seeds:
+        if runtime_bound and runtime.get("stage") != execution_contract.stage:
+            issues.append("EXECUTION_STAGE_MISMATCH")
+        if runtime_bound and runtime.get("epochs") != execution_contract.epochs:
+            issues.append("EXECUTION_EPOCHS_MISMATCH")
+        if runtime_bound and execution_contract.seeds:
             result_seeds = result.get("seeds")
-            if result_seeds != manifest.seeds:
+            if result_seeds != execution_contract.seeds:
                 issues.append("FORMAL_SEED_SET_MISMATCH")
             seed_results = result.get("seed_results")
             if not isinstance(seed_results, list):
@@ -569,7 +620,7 @@ class ExperimentAgent:
                 observed_seeds = [
                     item.get("seed") for item in seed_results if isinstance(item, dict)
                 ]
-                if observed_seeds != manifest.seeds:
+                if observed_seeds != execution_contract.seeds:
                     issues.append("FORMAL_SEED_RESULT_LINEAGE_MISMATCH")
                 for item in seed_results:
                     if not isinstance(item, dict) or not isinstance(item.get("metrics"), dict):

@@ -136,7 +136,7 @@ class ArxivCrossrefProvider:
                     url=raw_id,
                     identifiers={"arxiv": arxiv_id} if arxiv_id else {},
                     verified=bool(arxiv_id),
-                    relevance=0.75,
+                    relevance=0.0,
                     reliability=0.9,
                 )
             )

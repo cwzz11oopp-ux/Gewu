@@ -396,6 +396,20 @@ def test_local_provider_recovers_matching_completed_attempt_without_retraining(
     assert recovered["metrics"] == {"accuracy": 0.93}
     assert recovered["recovered_from_completed_attempt"] is True
 
+    legacy_bundle = bundle.model_copy(
+        update={
+            "files": [
+                bundle.files[0].model_copy(
+                    update={
+                        "content": bundle.files[0].content
+                        + "\nif args.smoke_test:\n    X = X[:1000]\n    y = y[:1000]\n"
+                    }
+                )
+            ]
+        }
+    )
+    assert provider.recover_completed_result({"run_id": "run_1"}, legacy_bundle) is None
+
     attempt_dir = root / "run_1" / "experiment_1" / "attempts" / original["attempt_id"]
     (attempt_dir / "train.py").write_text("print('tampered')", encoding="utf-8")
     assert provider.recover_completed_result({"run_id": "run_1"}, bundle) is None

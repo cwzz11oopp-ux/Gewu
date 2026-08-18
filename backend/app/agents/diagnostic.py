@@ -86,6 +86,16 @@ _KNOWN_FAILURES = {
         "user_message": "The generated code failed smoke testing and will be returned to Qwen for repair before a formal run.",
         "next_action": "Repair the complete Bundle from the smoke traceback, validate it, and repeat smoke testing.",
     },
+    "EXPERIMENT_SMOKE_DATA_REDUCTION_FORBIDDEN": {
+        "category": "generated_code",
+        "root_cause": "The persisted Bundle contains a legacy smoke-only dataset reduction.",
+        "retryable": True,
+        "auto_repairable": True,
+        "repair_action": "repair_experiment_code",
+        "repair_scope": "current experiment bundle only",
+        "user_message": "旧实验 Bundle 在 Smoke 中缩减了数据；将仅修复当前 Bundle 后重试。",
+        "next_action": "删除 Smoke 数据截断并保持完整数据和冻结 split，然后重新执行 Smoke。",
+    },
     "EXPERIMENT_AUDIT_FAILED": {
         "category": "generated_code",
         "root_cause": "The executed Bundle did not satisfy one or more independently audited scientific-result requirements.",

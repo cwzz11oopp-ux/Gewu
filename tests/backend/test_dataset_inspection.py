@@ -5,9 +5,12 @@ import pytest
 from backend.app.workflow.dataset_inspection import (
     DatasetInspectionError,
     contract_canonical_name,
+    dataset_option,
     inspect_dataset_directory,
     verify_dataset_contract,
 )
+from backend.app.workflow.phase2_evidence import dataset_profile
+from backend.app.workflow.engine import WorkflowEngine
 
 
 def test_inspection_creates_stable_contract_and_schema(tmp_path):
@@ -64,6 +67,76 @@ def test_inspection_reads_mat_variable_shapes_without_loading_full_arrays(tmp_pa
     assert schema["format"] == "mat"
     assert schema["variables"]["clutter"]["shape"] == [1, 3]
     assert schema["variables"]["labels"]["shape"] == [1, 3]
+
+
+def test_observed_structure_reads_real_mat_keys_shapes_and_dtypes_without_values(tmp_path):
+    scipy_io = pytest.importorskip("scipy.io")
+    numpy = pytest.importorskip("numpy")
+    root = tmp_path / "ipix"
+    root.mkdir()
+    scipy_io.savemat(
+        root / "clutter.mat",
+        {"clutter": numpy.array([[123456.75, 2.0]], dtype=numpy.float32)},
+    )
+
+    profile = inspect_dataset_directory(str(root))
+
+    observed = profile["observed_structure"]
+    assert observed == [{
+        "relative_path": "clutter.mat",
+        "filename": "clutter.mat",
+        "format": "mat",
+        "suffix": ".mat",
+        "arrays": [{"key": "clutter", "shape": [1, 2], "dtype": "float32"}],
+    }]
+    assert "__header__" not in json.dumps(observed)
+    assert "123456.75" not in json.dumps(observed)
+
+
+def test_observed_structure_reads_csv_columns_and_recognized_dtypes(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / "signals.csv").write_text(
+        "signal,label,name\n0.25,1,clutter\n", encoding="utf-8"
+    )
+
+    observed = inspect_dataset_directory(str(root))["observed_structure"]
+
+    assert observed == [{
+        "relative_path": "signals.csv",
+        "filename": "signals.csv",
+        "format": "csv",
+        "suffix": ".csv",
+        "columns": ["signal", "label", "name"],
+        "column_dtypes": {"signal": "number", "label": "integer", "name": "string"},
+    }]
+
+
+def test_observed_structure_records_mat_parse_failure_without_fabricating_arrays(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / "broken.mat").write_bytes(b"not a mat file")
+
+    observed = inspect_dataset_directory(str(root))["observed_structure"][0]
+
+    assert observed["relative_path"] == "broken.mat"
+    assert observed["format"] == "mat"
+    assert observed["inspection_error"]
+    assert "arrays" not in observed
+
+
+def test_dataset_profile_and_bound_option_preserve_observed_structure(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    (root / "signals.csv").write_text("x,label\n1.0,0\n", encoding="utf-8")
+    inspected = inspect_dataset_directory(str(root))
+
+    profile = dataset_profile(inspected, {"task_type": "classification"})
+
+    assert profile["observed_structure"] == inspected["observed_structure"]
+    assert dataset_option(profile)["card"]["observed_structure"] == inspected["observed_structure"]
+    accepted_plan = WorkflowEngine._bind_plan_to_dataset({"dataset": {}}, profile)
+    assert accepted_plan["dataset"]["observed_structure"] == inspected["observed_structure"]
 
 
 def test_named_contract_separates_semantics_from_directory_name(tmp_path):

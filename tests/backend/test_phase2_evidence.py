@@ -30,6 +30,22 @@ def test_three_task_dataset_profiles(task_type, columns, required):
     assert profile["user_description"] == "fixture"
 
 
+def test_dataset_profile_keeps_observed_structure_for_the_persisted_artifact():
+    observation = [{
+        "relative_path": "clutter.mat",
+        "filename": "clutter.mat",
+        "format": "mat",
+        "suffix": ".mat",
+        "arrays": [{"key": "clutter", "shape": [18_000, 512], "dtype": "float32"}],
+    }]
+    profile = dataset_profile(
+        {**inspected(["x", "label"]), "observed_structure": observation},
+        {"task_type": "classification"},
+    )
+
+    assert profile["observed_structure"] == observation
+
+
 def test_forecasting_order_evidence_controls_profile_without_forcing_incompatibility():
     with_column = dataset_profile(inspected(["timestamp", "value", "target"]), {"task_type": "forecasting"})
     assert with_column["task_profile"]["split_policy"] == "chronological_by_time_column"

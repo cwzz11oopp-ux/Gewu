@@ -19,7 +19,9 @@ def test_plan_contract_is_shared_and_preserves_scientific_gate_fields():
         "local_dataset_loader_verification": {"procedure": "load one batch"},
     }
     plan = normalize_plan(raw, {"selected": [{"claim": "CNN wins"}]})
-    assert {"dataset_identity", "split_identity", "metrics_and_statistics", "capacity_confounder", "execution_gates"} <= set(authoritative_plan_contract())
+    assert {"dataset", "split_contract", "evaluations", "comparisons", "procedure"} <= set(
+        authoritative_plan_contract()
+    )
     assert plan["diagnosis"]["status"] == "ready"
     assert plan["capacity_confounder"]["control_strategy"] == "parameter matched"
     assert plan["local_dataset_loader_verification"]["procedure"] == "load one batch"

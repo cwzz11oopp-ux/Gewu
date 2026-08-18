@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import httpx
 
-from backend.app.providers.experiment import validate_remote_gpu_settings
+from backend.app.providers.experiment import validate_remote_gpu_settings, validate_local_gpu_preflight
 from backend.app.providers.experiment_runtime import cuda_probe_command, parse_cuda_probe
 from backend.app.workflow.dataset_inspection import (
     DatasetInspectionError,
@@ -142,7 +142,7 @@ def _experiment_test_result(config: dict[str, Any], base_settings) -> dict[str, 
             result["dataset_profile"] = dataset_profile
         return result
     if provider == "local_gpu":
-        result = _local_experiment_test_result(config.get("local") or {})
+        result = _local_experiment_test_result(config.get("local") or {}, base_settings=base_settings)
         if dataset_profile:
             result["dataset_profile"] = dataset_profile
         return result
@@ -153,8 +153,18 @@ def _experiment_test_result(config: dict[str, Any], base_settings) -> dict[str, 
 
 
 def _local_experiment_test_result(
-    local: dict[str, Any], *, probe_cuda: bool = True
+    local: dict[str, Any], *, probe_cuda: bool = True, base_settings=None
 ) -> dict[str, Any]:
+    if probe_cuda and base_settings is not None:
+        settings = replace(
+            base_settings,
+            local_gpu_enabled=bool(local.get("enabled", False)),
+            local_gpu_workdir=str(local.get("workdir") or ""),
+            local_gpu_python=str(local.get("python") or "python"),
+            local_gpu_cuda_visible_devices=str(local.get("cuda_visible_devices") or ""),
+            experiment_timeout_seconds=int(local.get("timeout_seconds") or 1200),
+        )
+        return validate_local_gpu_preflight(settings)
     configured_workdir = str(local.get("workdir") or "")
     resolved_workdir = Path(configured_workdir).expanduser().resolve() if configured_workdir else None
     if not configured_workdir or resolved_workdir is None:

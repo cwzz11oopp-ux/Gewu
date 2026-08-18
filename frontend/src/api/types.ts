@@ -12,6 +12,23 @@ export type Artifact = {
   parent_artifact_id?: string | null;
 };
 
+export type GovernanceRecoveryStatus =
+  | "POLICY_INTEGRITY_REQUIRED";
+
+export const GOVERNANCE_RECOVERY_STATUSES = new Set<GovernanceRecoveryStatus>([
+  "POLICY_INTEGRITY_REQUIRED",
+]);
+
+export function isGovernanceRecoveryStatus(
+  status: string,
+): status is GovernanceRecoveryStatus {
+  return GOVERNANCE_RECOVERY_STATUSES.has(status as GovernanceRecoveryStatus);
+}
+
+export function isPlanRevisionRecoveryStatus(status: string): boolean {
+  return status === "NEEDS_PLAN_REVISION";
+}
+
 export type EventRecord = {
   id: string;
   run_id: string;

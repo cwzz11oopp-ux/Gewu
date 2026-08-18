@@ -136,10 +136,11 @@ export function HypothesisBoard({
             const assessment = assessmentsByCandidateIndex.get(index);
             const rawStatus = typeof assessment?.status === "string" ? assessment.status : "waiting";
             const isSelected = selectedIndex === index;
+            const activeCandidateIndex = assessmentsByCandidateIndex.size;
             const statusLabel = isSelected
               ? "用户已选择"
-              : isReasoning
-              ? "正在推理"
+              : isReasoning && index === activeCandidateIndex
+              ? `正在处理 CAND-${String(index + 1).padStart(3, "0")} · 已完成 ${Math.min(assessmentsByCandidateIndex.size, candidates.length)}/${candidates.length}`
               : assessmentLabels[rawStatus] ?? "等待推理";
             const wasRevised = !isReasoning && assessment?.was_revised === true;
             const currentClaim = claimFrom(candidate, "未命名候选假设");
@@ -164,7 +165,7 @@ export function HypothesisBoard({
               .filter(([, value]) => typeof value === "number");
 
             return (
-              <article className={`hypothesis-tile ${isSelected ? "status-selected" : isReasoning ? "status-reasoning" : `status-${rawStatus}`}`} key={`${currentClaim}-${index}`}>
+              <article className={`hypothesis-tile ${isSelected ? "status-selected" : isReasoning && index === activeCandidateIndex ? "status-reasoning" : `status-${rawStatus}`}`} key={`${currentClaim}-${index}`}>
                 <div className="hypothesis-tile-heading">
                   <h3>候选 {String(index + 1).padStart(2, "0")}</h3>
                   <span className="hypothesis-status">{statusLabel}</span>

@@ -67,11 +67,13 @@ def inspect_dataset_directory(
         if path.suffix.lower() in INSPECTABLE_SUFFIXES
     ][:MAX_PROFILE_FILES]
     schemas = []
+    observed_structure = []
     for record in profile_records:
         path = root / record["relative_path"]
         schema = _inspect_file(path)
         if schema:
             schemas.append({"relative_path": record["relative_path"], **schema})
+        observed_structure.append(_observe_file(root, path))
 
     fingerprint_payload = {
         "files": [
@@ -116,6 +118,9 @@ def inspect_dataset_directory(
         "file_types": suffix_counts,
         "files": file_records[:MAX_PROFILE_FILES],
         "schemas": schemas,
+        # This is deliberately structural only: it exposes real local keys,
+        # shapes, dtypes, and tabular headers without retaining any values.
+        "observed_structure": observed_structure,
         "limitations": (
             []
             if schemas
@@ -163,6 +168,7 @@ def dataset_option(profile: dict[str, Any]) -> dict[str, Any]:
         "file_types": profile["file_types"],
         "files": profile["files"],
         "schemas": profile["schemas"],
+        "observed_structure": profile.get("observed_structure") or [],
         "limitations": profile["limitations"],
     }
     return {
@@ -213,9 +219,95 @@ def _inspect_file(path: Path) -> dict[str, Any]:
             return _inspect_numpy(path)
         if suffix in SUPPORTED_MAT_SUFFIXES:
             return _inspect_mat(path)
-    except (OSError, UnicodeError, ValueError, csv.Error, json.JSONDecodeError) as exc:
+    except Exception as exc:
         return {"format": suffix.lstrip("."), "inspection_error": str(exc)}
     return {}
+
+
+def _observe_file(root: Path, path: Path) -> dict[str, Any]:
+    """Return bounded, value-free facts observed from one supported local file."""
+    suffix = path.suffix.lower()
+    observed: dict[str, Any] = {
+        "relative_path": path.relative_to(root).as_posix(),
+        "filename": path.name,
+        "format": suffix.lstrip("."),
+        "suffix": suffix,
+    }
+    try:
+        if suffix in SUPPORTED_TABULAR_SUFFIXES:
+            return {**observed, **_observe_delimited(path, "\t" if suffix == ".tsv" else ",")}
+        if suffix in SUPPORTED_MAT_SUFFIXES:
+            return {**observed, **_observe_mat(path)}
+        schema = _inspect_file(path)
+        return {**observed, **schema}
+    except Exception as exc:
+        # Inspection is advisory for code generation.  A bad auxiliary file
+        # must be visible, but must not prevent the immutable dataset contract
+        # from being created for the remaining real files.
+        return {**observed, "inspection_error": str(exc)}
+
+
+def _observe_delimited(path: Path, delimiter: str) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream, delimiter=delimiter)
+        columns = next(reader, [])
+        rows = [row for _, row in zip(range(20), reader)]
+    value_types = _column_types(rows, len(columns))
+    return {
+        "format": "tsv" if delimiter == "\t" else "csv",
+        "columns": columns,
+        "column_dtypes": {
+            name: value_types[index]
+            for index, name in enumerate(columns)
+            if name
+        },
+    }
+
+
+def _observe_mat(path: Path) -> dict[str, Any]:
+    scipy_error: Exception | None = None
+    try:
+        import numpy as np
+        from scipy.io import loadmat
+
+        values = loadmat(path)
+        return {
+            "format": "mat",
+            "arrays": [
+                {
+                    "key": name,
+                    "shape": list(np.asarray(value).shape),
+                    "dtype": str(np.asarray(value).dtype),
+                }
+                for name, value in values.items()
+                if not name.startswith("__")
+            ],
+        }
+    except Exception as exc:
+        scipy_error = exc
+
+    try:
+        import h5py
+
+        with h5py.File(path, "r") as archive:
+            arrays = [
+                {
+                    "key": name,
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                }
+                for name, value in archive.items()
+                if not name.startswith("__") and isinstance(value, h5py.Dataset)
+            ]
+        return {"format": "mat", "arrays": arrays}
+    except Exception as h5_error:
+        return {
+            "format": "mat",
+            "inspection_error": (
+                "MAT structural read failed: "
+                f"scipy={scipy_error}; h5py={h5_error}"
+            ),
+        }
 
 
 def _inspect_delimited(path: Path, delimiter: str) -> dict[str, Any]:
@@ -327,9 +419,11 @@ def _column_types(rows: list[list[str]], width: int) -> list[str]:
     types = []
     for index in range(width):
         values = [row[index] for row in rows if index < len(row) and row[index] != ""]
-        if values and all(_is_int(value) for value in values):
+        if not values:
+            types.append("unknown")
+        elif all(_is_int(value) for value in values):
             types.append("integer")
-        elif values and all(_is_float(value) for value in values):
+        elif all(_is_float(value) for value in values):
             types.append("number")
         else:
             types.append("string")

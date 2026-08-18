@@ -24,4 +24,8 @@ For a local dataset, state the immutable dataset fingerprint/contract reference,
 
 ## Acceptance
 
-Reject a plan that leaves the intervention unnamed, lacks an executable baseline, changes multiple causal factors, omits decision rules, repeats an unchanged failed run, exceeds the compute budget, or conflicts with the selected dataset card.
+Emit a frozen-policy finding when the intervention is unnamed, an executable comparator is absent, multiple causal factors change, decision rules are omitted, an unchanged failed run is repeated, compute constraints are violated, or the selected dataset card conflicts with the plan. This Skill does not accept or reject a plan; only validated governance ledger state may do so.
+
+## Review-bounded planning
+
+Apply `../shared-references/bounded-scientific-review.md`. Keep `primary_claim`, `original_question_link`, and `secondary_endpoints` explicit so a selected hypothesis cannot silently drift from the user's original question. When revising, consume the stable blocker ledger and emit a `fix_map`; do not rewrite resolved sections unless necessary for consistency. Non-blocking reviewer preferences must not be promoted into mandatory plan complexity.

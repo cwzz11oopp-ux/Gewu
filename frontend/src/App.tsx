@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Cpu, FlaskConical, UserCircle } from "lucide-react";
 import { api } from "./api/client";
+import { isGovernanceRecoveryStatus } from "./api/types";
 import type { ExperimentProgress, ProviderStatus, RunRecord } from "./api/types";
 import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
 import { findLatestArtifact, latestExperimentResultFailure } from "./utils/presentation";
@@ -212,14 +213,12 @@ export default function App() {
           current = await api.createRun(title, topicDraft.problem, topicDraft.domain, topicDraft.constraints, topicDraft.githubRepositoryUrl);
           setRun(current);
         }
-        const preflight = await api.preflightRun(current.id);
-        if (preflight.blocking) {
-          throw new Error(preflight.checks.filter((item) => !item.ok).map((item) => `${item.name}: ${item.code || item.detail || "不可用"}`).join("；"));
-        }
         current = await api.startPipeline(current.id);
         accepted = true;
         setRun(current);
-        setResearchRunning(true);
+        const active = ACTIVE_RUN_STATUSES.has(current.status);
+        setResearchRunning(active);
+        setActiveStepId(active ? current.current_step : null);
       });
     } finally {
       if (!accepted) setResearchRunning(false);
@@ -342,6 +341,7 @@ export default function App() {
 
   async function continuePipeline() {
     if (!run || researchRunning || activeStepId !== null) return;
+    if (isGovernanceRecoveryStatus(run.status)) return;
     if (!tryAcquireMutation()) return;
     setPipelineStopRequested(false);
     setResearchRunning(true);
@@ -351,7 +351,9 @@ export default function App() {
         const updated = await api.startPipeline(run.id);
         accepted = true;
         setRun(updated);
-        setResearchRunning(true);
+        const active = ACTIVE_RUN_STATUSES.has(updated.status);
+        setResearchRunning(active);
+        setActiveStepId(active ? updated.current_step : null);
       });
     } finally {
       if (!accepted) setResearchRunning(false);

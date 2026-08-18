@@ -14,20 +14,47 @@ class ReviewingLLM(MockLLMProvider):
     def __init__(self, reviews):
         self.reviews = list(reviews)
         self.calls = []
+        self.revision_count = 0
 
     def generate_json(self, task, inputs, schema_hint, instructions=""):
         self.calls.append((task, inputs))
         if task == "planning.review_plan":
-            return self.reviews.pop(0)
+            result = self.reviews.pop(0)
+            if result["verdict"] == "ACCEPT" and inputs.get("previous_issue_ledger"):
+                prior = dict(inputs["previous_issue_ledger"][0])
+                prior.update(
+                    status="CLOSED",
+                    resolution="The revised candidate defines the comparator.",
+                    evidence=["The current candidate contains the required comparator."],
+                    evidence_artifact_ids=[inputs["current_candidate_plan_id"]],
+                )
+                result = {**result, "issues": [prior]}
+            return result
         if task == "planning.revise_from_review":
-            return dict(inputs["current_plan"], additional_sections={"deepseek_revision": "applied"})
+            self.revision_count += 1
+            return dict(
+                inputs["current_plan"],
+                additional_sections={"deepseek_revision": f"applied-{self.revision_count}"},
+                fix_map={"PRI-control": ["additional_sections"]},
+            )
         return super().generate_json(task, inputs, schema_hint, instructions)
 
 
 def _review(verdict="ACCEPT"):
     return {
         "verdict": verdict,
-        "issues": [] if verdict == "ACCEPT" else [{"type": "method", "description": "DropPath requires a branch", "reason": "No residual path", "affected_plan_section": "method"}],
+        "issues": [] if verdict == "ACCEPT" else [{
+            "issue_id": "PRI-control",
+            "blocker_class": "MISSING_EXECUTABLE_COMPARATOR",
+            "severity": "BLOCKER",
+            "title": "Comparator is not executable",
+            "contract_fields": ["additional_sections"],
+            "evidence": ["The current candidate does not define the required comparator."],
+            "reason": "The planned comparison cannot identify the intervention.",
+            "required_fix": "Define one executable comparator.",
+            "status": "OPEN",
+        }],
+        "closed_issue_ids": ["PRI-control"] if verdict == "ACCEPT" else [],
         "required_changes": [] if verdict == "ACCEPT" else ["Use residual blocks or remove DropPath"],
         "suggested_fixes": [] if verdict == "ACCEPT" else [{"problem": "plain CNN + DropPath", "recommended_fix": "Use residual blocks", "alternative_fix": "Remove DropPath", "reason": "Preserves the regularization hypothesis"}],
         "revised_plan_guidance": [] if verdict == "ACCEPT" else ["Return a complete executable plan"],
@@ -51,7 +78,9 @@ def test_plan_review_context_is_compact_and_complete(tmp_path):
     engine.run_step(run.id, "research_plan")
     context = next(inputs for task, inputs in llm.calls if task == "planning.review_plan")
     assert {"research_problem_summary", "research_profile", "selected_hypothesis", "evidence_literature_compact_summary", "current_research_plan", "experiment_capability_constraints", "authoritative_plan_contract", "available_split_information"} <= set(context)
-    assert {"dataset_identity", "split_identity", "metrics_and_statistics", "capacity_confounder", "execution_gates"} <= set(context["authoritative_plan_contract"])
+    assert {"dataset", "split_contract", "evaluations", "comparisons", "procedure"} <= set(
+        context["authoritative_plan_contract"]
+    )
     assert context["context_policy"] == "compact_summaries_only_no_unbounded_artifact_injection"
 
 
@@ -63,7 +92,7 @@ def test_revise_round_trips_qwen_deepseek_qwen(tmp_path):
     assert tasks.count("planning.review_plan") == 2
     assert "planning.revise_from_review" in tasks
     assert [artifact.type for artifact in run.artifacts].count("plan_review") == 2
-    assert next(artifact for artifact in reversed(run.artifacts) if artifact.type == "plan").content["additional_sections"]["deepseek_revision"] == "applied"
+    assert next(artifact for artifact in reversed(run.artifacts) if artifact.type == "plan").content["additional_sections"]["deepseek_revision"] == "applied-1"
 
 
 def test_role_router_uses_configured_review_provider():

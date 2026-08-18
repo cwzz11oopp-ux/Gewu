@@ -20,7 +20,7 @@ READINESS_STATES = {
 }
 SCIENTIFIC_RUN_STATES = {
     "NEEDS_VERIFICATION", "NEEDS_EVIDENCE", "NEEDS_PROTOCOL_RESOLUTION",
-    "NEEDS_PLAN_REVISION", "RECOVERABLE_PROVIDER_ERROR", "HYPOTHESIS_REJECTED",
+    "NEEDS_PLAN_REVISION", "POLICY_INTEGRITY_REQUIRED", "RECOVERABLE_PROVIDER_ERROR", "HYPOTHESIS_REJECTED",
     "COMPLETED_NEGATIVE", "COMPLETED_INCONCLUSIVE", "COMPLETED_WITH_BOUNDARY",
 }
 HARD_CONTRACT_KINDS = {
@@ -158,35 +158,28 @@ def next_research_stage(readiness: dict[str, Any], profile: dict[str, Any]) -> s
             "full_experiment_ready": "MAIN", "scientifically_infeasible": "VERIFY"}[readiness["state"]]
 
 
-def merge_issue_ledger(previous: list[dict[str, Any]] | None, review: dict[str, Any], *, round_index: int,
-                       new_information: bool = False) -> list[dict[str, Any]]:
-    """Carry review issues forward; new blocking issues require a stated reason."""
-    prior = {str(item.get("issue_id")): deepcopy(item) for item in previous or [] if isinstance(item, dict)}
-    incoming = review.get("issues") if isinstance(review, dict) else []
-    incoming = incoming if isinstance(incoming, list) else []
-    matched: set[str] = set()
-    ledger: list[dict[str, Any]] = []
-    for index, issue in enumerate(incoming):
-        issue = issue if isinstance(issue, dict) else {"description": str(issue)}
-        description = str(issue.get("description") or issue.get("reason") or "")
-        fingerprint = "ISS-" + sha256(description.casefold().encode()).hexdigest()[:10]
-        old = prior.get(fingerprint)
-        blocking = str(issue.get("severity") or "major").casefold() in {"critical", "major"}
-        reason = issue.get("new_issue_reason")
-        if old is None and blocking and round_index > 1 and not (reason or new_information):
-            blocking = False
-            reason = "Unqualified new issue retained as non-blocking; ledger convergence contract."
-        ledger.append({"issue_id": fingerprint, "introduced_round": old.get("introduced_round", round_index) if old else round_index,
-                       "severity": str(issue.get("severity") or "major").casefold(), "blocking": blocking,
-                       "description": description, "required_fix": str(issue.get("required_fix") or issue.get("reason") or ""),
-                       "status": "open", "resolution_evidence": list(issue.get("resolution_evidence") or []),
-                       "new_issue_reason": reason})
-        matched.add(fingerprint)
-    for key, old in prior.items():
-        if key not in matched:
-            old["status"] = "resolved"
-            ledger.append(old)
-    return ledger
+def merge_issue_ledger(
+    previous: list[dict[str, Any]] | None,
+    review: dict[str, Any],
+    *,
+    round_index: int,
+    frozen_policy: dict[str, Any] | None = None,
+    changed_fields: tuple[str, ...] = (),
+    new_evidence_artifact_ids: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Compatibility entry point backed by the policy-driven adjudicator."""
+    if frozen_policy is None:
+        raise ValueError("PLAN_REVIEW_POLICY_REQUIRED")
+    from backend.app.workflow.plan_review_governance import adjudicate_review
+
+    return adjudicate_review(
+        previous,
+        review,
+        frozen_policy=frozen_policy,
+        round_index=round_index,
+        changed_fields=changed_fields,
+        new_evidence_artifact_ids=new_evidence_artifact_ids,
+    ).issues
 
 
 def selected_hypothesis_digest(selection: dict[str, Any], reasoning: dict[str, Any], *, budget: int = 12_000) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -235,6 +228,8 @@ def build_world_state(*, run: Any, profile: dict[str, Any], dataset: dict[str, A
 def failure_state_for(exc: Exception) -> str:
     """Classify operational failures separately from scientific outcomes."""
     text = f"{type(exc).__name__}:{exc}".casefold()
+    if "planreviewpolicyintegrityerror" in text or "plan_review_policy_integrity" in text:
+        return "POLICY_INTEGRITY_REQUIRED"
     if any(token in text for token in ("timeout", "429", "connection", "provider", "model_", "llm", "json", "schema")):
         return "RECOVERABLE_PROVIDER_ERROR"
     return "FAILED_SYSTEM"

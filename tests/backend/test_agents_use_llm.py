@@ -81,6 +81,35 @@ def test_reasoning_agents_call_llm_provider():
     assert llm.tasks[-2:] == ["writer.report_abstract", "writer.audit_report"]
 
 
+def test_planning_agent_receives_real_observed_structure_separately_from_semantics():
+    class CaptureLLM(TaskRecorder):
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            self.inputs = inputs
+            self.instructions = instructions
+            return {"ok": True}
+
+    observed = [{
+        "relative_path": "clutter.mat",
+        "filename": "clutter.mat",
+        "format": "mat",
+        "suffix": ".mat",
+        "arrays": [{"key": "clutter", "shape": [18_000, 512], "dtype": "float32"}],
+    }]
+    llm = CaptureLLM()
+    PlanningAgent(llm).build_plan(
+        {"claim": "c"},
+        dataset_options=[{
+            "contract_id": "dataset_1",
+            "card": {"observed_structure": observed},
+        }],
+    )
+
+    assert llm.inputs["observed_structure"] == [
+        {"contract_id": "dataset_1", "observed_structure": observed}
+    ]
+    assert "read-only inspection of real files" in llm.instructions
+
+
 def test_hypothesis_schema_requests_method_mechanism_and_traceable_evidence():
     llm = TaskRecorder()
 

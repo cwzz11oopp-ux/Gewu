@@ -25,6 +25,10 @@ def compile_runtime_contract(
     manifest = bundle.manifest
     dataset = plan.get("dataset") or {}
     iteration = plan.get("iteration_contract") or {}
+    phase2_protocol = task.get("phase2_protocol") or {}
+    protocol_stage = str(phase2_protocol.get("stage") or "formal_validation")
+    protocol_seeds = list(phase2_protocol.get("seeds") or manifest.seeds)
+    protocol_epochs = int(phase2_protocol.get("epochs") or plan.get("epochs") or 1)
     expected_metrics = list(manifest.expected_metrics)
     required_metrics = [
         str(metric).strip()
@@ -42,7 +46,9 @@ def compile_runtime_contract(
         "dataset_fingerprint": str(dataset.get("content_fingerprint") or manifest.dataset_fingerprint),
         "expected_data_root": str(dataset.get("root") or task.get("dataset_root") or ""),
         "requires_gpu": bool(manifest.requires_gpu),
-        "seeds": list(manifest.seeds),
+        "stage": protocol_stage,
+        "epochs": protocol_epochs,
+        "seeds": protocol_seeds,
         "parameters": dict(manifest.parameters),
         "expected_metrics": expected_metrics,
         "iteration_required_metrics": required_metrics,
@@ -111,6 +117,12 @@ def main() -> None:
     environment = dict(os.environ)
     environment["GEWU_RUNTIME_CONTRACT_SHA256"] = CONTRACT["contract_sha256"]
     environment["GEWU_SEEDS_JSON"] = json.dumps(CONTRACT["seeds"], sort_keys=True)
+    environment["GEWU_EXECUTION_STAGE"] = (
+        "smoke" if args.smoke_test else CONTRACT["stage"]
+    )
+    environment["GEWU_EXECUTION_EPOCHS"] = str(
+        1 if args.smoke_test else CONTRACT["epochs"]
+    )
     environment["GEWU_PARAMETERS_JSON"] = json.dumps(CONTRACT["parameters"], sort_keys=True)
     command = [
         sys.executable,
@@ -182,6 +194,8 @@ def main() -> None:
         "runtime": {{
             "contract_sha256": CONTRACT["contract_sha256"],
             "mode": "smoke" if args.smoke_test else "full",
+            "stage": "smoke" if args.smoke_test else CONTRACT["stage"],
+            "epochs": 1 if args.smoke_test else CONTRACT["epochs"],
         }},
     }}
     final_output.write_text(json.dumps(envelope, ensure_ascii=False, sort_keys=True), encoding="utf-8")

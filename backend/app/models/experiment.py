@@ -84,6 +84,8 @@ class ExperimentRuntimeContract(BaseModel):
     dataset_fingerprint: str = ""
     expected_data_root: str = ""
     requires_gpu: bool = False
+    stage: str = "formal_validation"
+    epochs: int = 1
     seeds: list[int] = Field(default_factory=list)
     parameters: dict[str, Any] = Field(default_factory=dict)
     expected_metrics: list[str] = Field(default_factory=list)

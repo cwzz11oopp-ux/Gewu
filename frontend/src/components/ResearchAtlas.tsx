@@ -1,5 +1,6 @@
 import { ArrowUpRight, Check, FlaskConical, NotebookPen, Play, TriangleAlert } from "lucide-react";
 import type { Artifact, ExperimentProgress, RunRecord } from "../api/types";
+import { isGovernanceRecoveryStatus } from "../api/types";
 import { findLatestArtifactContent } from "../utils/presentation";
 import { ResearchSidebar, type ResearchView } from "./ResearchSidebar";
 
@@ -53,6 +54,8 @@ export function ResearchAtlas({ run, topic, activeStepId, failedStepId, running,
   const activeIndex = Math.max(0, stages.findIndex(([id]) => id === activeStepId));
   const workflowProgress = running ? Math.max(12, (activeIndex + 1) / stages.length * 100) : 0;
   const canRun = Boolean(topic.problem.trim()) && !running;
+  const governanceHold = run && isGovernanceRecoveryStatus(run.status) ? run.status : null;
+  const planRecoveryAvailable = run?.status === "NEEDS_PLAN_REVISION";
   const primaryAction = run ? onContinue : onStart;
 
   return <main className="atlas-shell">
@@ -65,7 +68,7 @@ export function ResearchAtlas({ run, topic, activeStepId, failedStepId, running,
       <div className="atlas-heading">
         <div><p>研究地图 <span>Research Atlas</span></p>{run ? <h1>{value(topic.problem, "从一个清晰的问题开始研究")}</h1> : <textarea className="atlas-question-editor" aria-label="研究问题" value={topic.problem} onChange={(event) => onProblemChange(event.target.value)} placeholder="输入你想验证的研究问题…" />}<small>围绕当前假设，整合证据、推断与下一步实验，形成可执行的研究路径。</small><div className="atlas-legend"><span className="support">证据支持</span><span className="conflict">证据冲突</span><span className="method">方法/数据</span><span className="pending">待验证</span></div></div>
         <section className={running ? "atlas-now running" : "atlas-now"}><span>当前状态</span><strong>{progress?.process_alive ? "实验正在执行" : running ? `正在${stages[activeIndex]?.[1]}` : "等待开始"}</strong><div><i style={{ width: `${workflowProgress}%` }} /></div></section>
-        <button className="atlas-primary" disabled={!canRun} onClick={primaryAction}><Play size={16} fill="currentColor" />{run ? "运行下一步" : "开始研究"}<ArrowUpRight size={18} /></button>
+        <button className="atlas-primary" disabled={!canRun || Boolean(governanceHold)} onClick={primaryAction}><Play size={16} fill="currentColor" />{planRecoveryAvailable ? "继续研究（重新审查计划）" : governanceHold === "POLICY_INTEGRITY_REQUIRED" ? "等待操作员恢复" : run ? "运行下一步" : "开始研究"}<ArrowUpRight size={18} /></button>
       </div>
       <div className={running ? "atlas-canvas is-running" : "atlas-canvas"}>
         <svg className="atlas-links" viewBox="0 0 1000 620" preserveAspectRatio="none" aria-hidden="true">
@@ -80,6 +83,6 @@ export function ResearchAtlas({ run, topic, activeStepId, failedStepId, running,
         <section className="atlas-research-note"><header><NotebookPen size={17}/><strong>研究笔记</strong></header><p>{value(decision.reason, "从一个可验证的问题开始，系统会持续记录证据、风险与下一轮实验方向。")}</p><footer><span>研究员</span><time>{new Date().toLocaleDateString("zh-CN")}</time></footer></section>
       </div>
     </section>
-    <aside className="atlas-context"><section><p>研究流程 <span>V1.5</span></p><ol>{stages.map(([id, label, detail], index) => { const state = statusFor(id, run, activeStepId, failedStepId); return <li className={state} key={id}><i>{state === "complete" ? <Check size={13}/> : index + 1}</i><div><strong>{label}</strong><span>{state === "active" ? "正在运行" : state === "failed" ? "需要恢复" : detail}</span></div></li>; })}</ol></section><section><p>运行环境</p><dl><div><dt>执行状态</dt><dd>{progress?.state ?? (running ? "running" : "idle")}</dd></div><div><dt>研究 Run</dt><dd>{run?.id?.slice(-10) ?? "尚未创建"}</dd></div><div><dt>当前策略</dt><dd>{value(decision.action, "等待决策")}</dd></div></dl></section>{failedStepId && <section className="atlas-warning"><TriangleAlert size={18}/><div><strong>需要恢复</strong><p>未形成科学结论；请查看诊断后重试。</p></div></section>}</aside>
+    <aside className="atlas-context"><section><p>研究流程 <span>V1.5</span></p><ol>{stages.map(([id, label, detail], index) => { const state = statusFor(id, run, activeStepId, failedStepId); return <li className={state} key={id}><i>{state === "complete" ? <Check size={13}/> : index + 1}</i><div><strong>{label}</strong><span>{state === "active" ? "正在运行" : state === "failed" ? "需要恢复" : detail}</span></div></li>; })}</ol></section><section><p>运行环境</p><dl><div><dt>执行状态</dt><dd>{governanceHold ?? progress?.state ?? (running ? "running" : "idle")}</dd></div><div><dt>研究 Run</dt><dd>{run?.id?.slice(-10) ?? "尚未创建"}</dd></div><div><dt>当前策略</dt><dd>{value(decision.action, "等待决策")}</dd></div></dl></section>{planRecoveryAvailable ? <section className="atlas-warning"><TriangleAlert size={18}/><div><strong>计划可重新审查</strong><p>继续研究会重新裁决旧 Plan finding；通过后自动进入实验。</p></div></section> : governanceHold ? <section className="atlas-warning"><TriangleAlert size={18}/><div><strong>研究治理状态完整性异常</strong><p>自动执行已停止，需要操作员恢复，且不会自动重试。</p></div></section> : run?.status === "RECOVERABLE_PROVIDER_ERROR" ? <section className="atlas-warning"><TriangleAlert size={18}/><div><strong>连接中断，可继续恢复</strong><p>科研结论未被判定失败；可从当前步骤继续。</p></div></section> : failedStepId && <section className="atlas-warning"><TriangleAlert size={18}/><div><strong>需要恢复</strong><p>未形成科学结论；请查看诊断后重试。</p></div></section>}</aside>
   </main>;
 }

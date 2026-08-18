@@ -191,6 +191,11 @@ class SkillRuntime:
         declared = {tool for context in contexts for tool in context.allowed_tools}
         authorized = self.authorize(agent_id, declared, configured_tools)
         rendered = self.instruction_budget.render(contexts)
+        if rendered.omitted_sections:
+            raise ValueError(
+                "SKILL_INSTRUCTION_BUDGET_EXCEEDED:"
+                + ",".join(rendered.omitted_sections)
+            )
         denied = sorted(declared - set(authorized))
         instruction_hash = hashlib.sha256(rendered.text.encode("utf-8")).hexdigest()
         invocations = [

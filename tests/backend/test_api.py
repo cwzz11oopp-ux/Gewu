@@ -43,6 +43,9 @@ def run_to_completed_feedback(client, run_id):
             latest = response.json()
     revision = [artifact for artifact in latest["artifacts"] if artifact["type"] == "revision"][-1]
     while revision["content"]["requires_follow_up"]:
+        response = client.post(f"/api/runs/{run_id}/steps/research_plan/run")
+        assert response.status_code == 200, response.text
+        latest = response.json()
         for step_id in ["experiment_task", "experiment_run_analysis", "feedback_revision"]:
             response = client.post(f"/api/runs/{run_id}/steps/{step_id}/run")
             assert response.status_code == 200, response.text

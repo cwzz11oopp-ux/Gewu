@@ -1,7 +1,7 @@
 import type { Artifact, ExperimentProgress, RunRecord } from "../api/types";
 import { findLatestArtifact, findLatestArtifactContent } from "../utils/presentation";
 
-export type ResearchStatus = "empty" | "searching" | "thinking" | "running" | "failed" | "refuted" | "completed" | "ready" | "queued" | "revision_required" | "evidence_insufficient" | "rejected";
+export type ResearchStatus = "empty" | "searching" | "thinking" | "running" | "failed" | "refuted" | "completed" | "ready" | "queued" | "revision_required" | "needs_plan_revision" | "policy_integrity_required" | "evidence_insufficient" | "rejected";
 
 export type PaperItem = {
   id: string;
@@ -164,6 +164,8 @@ const externalUrl = (value: unknown): string | undefined => {
 };
 const statusForRun = (run: RunRecord | null, progress: ExperimentProgress | null): ResearchStatus => {
   if (!run) return "empty";
+  if (run.status === "NEEDS_PLAN_REVISION") return "needs_plan_revision";
+  if (run.status === "POLICY_INTEGRITY_REQUIRED") return "policy_integrity_required";
   if (run.status === "hypothesis_revision_required") return "revision_required";
   if (progress?.state === "failed" || run.status === "failed") return "failed";
   if (progress?.process_alive || ["running", "queued", "stopping"].includes(run.status)) return "running";

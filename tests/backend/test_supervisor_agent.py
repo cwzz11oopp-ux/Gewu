@@ -13,7 +13,12 @@ EXPECTED_ASSIGNMENTS = {
     ),
     "research_plan": (
         "planning",
-        ("research-refine", "hypothesis-experiment-gate", "experiment-plan"),
+        (
+            "research-refine",
+            "hypothesis-experiment-gate",
+            "experiment-plan",
+            "plan-review-governance",
+        ),
     ),
     "experiment_task": ("experiment", ("experiment-implementation",)),
     "experiment_run_analysis": (

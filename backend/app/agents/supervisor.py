@@ -66,9 +66,6 @@ _SEMANTIC_RUBRICS = {
     "evidence_reasoning": ReviewRubric(
         "2", ("evidence traceability", "novelty risk", "candidate reasoning completeness")
     ),
-    "research_plan": ReviewRubric(
-        "1", ("falsifiability", "procedure completeness", "resource feasibility")
-    ),
     "feedback_revision": ReviewRubric(
         "2",
         (
@@ -182,6 +179,12 @@ class SupervisorAgent:
         if issues:
             return ValidationDecision(False, tuple(dict.fromkeys(issues)))
 
+        # Research-plan science has exactly one authority: the frozen-policy
+        # governance ledger.  The Supervisor performs structure/routing only,
+        # even when production injects a ReviewerAgent.
+        if step_id == "research_plan":
+            return ValidationDecision(True)
+
         # This stage already consists of one comprehensive model review over every
         # candidate. A second model-as-reviewer pass adds latency without adding a
         # decision, because the human explicitly owns the final selection.
@@ -208,6 +211,8 @@ class SupervisorAgent:
         issues: tuple[str, ...],
         diagnosis: bool = False,
     ) -> dict:
+        if step_id == "research_plan":
+            raise ValueError("PLAN_REVIEW_GOVERNANCE_ONLY")
         limit = SupervisorAgent.revision_limit(step_id, diagnosis=diagnosis)
         if attempt > limit:
             detail = " | ".join(str(issue) for issue in issues)[:320]
@@ -225,6 +230,8 @@ class SupervisorAgent:
 
     @staticmethod
     def revision_limit(step_id: str, *, diagnosis: bool = False) -> int:
+        if step_id == "research_plan":
+            raise ValueError("PLAN_REVIEW_GOVERNANCE_ONLY")
         if step_id in {"evidence_reasoning", "experiment_task"}:
             return 5
         if diagnosis and step_id == "experiment_run_analysis":

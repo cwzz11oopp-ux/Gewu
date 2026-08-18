@@ -103,6 +103,7 @@ class RuntimeConfigStore:
         qwen = providers.get("qwen") or {}
         deepseek = providers.get("deepseek") or {}
         roles = config["roles"]
+        experiment_code_role = roles.get("EXPERIMENT_CODE_GENERATION") or {}
         return replace(
             settings,
             model_role_assignments=config["roles"],
@@ -111,6 +112,11 @@ class RuntimeConfigStore:
             qwen_model=str(
                 (((saved_config.get("roles") or {}).get("RESEARCH_PLAN_GENERATION") or {}).get("model"))
                 or settings.qwen_model
+            ),
+            qwen_code_model=(
+                str(experiment_code_role.get("model") or settings.qwen_code_model)
+                if experiment_code_role.get("provider_id") == "qwen"
+                else settings.qwen_code_model
             ),
             deepseek_api_key=str((secrets.get("deepseek") or {}).get("api_key") or settings.deepseek_api_key),
             deepseek_base_url=str(deepseek.get("base_url") or settings.deepseek_base_url),

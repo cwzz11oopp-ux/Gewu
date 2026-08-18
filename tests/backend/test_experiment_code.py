@@ -12,6 +12,7 @@ from backend.app.workflow.experiment_code import (
     experiment_validation_issues,
     normalize_experiment_bundle,
     normalize_experiment_code,
+    smoke_data_reduction_issues,
     validate_experiment_bundle_source,
     validate_relative_file_path,
 )
@@ -68,6 +69,18 @@ class BundleLLM:
 
 def test_validate_relative_file_path_accepts_nested_relative_path():
     assert validate_relative_file_path("src/train.py") == "src/train.py"
+
+
+def test_smoke_data_reduction_check_rejects_the_legacy_ipix_head_slice():
+    source = """
+if args.smoke_test:
+    X = X[:1000]
+    y = y[:1000]
+"""
+    assert smoke_data_reduction_issues(source) == [
+        "EXPERIMENT_SMOKE_DATA_REDUCTION_FORBIDDEN:X",
+        "EXPERIMENT_SMOKE_DATA_REDUCTION_FORBIDDEN:y",
+    ]
 
 
 def test_normalize_experiment_code_rejects_parent_directory_file_path():
@@ -172,6 +185,41 @@ def test_generate_bundle_contains_manifest_code_requirements_and_stable_ids():
     assert "python_args" not in schema_hint
     assert "content_lines" in schema_hint["files"][0]
     assert "content_lines" in instructions
+
+
+def test_bundle_generation_and_repair_receive_observed_local_structure():
+    llm = BundleLLM()
+    agent = ExperimentAgent(MockExperimentProvider(), llm)
+    observed = [{
+        "relative_path": "clutter.mat",
+        "filename": "clutter.mat",
+        "format": "mat",
+        "suffix": ".mat",
+        "arrays": [{"key": "clutter", "shape": [18_000, 512], "dtype": "float32"}],
+    }]
+    plan = {
+        "dataset": {
+            "contract_id": "dataset_1",
+            "root": "D:/data/IPIX17",
+            "observed_structure": observed,
+        }
+    }
+    task = {"seed": 42, "plan": plan}
+
+    bundle = agent.generate_bundle(
+        "run_1", "experiment_1", plan, task, "Use local data.", "python", validate=False
+    )
+    repaired = agent.repair_bundle(
+        plan, task, bundle, {"evidence": ["repair"]}, "Repair local data.", validate=False
+    )
+
+    generated = llm.calls[0]
+    repaired_call = llm.calls[1]
+    assert generated[1]["observed_structure"] == observed
+    assert repaired_call[1]["observed_structure"] == observed
+    assert "read-only inspection of the real local data files" in generated[3]
+    assert "read-only inspection of the real local data files" in repaired_call[3]
+    assert repaired.manifest.dataset_contract_id == "dataset_1"
 
 
 def test_generate_bundle_rejects_parent_file_paths():

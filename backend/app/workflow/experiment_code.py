@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import posixpath
 import re
@@ -215,25 +216,26 @@ def _normalize_bundle_file(raw_file: Any) -> dict[str, Any]:
     if not isinstance(raw_file, dict):
         raise ValueError("EXPERIMENT_CODE_FILE_INVALID: each files item must be an object")
     item = dict(raw_file)
-    if "content_lines" not in item:
-        return item
-    if item.get("content") not in (None, ""):
-        raise ValueError(
-            "EXPERIMENT_CODE_CONTENT_AMBIGUOUS: return content_lines without content"
-        )
-    lines = item.pop("content_lines")
-    if not isinstance(lines, list) or not lines or any(
-        not isinstance(line, str) for line in lines
-    ):
-        raise ValueError(
-            "EXPERIMENT_CODE_LINES_INVALID: content_lines must be a non-empty array of strings"
-        )
-    if any("\n" in line or "\r" in line for line in lines):
-        raise ValueError(
-            "EXPERIMENT_CODE_LINES_INVALID: each content_lines item must contain exactly one "
-            "physical source line without newline characters"
-        )
-    item["content"] = "\n".join(lines).rstrip("\n") + "\n"
+    if "content_lines" in item:
+        if item.get("content") not in (None, ""):
+            raise ValueError(
+                "EXPERIMENT_CODE_CONTENT_AMBIGUOUS: return content_lines without content"
+            )
+        lines = item.pop("content_lines")
+        if not isinstance(lines, list) or not lines or any(
+            not isinstance(line, str) for line in lines
+        ):
+            raise ValueError(
+                "EXPERIMENT_CODE_LINES_INVALID: content_lines must be a non-empty array of strings"
+            )
+        if any("\n" in line or "\r" in line for line in lines):
+            raise ValueError(
+                "EXPERIMENT_CODE_LINES_INVALID: each content_lines item must contain exactly one "
+                "physical source line without newline characters"
+            )
+        item["content"] = "\n".join(lines).rstrip("\n") + "\n"
+    if isinstance(item.get("content"), str):
+        item["sha256"] = hashlib.sha256(item["content"].encode("utf-8")).hexdigest()
     return item
 
 
@@ -335,6 +337,8 @@ def _declared_dataset(raw: dict[str, Any], task: dict[str, Any], files: list[Exp
     if plan_dataset.get("contract_id"):
         declared = str(raw.get("dataset") or "").strip()
         planned_name = contract_canonical_name(plan_dataset)
+        if not planned_name and declared == str(plan_dataset["contract_id"]):
+            declared = ""
         declared_name = normalize_dataset_name(declared) if declared else ""
         if declared and (not planned_name or declared_name != planned_name):
             raise ValueError(
@@ -428,8 +432,23 @@ def validate_experiment_bundle_source(bundle: ExperimentBundle) -> None:
                 "EXPERIMENT_SMOKE_TEST_PROTOCOL_INVALID:"
                 "train.py must accept --smoke-test and branch on args.smoke_test"
             )
+        issues.extend(smoke_data_reduction_issues(source))
     if issues:
         raise ExperimentBundleValidationError(issues)
+
+
+def smoke_data_reduction_issues(source: str) -> list[str]:
+    """Reject the legacy smoke-only head slice without a broader code analyzer."""
+    issues = []
+    for variable in ("X", "y", "dataset", "data"):
+        if re.search(
+            rf"\b{variable}\s*=\s*{variable}\s*\[\s*:\s*[^\]]+\]",
+            source,
+        ):
+            issues.append(
+                f"EXPERIMENT_SMOKE_DATA_REDUCTION_FORBIDDEN:{variable}"
+            )
+    return issues
 
 
 def _has_metrics_result_mechanism(source: str) -> bool:

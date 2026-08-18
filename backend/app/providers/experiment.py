@@ -30,6 +30,7 @@ from backend.app.workflow.dataset_catalog import (
     supported_dataset_names,
 )
 from backend.app.workflow.dataset_inspection import verify_dataset_contract
+from backend.app.workflow.experiment_code import smoke_data_reduction_issues
 from backend.app.workflow.experiment_harness import harness_file_path, harness_source
 from backend.app.providers.experiment_runtime import (
     build_python_command,
@@ -146,6 +147,59 @@ def _configured_device_indexes(value: str) -> list[int] | None:
     if not re.fullmatch(r"\d+(?:,\d+)*", value):
         return None
     return [int(item) for item in value.split(",")]
+
+
+def validate_local_gpu_preflight(settings: Settings) -> dict:
+    """The one real local-runtime probe used by settings and run admission."""
+    workdir_value = str(settings.local_gpu_workdir or "")
+    if not workdir_value:
+        return {
+            "ok": False, "provider": "local_gpu", "code": "LOCAL_EXPERIMENT_WORKDIR_INVALID",
+            "message": "Local experiment workdir is required.", "missing": ["LOCAL_EXPERIMENT_WORKDIR"],
+            "workdir": "", "resolved_workdir": "",
+        }
+    workdir = Path(workdir_value).expanduser().resolve()
+    base = {
+        "provider": "local_gpu", "workdir": workdir_value,
+        "resolved_workdir": str(workdir), "entrypoint": str(workdir / "train.py"),
+        "entrypoint_exists": (workdir / "train.py").is_file(), "missing": [],
+    }
+    if not settings.local_gpu_enabled:
+        return {**base, "ok": False, "code": "LOCAL_GPU_DISABLED", "message": "Local GPU is disabled."}
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        probe_file = workdir / ".gewu-write-probe"
+        probe_file.write_text("ok", encoding="utf-8")
+        probe_file.unlink()
+    except OSError as exc:
+        return {**base, "ok": False, "code": "LOCAL_EXPERIMENT_WORKDIR_INVALID", "message": f"Local experiment workdir is not writable: {exc}"}
+    indexes = _configured_device_indexes(settings.local_gpu_cuda_visible_devices)
+    if indexes is None:
+        return {**base, "ok": False, "code": "LOCAL_GPU_DEVICE_INDEX_INVALID", "message": "CUDA device indexes must use values such as 0 or 0,1."}
+    env = os.environ.copy()
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    try:
+        completed = subprocess.run(
+            cuda_probe_command(settings.local_gpu_python), check=True,
+            capture_output=True, text=True, timeout=_probe_timeout(settings),
+            cwd=str(workdir), env=env,
+        )
+        probe = parse_cuda_probe(completed.stdout)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        return {**base, "ok": False, "code": "LOCAL_GPU_PYTHON_PROBE_FAILED", "message": "The configured Local Python could not complete the CUDA probe.", "python": settings.local_gpu_python, "error_type": type(exc).__name__}
+    diagnostics = {
+        "python": settings.local_gpu_python, "python_version": probe.python_version,
+        "torch_version": probe.torch_version, "torch_cuda": probe.torch_cuda or "",
+        "cuda_available": probe.available, "device_count": probe.device_count,
+        "device_names": probe.device_names,
+        "available_device_indexes": list(range(probe.device_count)),
+        "dependency_status": "ready",
+    }
+    if not probe.available or probe.device_count < 1:
+        return {**base, **diagnostics, "ok": False, "code": "LOCAL_EXPERIMENT_CUDA_UNAVAILABLE", "message": "The configured Local Python cannot access a CUDA GPU."}
+    if any(index >= probe.device_count for index in indexes):
+        return {**base, **diagnostics, "ok": False, "code": "LOCAL_GPU_DEVICE_INDEX_INVALID", "message": "A configured CUDA device index is outside the available range."}
+    return {**base, **diagnostics, "ok": True, "code": "", "message": "Local Python, torch, CUDA, GPU selection, and workdir are ready."}
 
 
 def validate_remote_gpu_settings(settings: Settings) -> dict:
@@ -822,6 +876,8 @@ class LocalGpuExperimentProvider:
         self, task: dict, bundle: ExperimentBundle
     ) -> dict | None:
         """Recover a validated local attempt after its HTTP request was interrupted."""
+        if any(smoke_data_reduction_issues(item.content) for item in bundle.files):
+            return None
         manifest = bundle.manifest
         root = Path(self.settings.local_gpu_workdir).expanduser().resolve()
         experiment_dir = (root / manifest.run_id / manifest.experiment_id).resolve()
@@ -1258,7 +1314,7 @@ class LocalGpuExperimentProvider:
             "workdir": str(experiment_dir),
             "command": command,
             "parameters": manifest.parameters,
-            "seeds": manifest.seeds,
+            "seeds": payload.get("seeds", manifest.seeds),
             "environment": environment,
             "deployed_files": deployed_files,
             "metrics_path": str(result_path),

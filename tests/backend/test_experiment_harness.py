@@ -206,6 +206,65 @@ def test_harness_executes_and_aggregates_every_formal_seed(tmp_path):
     assert payload["metric_summary"]["accuracy"]["std"] == pytest.approx(0.2)
 
 
+def test_harness_binds_smoke_small_scale_and_formal_budgets(tmp_path):
+    plan = {
+        "seeds": [3, 5, 7],
+        "epochs": 20,
+        "parameters": {"learning_rate": 0.01},
+    }
+    source = (
+        "import argparse\nimport json\nimport os\nfrom pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--run-id')\np.add_argument('--experiment-id')\n"
+        "p.add_argument('--result-id')\np.add_argument('--output')\n"
+        "p.add_argument('--seed', type=int)\np.add_argument('--smoke-test', action='store_true')\n"
+        "a=p.parse_args()\n"
+        "record={'seed': a.seed, 'smoke': a.smoke_test, 'stage': os.environ['GEWU_EXECUTION_STAGE'], 'epochs': os.environ['GEWU_EXECUTION_EPOCHS']}\n"
+        "with Path('calls.jsonl').open('a', encoding='utf-8') as f: f.write(json.dumps(record) + '\\n')\n"
+        "Path(a.output).parent.mkdir(parents=True, exist_ok=True)\n"
+        "Path(a.output).write_text(json.dumps({'seed': a.seed, 'metrics': {'accuracy': 0.9}}), encoding='utf-8')\n"
+    )
+    bundle = normalize_experiment_bundle(
+        {
+            "files": [{"path": "train.py", "content": source}],
+            "expected_metrics": ["accuracy"],
+            "parameters": {"learning_rate": 0.01},
+            "seeds": [3, 5, 7],
+            "supports_smoke_test": True,
+        },
+        "run_1",
+        "experiment_1",
+        {"plan": plan},
+    )
+    small_task = {"phase2_protocol": {"stage": "small_scale", "seeds": [3, 5], "epochs": 5}}
+    small = compile_runtime_contract(plan, small_task, bundle)
+    assert small.stage == "small_scale" and small.seeds == [3, 5] and small.epochs == 5
+    (tmp_path / "train.py").write_text(source, encoding="utf-8")
+    (tmp_path / small.harness_filename).write_text(harness_source(small), encoding="utf-8")
+
+    smoke = subprocess.run([sys.executable, small.harness_filename, "--smoke-test"], cwd=tmp_path, capture_output=True, text=True)
+    small_run = subprocess.run([sys.executable, small.harness_filename], cwd=tmp_path, capture_output=True, text=True)
+    assert smoke.returncode == 0, smoke.stderr
+    assert small_run.returncode == 0, small_run.stderr
+    calls = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert calls == [
+        {"seed": 3, "smoke": True, "stage": "smoke", "epochs": "1"},
+        {"seed": 3, "smoke": False, "stage": "small_scale", "epochs": "5"},
+        {"seed": 5, "smoke": False, "stage": "small_scale", "epochs": "5"},
+    ]
+
+    formal_task = {"phase2_protocol": {"stage": "formal_validation", "seeds": [3, 5, 7], "epochs": 20}}
+    formal = compile_runtime_contract(plan, formal_task, bundle)
+    (tmp_path / formal.harness_filename).write_text(harness_source(formal), encoding="utf-8")
+    formal_run = subprocess.run([sys.executable, formal.harness_filename], cwd=tmp_path, capture_output=True, text=True)
+    assert formal_run.returncode == 0, formal_run.stderr
+    formal_calls = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text(encoding="utf-8").splitlines()][3:]
+    assert formal_calls == [
+        {"seed": seed, "smoke": False, "stage": "formal_validation", "epochs": "20"}
+        for seed in [3, 5, 7]
+    ]
+
+
 def test_runtime_audit_rejects_single_seed_result_for_multiseed_contract():
     plan = _plan()
     bundle = compile_bundle_runtime_contract(plan, {}, _bundle(plan))

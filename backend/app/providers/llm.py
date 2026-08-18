@@ -779,7 +779,7 @@ class QwenLLMProvider:
                         request_id = candidate.headers.get("x-request-id") or candidate.headers.get("x-dashscope-request-id") or ""
                         excerpt = sanitized_response_excerpt(candidate.text, self.settings.qwen_api_key, limit=800)
                         raise RuntimeError(
-                            f"QWEN_PROVIDER_CONFIG_ERROR:provider=qwen:model={model}:task={task}:"
+                            f"MODEL_PROVIDER_CONFIG_ERROR:provider={self.mode}:model={model}:task={task}:"
                             f"http_status={candidate.status_code}:request_id={request_id}:response_excerpt={excerpt}"
                         )
                     last_exception = httpx.HTTPStatusError(
@@ -788,7 +788,7 @@ class QwenLLMProvider:
                         response=candidate,
                     )
                 if attempt < self.settings.qwen_retries_per_model:
-                    time.sleep(0.25 * (attempt + 1))
+                    time.sleep(min(2.0, float(2 ** attempt)))
             if response is not None:
                 break
 
@@ -796,11 +796,13 @@ class QwenLLMProvider:
             failure_summary = ",".join(failures)
             if failures and all(":timeout" in failure for failure in failures):
                 raise RuntimeError(
-                    f"QWEN_REQUEST_TIMEOUT: no response within "
-                    f"{timeout_seconds}s; attempts={failure_summary}"
+                    f"MODEL_REQUEST_TIMEOUT:provider={self.mode}:model={model}:task={task}:"
+                    f"timeout_seconds={timeout_seconds}:attempts={failure_summary}"
                 ) from last_exception
             raise RuntimeError(
-                f"QWEN_REQUEST_FAILED: route={policy.route}; attempts={failure_summary}"
+                f"MODEL_REQUEST_FAILED:provider={self.mode}:model={model}:task={task}:"
+                f"route={policy.route}:exception_type={type(last_exception).__name__ if last_exception else 'Unknown'}:"
+                f"attempts={failure_summary}"
             ) from last_exception
 
         choice = response.json()["choices"][0]
@@ -818,9 +820,9 @@ class QwenLLMProvider:
             )
         json_repaired = False
         try:
-            parsed = json.loads(message)
+            parsed = _loads_model_json(message, task)
         except json.JSONDecodeError as exc:
-            parsed = self._repair_json(message, schema_hint)
+            parsed = self._repair_json(message, schema_hint, task=task)
             if parsed is None:
                 if not task.startswith("experiment."):
                     raise
@@ -877,7 +879,9 @@ class QwenLLMProvider:
     def _model_for_task(self, task: str) -> str:
         return self._models_for_policy(self._policy_for_task(task))[0]
 
-    def _repair_json(self, raw_output: str, schema_hint: dict) -> dict | None:
+    def _repair_json(
+        self, raw_output: str, schema_hint: dict, *, task: str
+    ) -> dict | None:
         policy = _FAST_POLICY
         model = self._models_for_policy(policy)[0]
         try:
@@ -894,7 +898,9 @@ class QwenLLMProvider:
                 int(getattr(self.settings, policy.timeout_setting)),
             )
             response.raise_for_status()
-            repaired = json.loads(response.json()["choices"][0]["message"]["content"])
+            repaired = _loads_model_json(
+                response.json()["choices"][0]["message"]["content"], task
+            )
         except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError):
             return None
         return repaired if isinstance(repaired, dict) else None
@@ -1038,6 +1044,7 @@ class ModelRoleRouter:
         self.settings = settings
         self.qwen = qwen
         self.deepseek = deepseek
+        self._last_provider: LLMProvider | None = None
 
     def generate_json(self, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
         role = {
@@ -1051,17 +1058,20 @@ class ModelRoleRouter:
             "planning.review_plan": "RESEARCH_PLAN_REVIEW",
             "experiment.generate_code": "EXPERIMENT_CODE_GENERATION",
             "experiment.generate_bundle": "EXPERIMENT_CODE_GENERATION",
+            "experiment.repair_bundle": "EXPERIMENT_CODE_GENERATION",
             "critic.review_result": "CRITIC",
             "writer.build_report": "WRITER",
         }.get(task, "GENERAL_REASONING")
         assignment = self.settings.model_role_assignments.get(role) or {}
         provider = self.deepseek if assignment.get("provider_id") == "deepseek" else self.qwen
+        self._last_provider = provider
         return provider.generate_json(task, inputs, schema_hint, instructions)
 
     def generate_json_for_provider(self, provider_id: str, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
         provider = self.qwen if provider_id == "qwen" else self.deepseek if provider_id == "deepseek" else None
         if provider is None:
             raise RuntimeError(f"SCIENTIFIC_PROVIDER_UNKNOWN:{provider_id}")
+        self._last_provider = provider
         return provider.generate_json(task, inputs, schema_hint, instructions)
 
     def preflight(self, provider_id: str) -> dict:
@@ -1092,4 +1102,37 @@ class ModelRoleRouter:
         return any(provider.cancel_run(run_id) for provider in (self.qwen, self.deepseek))
 
     def consume_call_metadata(self) -> dict:
+        provider = self._last_provider
+        self._last_provider = None
+        if provider is not None:
+            metadata = provider.consume_call_metadata()
+            for other in (self.qwen, self.deepseek):
+                if other is not provider:
+                    other.consume_call_metadata()
+            return metadata
         return self.qwen.consume_call_metadata() or self.deepseek.consume_call_metadata()
+class DuplicateJSONKeyError(ValueError):
+    def __init__(self, key: str) -> None:
+        super().__init__(key)
+        self.key = key
+
+
+def _duplicate_key_rejecting_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJSONKeyError(str(key))
+        result[key] = value
+    return result
+
+
+def _loads_model_json(raw: str, task: str):
+    try:
+        return json.loads(raw, object_pairs_hook=_duplicate_key_rejecting_object)
+    except DuplicateJSONKeyError as exc:
+        code = (
+            "FIX_MAP_DUPLICATE_KEY"
+            if task == "planning.revise_from_review"
+            else "PLAN_REVIEW_DUPLICATE_KEY"
+        )
+        raise ValueError(f"{code}:{exc.key}") from exc

@@ -157,6 +157,7 @@ def test_loader_reports_missing_skill_and_registry_has_plan_route(tmp_path):
         "research-refine",
         "hypothesis-experiment-gate",
         "experiment-plan",
+        "plan-review-governance",
     )
 
 

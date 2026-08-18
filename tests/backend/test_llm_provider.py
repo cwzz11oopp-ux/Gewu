@@ -50,6 +50,27 @@ def test_qwen_llm_parses_json_response():
     assert result["fallback_used"] is False
 
 
+def test_qwen_rejects_raw_duplicate_fix_map_issue_ids():
+    raw = (
+        '{"objective":"x","fix_map":{'
+        '"PRI-1":["procedure"],"PRI-1":["dataset"]}}'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": raw}}]},
+        )
+
+    provider = QwenLLMProvider(
+        Settings.from_env({"LLM_PROVIDER": "qwen", "QWEN_API_KEY": "key"}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="FIX_MAP_DUPLICATE_KEY:PRI-1"):
+        provider.generate_json("planning.revise_from_review", {}, {})
+
+
 def test_task_output_shape_unwraps_a_unique_known_payload_wrapper():
     normalized, changed = normalize_task_output_shape(
         "idea_selection.review",
@@ -284,7 +305,7 @@ def test_qwen_llm_wraps_timeouts_in_actionable_error():
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
-    with pytest.raises(RuntimeError, match="QWEN_REQUEST_TIMEOUT"):
+    with pytest.raises(RuntimeError, match="MODEL_REQUEST_TIMEOUT:provider=qwen"):
         provider.generate_json("research", {}, {})
 
 
@@ -321,7 +342,7 @@ def test_qwen_diagnostic_log_records_sanitized_http_error(
     )
     provider.begin_run("run_trace")
 
-    with pytest.raises(RuntimeError, match="QWEN_PROVIDER_CONFIG_ERROR"):
+    with pytest.raises(RuntimeError, match="MODEL_PROVIDER_CONFIG_ERROR:provider=qwen"):
         provider.generate_json(
             "critic.review_result",
             {"evidence": [{"claim": "x"}]},

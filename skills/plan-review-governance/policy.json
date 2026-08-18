@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "policy_id": "bounded-plan-review-v1",
+  "severity_levels": ["BLOCKER", "WARNING", "SUGGESTION"],
+  "blocker_classes": [
+    "CLAIM_PLAN_MISMATCH",
+    "MISSING_EXECUTABLE_COMPARATOR",
+    "MULTIPLE_CAUSAL_CHANGES",
+    "DATASET_TASK_DRIFT",
+    "DATA_LEAKAGE_OR_TEST_CONTAMINATION",
+    "PRIMARY_ENDPOINT_UNDEFINED",
+    "INTERVENTION_UNDEFINED",
+    "FROZEN_CONSTRAINT_VIOLATION",
+    "FORMAL_INFERENCE_INVALID"
+  ],
+  "non_blocking_severities": ["WARNING", "SUGGESTION"],
+  "accept_when_validated_open_blockers_zero": true,
+  "closed_issue_reopen_bases": ["regression", "new_evidence"],
+  "new_blocker_after_initial_round_bases": ["regression", "new_evidence"],
+  "require_contract_fields_for_blocker": true,
+  "require_concrete_evidence_for_blocker": true,
+  "preserve_closed_issues": true,
+  "freeze_policy_per_run": true,
+  "freeze_problem_anchor_per_run": true,
+  "engine_must_not_embed_blocker_classes": true
+}

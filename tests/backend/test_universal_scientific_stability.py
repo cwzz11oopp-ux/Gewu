@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from backend.app.providers.experiment import MockExperimentProvider
 from backend.app.providers.literature import MockLiteratureProvider
@@ -21,9 +22,22 @@ from backend.app.workflow.scientific_stability import (
 
 
 def _review(verdict: str):
+    issue = {
+        "issue_id": "PRI-control",
+        "blocker_class": "MISSING_EXECUTABLE_COMPARATOR",
+        "severity": "BLOCKER",
+        "title": "Missing justified control",
+        "contract_fields": ["additional_sections"],
+        "evidence": ["The current candidate resolves or still exhibits the control issue."],
+        "reason": "The control must be executable.",
+        "required_fix": "Supply one supported control.",
+        "status": "CLOSED" if verdict == "ACCEPT" else "OPEN",
+        "resolution": "The revised candidate supplies the control." if verdict == "ACCEPT" else "",
+    }
     return {
         "verdict": verdict,
-        "issues": [] if verdict == "ACCEPT" else [{"description": "missing justified control", "reason": "control absent", "affected_plan_section": "control"}],
+        "issues": [issue],
+        "closed_issue_ids": ["PRI-control"] if verdict == "ACCEPT" else [],
         "required_changes": [] if verdict == "ACCEPT" else ["supply a supported control"],
         "suggested_fixes": [] if verdict == "ACCEPT" else [{"problem": "control", "recommended_fix": "state source", "alternative_fix": "verify", "reason": "provenance"}],
         "revised_plan_guidance": [] if verdict == "ACCEPT" else ["address the open ledger issue"],
@@ -37,12 +51,25 @@ class RevisingLLM(MockLLMProvider):
 
     def __init__(self, reviews):
         self.reviews = list(reviews)
+        self.revision_calls = 0
 
     def generate_json(self, task, inputs, schema_hint, instructions=""):
         if task == "planning.review_plan":
-            return self.reviews.pop(0)
+            result = dict(self.reviews.pop(0))
+            result["issues"] = [dict(item) for item in result.get("issues") or []]
+            if result.get("verdict") == "ACCEPT" and not inputs.get("previous_issue_ledger"):
+                result["issues"] = []
+            for issue in result["issues"]:
+                if issue.get("status") == "CLOSED":
+                    issue["evidence_artifact_ids"] = [inputs["current_candidate_plan_id"]]
+            return result
         if task == "planning.revise_from_review":
-            return dict(inputs["current_plan"], additional_sections={"revision": "applied"})
+            self.revision_calls += 1
+            return dict(
+                inputs["current_plan"],
+                additional_sections={"revision": f"applied-{self.revision_calls}"},
+                fix_map={"PRI-control": ["additional_sections"]},
+            )
         return super().generate_json(task, inputs, schema_hint, instructions)
 
 
@@ -103,10 +130,24 @@ def test_evidence_insufficient_cannot_enter_main_and_is_not_system_failure():
 
 
 def test_review_ledger_converges_and_qualified_new_issue_rule():
-    first = merge_issue_ledger([], _review("REVISE"), round_index=1)
-    second = merge_issue_ledger(first, {**_review("REVISE"), "issues": [{"description": "new concern"}]}, round_index=2)
-    assert any(item["status"] == "resolved" for item in second)
-    assert next(item for item in second if item["description"] == "new concern")["blocking"] is False
+    policy = {
+        "blocker_classes": ["MISSING_EXECUTABLE_COMPARATOR"],
+        "reopen_rules": {"allowed_bases": ["regression"]},
+        "new_blocker_rules": {
+            "after_initial_round_allowed_bases": ["regression", "new_evidence"]
+        },
+    }
+    first = merge_issue_ledger(
+        [], _review("REVISE"), round_index=1, frozen_policy=policy
+    )
+    second = merge_issue_ledger(
+        first,
+        {**_review("REVISE"), "issues": [{"title": "new concern"}]},
+        round_index=2,
+        frozen_policy=policy,
+    )
+    assert next(item for item in second if item["issue_id"] == "PRI-control")["status"] == "OPEN"
+    assert next(item for item in second if item["title"] == "new concern")["validated_blocker"] is False
 
 
 def test_selected_hypothesis_digest_excludes_unselected_large_assessments():
@@ -123,6 +164,14 @@ def test_review_exhaustion_is_recoverable_and_preserves_append_only_lineage(tmp_
     result = engine.run_step(run.id, "research_plan")
     assert result.status == "NEEDS_PLAN_REVISION"
     assert result.status != "FAILED_SYSTEM"
+    plan_step = next(item for item in result.steps if item.id == "research_plan")
+    assert plan_step.status == "interrupted"
+    assert plan_step.error == {
+        "code": "PLAN_REVISION_REQUIRED",
+        "message": "DeepSeek did not produce an acceptable plan within the bounded revision limit.",
+        "recoverable": True,
+        "user_action_required": True,
+    }
     candidates = [item for item in result.artifacts if item.type == "research_plan_candidate"]
     reviews = [item for item in result.artifacts if item.type == "plan_review"]
     assert len(candidates) == 3 and len(reviews) == 3
@@ -138,7 +187,49 @@ def test_provider_review_failure_is_recoverable_and_checkpoint_is_preserved(tmp_
                 raise RuntimeError("provider unavailable")
             return super().generate_json(task, inputs, schema_hint, instructions)
     repo, engine, run = _ready_engine(tmp_path, BrokenReviewLLM([]))
-    result = engine.run_step(run.id, "research_plan")
-    assert result.status == "RECOVERABLE_PROVIDER_ERROR"
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        engine.run_step(run.id, "research_plan")
+    result = repo.get_run(run.id)
+    assert result.status == "created"
+    assert next(step for step in result.steps if step.id == "research_plan").status == "interrupted"
     assert any(item.type == "research_plan_candidate" for item in result.artifacts)
     assert any(item.type == "failure_record" for item in result.artifacts)
+
+
+def test_plan_review_resume_reuses_the_existing_candidate_before_acceptance(tmp_path):
+    class FailThenAcceptLLM(RevisingLLM):
+        def __init__(self):
+            super().__init__([])
+            self.build_plan_calls = 0
+            self.review_calls = 0
+
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            if task == "planning.build_plan":
+                self.build_plan_calls += 1
+            if task == "planning.review_plan":
+                self.review_calls += 1
+                if self.review_calls == 1:
+                    raise RuntimeError("MODEL_REQUEST_FAILED:provider=deepseek")
+                return {**_review("ACCEPT"), "issues": []}
+            return super().generate_json(task, inputs, schema_hint, instructions)
+
+    llm = FailThenAcceptLLM()
+    repo, engine, run = _ready_engine(tmp_path, llm)
+    with pytest.raises(RuntimeError, match="provider=deepseek"):
+        engine.run_step(run.id, "research_plan")
+
+    interrupted = repo.get_run(run.id)
+    candidates = [item for item in interrupted.artifacts if item.type == "research_plan_candidate"]
+    assert len(candidates) == 1
+    candidate_id = candidates[0].id
+    assert llm.build_plan_calls == 1
+    assert not any(item.type in {"plan", "baseline_profile", "fair_experiment_contract"}
+                   for item in interrupted.artifacts)
+
+    resumed = engine.run_step(run.id, "research_plan")
+    resumed_candidates = [item for item in resumed.artifacts if item.type == "research_plan_candidate"]
+    assert [item.id for item in resumed_candidates] == [candidate_id]
+    assert llm.build_plan_calls == 1
+    assert any(item.type == "plan" for item in resumed.artifacts)
+    assert any(item.type == "baseline_profile" for item in resumed.artifacts)
+    assert any(item.type == "fair_experiment_contract" for item in resumed.artifacts)

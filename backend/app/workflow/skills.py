@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -42,7 +43,11 @@ _ASSIGNMENTS = {
     "research_plan": StepAssignment(
         "planning",
         ("research-refine",),
-        ("hypothesis-experiment-gate", "experiment-plan"),
+        (
+            "hypothesis-experiment-gate",
+            "experiment-plan",
+            "plan-review-governance",
+        ),
     ),
     "experiment_task": StepAssignment("experiment", ("experiment-implementation",)),
     "experiment_run_analysis": (
@@ -119,6 +124,13 @@ class SkillContext:
     allowed_tools: tuple[str, ...]
     instruction_sha256: str
     truncated: bool
+
+
+@dataclass(frozen=True)
+class SkillPolicy:
+    skill_id: str
+    content: dict[str, Any]
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -268,12 +280,36 @@ class SkillLoader:
             tokens=_tokens(f"{context.id} {context.name} {context.description}"),
         )
 
+    def load_policy(self, skill_id: str) -> SkillPolicy:
+        """Load a Skill-local structured policy without changing instruction loading."""
+        skill_dir = self._skill_dir_for(skill_id)
+        target = (skill_dir / "policy.json").resolve()
+        if target.parent != skill_dir or target.name != "policy.json":
+            raise ValueError(f"SKILL_POLICY_NOT_FOUND:{skill_id}")
+        if not target.is_file():
+            raise ValueError(f"SKILL_POLICY_NOT_FOUND:{skill_id}")
+        raw = target.read_bytes()
+        try:
+            content = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"SKILL_POLICY_INVALID:{skill_id}") from exc
+        if not isinstance(content, dict):
+            raise ValueError(f"SKILL_POLICY_INVALID:{skill_id}")
+        return SkillPolicy(
+            skill_id=skill_id,
+            content=content,
+            sha256=hashlib.sha256(raw).hexdigest(),
+        )
+
     def _path_for(self, skill_id: str) -> Path:
+        return self._skill_dir_for(skill_id) / "SKILL.md"
+
+    def _skill_dir_for(self, skill_id: str) -> Path:
         requested = Path(skill_id)
         if requested.is_absolute() or ".." in requested.parts:
             raise ValueError(f"SKILL_NOT_FOUND:{skill_id}")
-        target = (self.skills_root / requested / "SKILL.md").resolve()
-        if self.skills_root not in target.parents:
+        target = (self.skills_root / requested).resolve()
+        if target.parent != self.skills_root:
             raise ValueError(f"SKILL_NOT_FOUND:{skill_id}")
         return target
 

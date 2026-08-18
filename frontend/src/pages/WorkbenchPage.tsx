@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ExperimentProgress, RunRecord } from "../api/types";
+import { isGovernanceRecoveryStatus } from "../api/types";
 import { ResearchSidebar, type ResearchView } from "../components/ResearchSidebar";
 import { buildResearchViewModel } from "../components/researchViewModel";
 import { ResearchPage } from "../components/workspace/ResearchPage";
@@ -33,7 +34,7 @@ type Props = {
 
 export function WorkbenchPage({
   run, report, topicDraft, activeStepId, failedStepId, researchRunning, pipelineStopRequested,
-  onTopicDraftChange, onCreate, onStartResearch, onContinuePipeline, onStopPipeline,
+  onTopicDraftChange, onCreate, onStartResearch, onRerunFrom, onContinuePipeline, onStopPipeline,
   onOpenSettings, onSelectHypothesis, experimentProgress,
 }: Props) {
   const [activeView, setActiveView] = useState<ResearchView>("research");
@@ -42,6 +43,14 @@ export function WorkbenchPage({
   const [openExperimentLog, setOpenExperimentLog] = useState(false);
   const model = useMemo(() => buildResearchViewModel(run, report, experimentProgress), [run, report, experimentProgress]);
   const busy = researchRunning || activeStepId !== null;
+  const governanceHold = run && isGovernanceRecoveryStatus(run.status) ? run.status : null;
+  const handleResearchStart = !run
+    ? onStartResearch
+    : run.status === "hypothesis_revision_required"
+      ? () => onRerunFrom("hypothesis_generation")
+      : governanceHold
+        ? () => undefined
+        : onContinuePipeline;
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: "instant" }); }, [activeView]);
   const content = activeView === "research" ? <ResearchPage
     model={model}
@@ -53,7 +62,8 @@ export function WorkbenchPage({
     githubRepositoryUrl={topicDraft.githubRepositoryUrl}
     onGithubRepositoryUrlChange={(githubRepositoryUrl) => onTopicDraftChange({ ...topicDraft, githubRepositoryUrl })}
     onCreate={onCreate}
-    onStart={run ? onContinuePipeline : onStartResearch}
+    onStart={handleResearchStart}
+    governanceHold={governanceHold}
     onOpenHypothesis={(id) => { setFocusHypothesisId(id); setActiveView("idea"); }}
     onOpenExperiment={(id, log = false) => { setFocusExperimentId(id); setOpenExperimentLog(log); setActiveView("experiment"); }}
   /> : activeView === "idea" ? <IdeaPage

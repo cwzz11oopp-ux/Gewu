@@ -8,6 +8,7 @@ from backend.app.storage.repository import Repository
 from backend.app.workflow.artifact_lineage import result_for_experiment_task
 from backend.app.workflow.steps import ORDER
 from backend.app.workflow.scientific_stability import failure_state_for
+from backend.app.workflow.plan_review_governance import is_plan_governance_accepted
 
 
 MAX_FEEDBACK_ITERATIONS = 4
@@ -25,15 +26,52 @@ class WorkflowOrchestrator:
 
     def start(self, run_id: str):
         engine = self._engine()
-        preflight = getattr(engine, "preflight_run", None)
-        if callable(preflight):
-            result = preflight(run_id)
-            if result.get("blocking"):
-                self.repository.update_workflow_state(run_id, status="preflight_failed", automatic=False)
-                return self.repository.get_run(run_id)
-        ensure_constraints = getattr(engine, "_ensure_research_constraints", None)
-        if callable(ensure_constraints):
-            ensure_constraints(run_id)
+        run = self.repository.get_run(run_id)
+        recovered_plan_review = False
+        if run.status == "POLICY_INTEGRITY_REQUIRED":
+            return self.repository.update_workflow_state(
+                run_id, automatic=False, stop_requested=False
+            )
+        if run.status == "NEEDS_PLAN_REVISION":
+            recover = getattr(engine, "recover_plan_review_for_continue", None)
+            if not callable(recover) or not recover(run_id):
+                return self.repository.update_workflow_state(
+                    run_id, automatic=False, stop_requested=False
+                )
+            run = self.repository.get_run(run_id)
+            recovered_plan_review = True
+        # Admission is an external side effect.  A durable constraints artifact
+        # means it already passed, so resume/continue must not call providers again.
+        if not getattr(run, "research_constraints_artifact_id", ""):
+            preflight = getattr(engine, "preflight_run", None)
+            if callable(preflight):
+                result = preflight(run_id)
+                if result.get("blocking"):
+                    self.repository.update_workflow_state(run_id, status="preflight_failed", automatic=False)
+                    return self.repository.get_run(run_id)
+            ensure_constraints = getattr(engine, "_ensure_research_constraints", None)
+            if callable(ensure_constraints):
+                ensure_constraints(run_id)
+        current_step = next(
+            (item for item in run.steps if item.id == run.current_step),
+            None,
+        )
+        if (
+            current_step
+            and current_step.status == "interrupted"
+            and isinstance(current_step.error, dict)
+            and current_step.error.get("recoverable") is True
+        ):
+            if (
+                current_step.error.get("user_action_required") is True
+                and not recovered_plan_review
+            ):
+                return self.repository.update_workflow_state(
+                    run_id, automatic=False, stop_requested=False
+                )
+            self.repository.update_step_state(
+                run_id, current_step.id, "pending", error=None
+            )
         self.repository.update_workflow_state(
             run_id,
             status="queued",
@@ -113,8 +151,35 @@ class WorkflowOrchestrator:
                 self.repository.update_workflow_state(run.id, status="interrupted")
 
     def _drive(self, run_id: str) -> None:
+        engine = self._engine()
         try:
-            self.repository.update_workflow_state(run_id, status="running")
+            resumable = self.repository.get_run(run_id)
+            if resumable.status in {"NEEDS_PLAN_REVISION", "POLICY_INTEGRITY_REQUIRED"}:
+                self.repository.update_workflow_state(
+                    run_id, automatic=False, stop_requested=False
+                )
+                return
+            if resumable.status == "RECOVERABLE_PROVIDER_ERROR":
+                interrupted = next(
+                    (item for item in resumable.steps if item.id == resumable.current_step),
+                    None,
+                )
+                if (
+                    interrupted
+                    and interrupted.status == "interrupted"
+                    and isinstance(interrupted.error, dict)
+                    and interrupted.error.get("recoverable") is True
+                    and interrupted.error.get("user_action_required") is not True
+                ):
+                    # Entering _drive is an explicit provider-recovery request.
+                    # Clear only that operational checkpoint; scientific/user
+                    # action states remain forbidden from automatic execution.
+                    self.repository.update_step_state(
+                        run_id, interrupted.id, "pending", error=None
+                    )
+            self.repository.update_workflow_state(
+                run_id, status="running", automatic=True, stop_requested=False
+            )
             while True:
                 run = self.repository.get_run(run_id)
                 if run.stop_requested:
@@ -130,6 +195,7 @@ class WorkflowOrchestrator:
                         "max_feedback_iterations",
                         MAX_FEEDBACK_ITERATIONS,
                     ),
+                    automatic_execution=True,
                 )
                 if step_id == AWAIT_HYPOTHESIS_SELECTION:
                     if run.automatic:
@@ -154,11 +220,33 @@ class WorkflowOrchestrator:
                     )
                     return
                 if step_id is None:
+                    interrupted = next(
+                        (item for item in run.steps if item.id == run.current_step),
+                        None,
+                    )
+                    if (
+                        interrupted
+                        and interrupted.status == "interrupted"
+                        and isinstance(interrupted.error, dict)
+                        and interrupted.error.get("recoverable") is True
+                    ):
+                        self.repository.update_workflow_state(
+                            run_id,
+                            status=(
+                                "paused"
+                                if interrupted.error.get("user_action_required") is True
+                                else "RECOVERABLE_PROVIDER_ERROR"
+                            ),
+                            automatic=False,
+                        )
+                        return
                     self.repository.update_workflow_state(
                         run_id, status="completed", automatic=False
                     )
                     return
                 engine.run_step(run_id, step_id)
+                if self._must_stop_automatic(self.repository.get_run(run_id)):
+                    return
         except LLMRequestCancelled:
             current = self.repository.get_run(run_id)
             self.repository.update_workflow_state(
@@ -191,7 +279,12 @@ class WorkflowOrchestrator:
                 "Workflow Orchestrator",
                 "Automatic pipeline stopped after a step failure.",
                 data={"error": str(exc), "error_type": type(exc).__name__},
-                output_summary={"recoverable": state == "RECOVERABLE_PROVIDER_ERROR"},
+                output_summary={
+                    "recoverable": state in {
+                        "RECOVERABLE_PROVIDER_ERROR",
+                        "POLICY_INTEGRITY_REQUIRED",
+                    }
+                },
             )
         finally:
             with self._guard:
@@ -202,7 +295,11 @@ class WorkflowOrchestrator:
         cls,
         run,
         max_feedback_iterations: int = MAX_FEEDBACK_ITERATIONS,
+        *,
+        automatic_execution: bool = False,
     ) -> str | None:
+        if automatic_execution and cls._must_stop_automatic(run):
+            return None
         latest = cls._latest_by_type(run.artifacts)
         simple_outputs = {
             "problem_understanding": "problem",
@@ -215,7 +312,7 @@ class WorkflowOrchestrator:
                 return step_id
         if "hypothesis_selection" not in latest:
             return AWAIT_HYPOTHESIS_SELECTION
-        if "plan" not in latest:
+        if "plan" not in latest or not is_plan_governance_accepted(run.artifacts):
             return "research_plan"
 
         plan = latest["plan"]
@@ -225,6 +322,8 @@ class WorkflowOrchestrator:
         result = cls._result_for_task(run.artifacts, task)
         if result is None:
             return "experiment_run_analysis"
+        if cls._is_smoke_preflight_failure(result.content or {}):
+            return None
         revision = cls._revision_for_result(run.artifacts, result)
         if revision is None:
             return "feedback_revision"
@@ -246,6 +345,23 @@ class WorkflowOrchestrator:
         if "report" not in latest:
             return "report_export"
         return None
+
+    @staticmethod
+    def _must_stop_automatic(run) -> bool:
+        if run.status in {"NEEDS_PLAN_REVISION", "POLICY_INTEGRITY_REQUIRED"}:
+            return True
+        if not run.automatic:
+            return True
+        current = next((item for item in run.steps if item.id == run.current_step), None)
+        return bool(
+            current
+            and current.status == "interrupted"
+            and isinstance(current.error, dict)
+            and (
+                current.error.get("recoverable") is True
+                or current.error.get("user_action_required") is True
+            )
+        )
 
     @staticmethod
     def _latest_by_type(artifacts) -> dict:
@@ -270,6 +386,8 @@ class WorkflowOrchestrator:
     def _task_for_plan(cls, artifacts, plan):
         direct = cls._child_artifact(artifacts, plan.id, "experiment_task")
         if direct is not None:
+            if cls._formal_validation_pending(artifacts):
+                return None
             return direct
         # Compatibility for runs created before task-to-plan lineage was persisted.
         return next(
@@ -280,6 +398,36 @@ class WorkflowOrchestrator:
                 and artifact.created_at >= plan.created_at
             ),
             None,
+        )
+
+    @staticmethod
+    def _is_smoke_preflight_failure(result: dict) -> bool:
+        return (
+            str(result.get("status") or "").lower() == "failed"
+            and str(result.get("error") or "").startswith(
+                "EXPERIMENT_BUNDLE_SMOKE_TEST_FAILED:"
+            )
+        )
+
+    @staticmethod
+    def _formal_validation_pending(artifacts) -> bool:
+        latest_evidence = next(
+            (item for item in reversed(artifacts) if item.type == "result_evidence"),
+            None,
+        )
+        if not latest_evidence:
+            return False
+        content = latest_evidence.content or {}
+        if (
+            content.get("stage") != "small_scale"
+            or content.get("route") != "expand_validation"
+        ):
+            return False
+        return not any(
+            item.type == "experiment_task"
+            and (item.content or {}).get("phase2_protocol", {}).get("stage")
+            == "formal_validation"
+            for item in artifacts
         )
 
     @classmethod

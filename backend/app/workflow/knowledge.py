@@ -235,7 +235,7 @@ def _english_query_fallback(query: str) -> str:
         if chinese in query
     ]
     if not terms:
-        return "machine learning research"
+        return ""
     return " ".join(dict.fromkeys(terms))
 
 
@@ -306,14 +306,16 @@ def _rerank(
     queries: list[LiteratureQuery],
     policy: LiteratureRetrievalPolicy,
 ) -> list[EvidenceCard]:
-    query_terms = set(
-        re.findall(r"[a-z0-9]+", " ".join(item.query for item in queries).casefold())
-    )
+    stopwords = {"the", "and", "for", "with", "from", "into", "using", "study", "research", "model", "models"}
+    query_terms = [
+        set(re.findall(r"[a-z0-9]+", item.query.casefold())) - stopwords
+        for item in queries
+    ]
     current_year = datetime.now(timezone.utc).year
 
     def score(card: EvidenceCard) -> tuple[float, str, float]:
         text_terms = set(re.findall(r"[a-z0-9]+", f"{card.title} {card.claim}".casefold()))
-        lexical = len(query_terms & text_terms) / max(1, len(query_terms))
+        lexical = max((len(terms & text_terms) / max(1, len(terms)) for terms in query_terms), default=0.0)
         # Provider relevance is only one signal, never a blanket default.  The
         # query/document match is calculated for every card and persisted below.
         relevance = min(1.0, 0.65 * lexical + 0.35 * float(card.relevance))

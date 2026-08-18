@@ -175,6 +175,7 @@ class Repository:
         source_step: str,
         created_by: str,
         parent_artifact_id: str | None = None,
+        self_id_field: str | None = None,
     ) -> Artifact:
         run = self.get_run(run_id)
         version = 1 + sum(1 for artifact in run.artifacts if artifact.type == artifact_type)
@@ -188,9 +189,43 @@ class Repository:
             created_by=created_by,
             parent_artifact_id=parent_artifact_id,
         )
+        if self_id_field:
+            # Populate self identity before the first durable write.  This keeps
+            # governance artifacts immutable after they enter append-only history.
+            artifact.content[self_id_field] = artifact.id
         run.artifacts.append(artifact)
         self.save_run(run)
         return artifact
+
+    @_locked
+    def add_artifacts_atomic(self, run_id: str, specs: list[dict]) -> list[Artifact]:
+        """Append a related artifact set with one durable store replacement."""
+        run = self.get_run(run_id)
+        counts: dict[str, int] = {}
+        for artifact in run.artifacts:
+            counts[artifact.type] = counts.get(artifact.type, 0) + 1
+        created: list[Artifact] = []
+        for spec in specs:
+            artifact_type = str(spec["artifact_type"])
+            counts[artifact_type] = counts.get(artifact_type, 0) + 1
+            artifact = Artifact(
+                id=str(spec["artifact_id"]),
+                run_id=run_id,
+                type=artifact_type,
+                version=counts[artifact_type],
+                title=str(spec["title"]),
+                content=dict(spec.get("content") or {}),
+                source_step=str(spec["source_step"]),
+                created_by=str(spec["created_by"]),
+                parent_artifact_id=spec.get("parent_artifact_id"),
+            )
+            self_id_field = spec.get("self_id_field")
+            if self_id_field:
+                artifact.content[str(self_id_field)] = artifact.id
+            created.append(artifact)
+        run.artifacts.extend(created)
+        self.save_run(run)
+        return created
 
     @_locked
     def get_artifact(self, run_id: str, artifact_id: str) -> Artifact:

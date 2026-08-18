@@ -7,13 +7,23 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
+from uuid import uuid4
 
 from backend.app.agents.critic import CriticAgent
 from backend.app.agents.diagnostic import ExperimentDiagnosticAgent
 from backend.app.agents.experiment import ExperimentAgent, ExperimentBundleCandidateError
 from backend.app.agents.idea import IdeaAgent
 from backend.app.agents.idea_selection import IdeaSelectionAgent
-from backend.app.agents.planner import PlanningAgent
+from backend.app.agents.planner import (
+    PLAN_REVIEW_FIXED_INSTRUCTIONS,
+    PLAN_REVIEW_PROMPT_SCHEMA_VERSION,
+    PLAN_REVISION_FIXED_INSTRUCTIONS,
+    PlanningAgent,
+    build_plan_review_runtime_contract,
+    build_plan_revision_runtime_contract,
+    plan_review_schema_snapshot,
+    plan_revision_schema_snapshot,
+)
 from backend.app.agents.reviewer import ValidationDecision
 from backend.app.agents.research import ResearchAgent
 from backend.app.agents.supervisor import Delegation, SupervisorAgent
@@ -21,6 +31,7 @@ from backend.app.agents.writer import ReportFactAuditError, WriterAgent
 from backend.app.models.experiment import ExperimentBundle
 from backend.app.models.provider import EvidenceCard
 from backend.app.providers.experiment import ExperimentProvider
+from backend.app.providers.experiment import validate_local_gpu_preflight
 from backend.app.providers.literature import LiteratureProvider
 from backend.app.providers.llm import LLMProvider, LLMRequestCancelled
 from backend.app.storage.repository import Repository
@@ -69,7 +80,10 @@ from backend.app.workflow.evidence_pipeline import (
     targeted_queries as candidate_targeted_queries,
 )
 from backend.app.workflow.artifact_lineage import experiment_bundle_ids
-from backend.app.workflow.experiment_code import experiment_validation_issues
+from backend.app.workflow.experiment_code import (
+    experiment_validation_issues,
+    smoke_data_reduction_issues,
+)
 from backend.app.workflow.scientific_integrity import (
     compile_scientific_contract,
     scientific_feedback,
@@ -84,7 +98,29 @@ from backend.app.workflow.scientific_evolution import (
     synthesize_scientific_conclusion,
     unavailable_secondary_review,
 )
-from backend.app.workflow.plan_contract import authoritative_plan_contract, normalize_plan
+from backend.app.workflow.plan_contract import (
+    CANONICAL_PLAN_CONTRACT_FIELDS,
+    FIELD_ALIAS_TO_CANONICAL,
+    authoritative_plan_contract,
+    normalize_plan,
+)
+from backend.app.workflow.plan_review_governance import (
+    GOVERNANCE_IMPLEMENTATION_SEMANTIC_VERSION,
+    PlanReviewPolicyIntegrityError,
+    adjudicate_review,
+    canonicalize_fix_map,
+    canonical_sha256,
+    changed_contract_fields,
+    fix_map_issues,
+    freeze_plan_review_recovery,
+    freeze_plan_governance_migration,
+    freeze_review_policy,
+    is_plan_governance_accepted,
+    normalize_skill_content,
+    validate_frozen_review_policy,
+    validate_plan_review_recovery,
+    validate_plan_governance_migration,
+)
 from backend.app.workflow.policies import competition_export_allowed, normalize_feedback_verdict
 from backend.app.workflow.research_state import build_research_state
 from backend.app.workflow.knowledge import (
@@ -115,7 +151,6 @@ from backend.app.workflow.scientific_stability import (
     build_world_state,
     context_telemetry,
     infer_research_profile,
-    merge_issue_ledger,
     next_research_stage,
     protocol_state,
     readiness_state,
@@ -246,14 +281,35 @@ class WorkflowEngine:
                     )
                     raise
                 except Exception as exc:
+                    state = failure_state_for(exc)
+                    recoverable = state in {
+                        "RECOVERABLE_PROVIDER_ERROR",
+                        "POLICY_INTEGRITY_REQUIRED",
+                    }
                     self.repository.update_step_state(
                         run_id,
                         step_id,
-                        "failed",
-                        error={"code": str(exc).split(":", 1)[0], "message": str(exc)},
+                        "interrupted" if recoverable else "failed",
+                        error={
+                            "code": str(exc).split(":", 1)[0],
+                            "message": str(exc),
+                            "recoverable": recoverable,
+                            "user_action_required": state == "POLICY_INTEGRITY_REQUIRED",
+                        },
                     )
+                    if state == "POLICY_INTEGRITY_REQUIRED":
+                        self.repository.update_workflow_state(
+                            run_id,
+                            status=state,
+                            current_step="research_plan",
+                            automatic=False,
+                            stop_requested=False,
+                        )
                     raise
-                self.repository.update_step_state(run_id, step_id, "completed")
+                current = self.repository.get_run(run_id)
+                current_step = next(item for item in current.steps if item.id == step_id)
+                if current_step.status == "running":
+                    self.repository.update_step_state(run_id, step_id, "completed")
                 return self.repository.get_run(run_id)
             finally:
                 if callable(end_run):
@@ -293,7 +349,11 @@ class WorkflowEngine:
             add("dataset", False, str(exc).split(":", 1)[0], str(exc))
         status = getattr(settings, "provider_status", lambda: {})()
         experiment = status.get("experiment", {}) if isinstance(status, dict) else {}
-        add("experiment_environment", bool(experiment.get("ready", True)), str(experiment.get("code") or ""))
+        if getattr(settings, "experiment_provider", "") == "local_gpu":
+            runtime_check = validate_local_gpu_preflight(settings)
+            add("experiment_environment", bool(runtime_check.get("ok")), str(runtime_check.get("code") or ""), str(runtime_check.get("message") or ""))
+        else:
+            add("experiment_environment", bool(experiment.get("ready", True)), str(experiment.get("code") or ""))
         if run.github_repository_url:
             inspected = self.github_source_inspector.inspect(run.github_repository_url)
             add("repository", inspected.github_source_status == "parsed", inspected.github_source_status, "; ".join(inspected.warnings[:3]))
@@ -312,13 +372,6 @@ class WorkflowEngine:
         run.research_constraints_artifact_id = artifact.id
         self.repository.save_run(run)
         return artifact
-
-    def _set_artifact_fields(self, run_id: str, artifact_id: str, **fields) -> None:
-        """Persist post-creation lineage identities without replacing history."""
-        current = self.repository.get_run(run_id)
-        artifact = next(item for item in current.artifacts if item.id == artifact_id)
-        artifact.content.update(fields)
-        self.repository.save_run(current)
 
     def _persist_scientific_world_state(self, run_id: str, run, profile: dict, dataset: dict,
                                         protocol: dict, readiness: dict, stage: str,
@@ -360,12 +413,62 @@ class WorkflowEngine:
         self._require_step_inputs(step_id, latest)
         state = self._skill_state(step_id, latest)
         delegation = self.supervisor_agent.delegate(step_id, state)
-        package = self.skill_runtime.prepare(
-            step_id,
-            delegation.agent_id,
-            self.configured_tools,
-            state,
+        frozen_policy_artifacts = (
+            [item for item in run.artifacts if item.type == "plan_review_policy"]
+            if step_id == "research_plan"
+            else []
         )
+        if step_id == "research_plan" and not frozen_policy_artifacts and any(
+            item.type in {
+                "plan_review_issue_ledger",
+                "plan_review_round_state",
+                "plan_review_revision_request",
+                "plan_review_change_request",
+                "plan_refinement_proposal",
+                "plan_revision_required",
+                "plan_governance_migration",
+            }
+            or (
+                item.type in {"research_plan_candidate", "plan_review", "plan"}
+                and bool((item.content or {}).get("policy_artifact_id"))
+            )
+            for item in run.artifacts
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:policy_missing_with_governance_history"
+            )
+        if frozen_policy_artifacts:
+            if len(frozen_policy_artifacts) != 1:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:multiple_policy_artifacts"
+                )
+            frozen_runtime = validate_frozen_review_policy(
+                frozen_policy_artifacts[0].content or {}
+            )
+            package = RuntimePackage(
+                step_id=step_id,
+                agent_id=delegation.agent_id,
+                skill_ids=tuple(frozen_runtime["active_skill_ids"]),
+                instructions=str(frozen_runtime["runtime_instructions"]),
+                authorized_tools=(),
+                omitted_sections=(),
+                audit={
+                    "skill_hashes": deepcopy(frozen_runtime["instruction_hashes"]),
+                    "instruction_sha256": frozen_runtime["runtime_instructions_sha256"],
+                    "declared_tools": [],
+                    "authorized_tools": [],
+                    "denied_tools": [],
+                    "omitted_sections": [],
+                    "skill_invocations": [],
+                },
+            )
+        else:
+            package = self.skill_runtime.prepare(
+                step_id,
+                delegation.agent_id,
+                self.configured_tools,
+                state,
+            )
         instructions = package.instructions
         skill_calls = [delegation.tool_call, self._runtime_call(package)]
         if step_id == "problem_understanding":
@@ -816,14 +919,48 @@ class WorkflowEngine:
                     )
                     if checkpoint is not None:
                         assessments.append(checkpoint)
+                        self.repository.append_event(
+                            run_id, step_id, self.critic_agent.name,
+                            f"CAND-{index + 1:03d} checkpoint reused.",
+                            data={"candidate_index": index, "status": "checkpoint_reused"},
+                        )
                         continue
-                    critic_reasoning = self.critic_agent.evidence_reasoning(
-                        hypothesis,
-                        evidence,
-                        evidence_audit=candidate_audit,
-                        evaluation=evaluation,
-                        instructions=critic_instruction,
+                    candidate_scope = self._focused_evidence_for_candidate(
+                        all_evidence, hypothesis
                     )
+                    candidate_evidence = select_units(
+                        [literature_card(card) for card in candidate_scope],
+                        context_budget.max_reference_chars,
+                    )
+                    candidate_scope_hash = self._stable_hash(candidate_evidence)
+                    self.repository.append_event(
+                        run_id, step_id, self.critic_agent.name,
+                        f"CAND-{index + 1:03d} started.",
+                        data={"candidate_index": index, "status": "started",
+                              "evidence_scope_count": len(candidate_evidence)},
+                    )
+                    try:
+                        critic_reasoning = self.critic_agent.evidence_reasoning(
+                            hypothesis,
+                            candidate_evidence,
+                            evidence_audit=candidate_audit,
+                            evaluation=evaluation,
+                            instructions=critic_instruction,
+                        )
+                    except Exception as exc:
+                        if failure_state_for(exc) == "RECOVERABLE_PROVIDER_ERROR":
+                            self.repository.append_event(
+                                run_id, step_id, self.critic_agent.name,
+                                f"CAND-{index + 1:03d} interrupted; resume is available.",
+                                data={
+                                    "status": "interrupted", "candidate_index": index,
+                                    "candidate_id": f"CAND-{index + 1:03d}",
+                                    "completed_count": len(assessments), "recoverable": True,
+                                    "error_code": str(exc).split(":", 1)[0],
+                                },
+                                output_summary={"recoverable": True},
+                            )
+                        raise
                     assessment = self._candidate_assessment(
                         index,
                         hypothesis,
@@ -864,14 +1001,24 @@ class WorkflowEngine:
                             {
                                 "candidate_index": index,
                                 "candidate_id": candidate_ids[index],
+                                "candidate_label": f"CAND-{index + 1:03d}",
                                 "prompt_version": EVIDENCE_REASONING_PROMPT_VERSION,
                                 "evidence_set_hash": evidence_set_hash,
+                                "evidence_scope_count": len(candidate_evidence),
+                                "evidence_scope_hash": candidate_scope_hash,
+                                "evidence_source_ids": [self._stable_hash(item)[:16] for item in candidate_evidence],
                                 "assessment": assessment,
                             },
                             step_id,
                             self.critic_agent.name,
                         )
                     assessments.append(assessment)
+                    self.repository.append_event(
+                        run_id, step_id, self.critic_agent.name,
+                        f"CAND-{index + 1:03d} completed.",
+                        data={"candidate_index": index, "status": "completed",
+                              "evidence_scope_count": len(candidate_evidence)},
+                    )
                 if revision_issues:
                     return {
                         "_validation_issues": revision_issues,
@@ -957,7 +1104,11 @@ class WorkflowEngine:
             )
         elif step_id == "research_plan":
             self.supervisor_agent.require_agent(delegation, "planning")
+            existing_final_plan = latest.get("plan")
             selection = self._require_evidence_reasoned_hypothesis_selection(latest)
+            constraints_artifact = self._ensure_research_constraints(run_id)
+            run = self.repository.get_run(run_id)
+            latest = self._latest_by_type(run.artifacts)
             reasoning_content = latest.get("reasoning").content if latest.get("reasoning") else {}
             selected_index = (selection.get("selected_indexes") or [None])[0]
             selected_id = str(((selection.get("selected") or [{}])[0]).get("candidate_id") or "")
@@ -1005,15 +1156,49 @@ class WorkflowEngine:
                 if dataset_profile
                 else self._dataset_options()
             )
+            constraints_reference = {
+                "artifact_id": run.research_constraints_artifact_id or "",
+                "schema_version": 1,
+            }
+            policy_artifact, frozen_policy = self._ensure_plan_review_policy(
+                run_id,
+                package=package,
+                run=run,
+                latest=latest,
+                selection=selection,
+                constraints_artifact=constraints_artifact,
+            )
+            # Existing Runs always use the immutable prompt snapshot stored in
+            # their policy artifact; current disk Skills cannot alter semantics.
+            instructions = str(frozen_policy["runtime_instructions"])
 
             def build_plan(revision):
-                candidate = normalize_plan(
-                    self.planning_agent.build_plan(
+                pending = latest.get("research_plan_candidate")
+                pending_plan = (
+                    deepcopy((pending.content or {}).get("normalized_plan") or {})
+                    if pending and (pending.content or {}).get("status") == "review_pending"
+                    and ((pending.content or {}).get("research_constraints_reference") or {}).get("artifact_id") == (run.research_constraints_artifact_id or "")
+                    and (pending.content or {}).get("policy_artifact_id") == policy_artifact.id
+                    and not any(
+                        artifact.type == "plan_review"
+                        and artifact.parent_artifact_id == pending.id
+                        for artifact in run.artifacts
+                    )
+                    else {}
+                )
+                raw_plan = pending_plan or self.planning_agent.build_plan(
                         selection,
                         instructions=self._with_revision(instructions, revision),
                         dataset_options=dataset_options,
+                        authoritative_contract_snapshot=frozen_policy[
+                            "authoritative_plan_contract_snapshot"
+                        ],
                         plan_context={
-                            "authoritative_plan_contract": authoritative_plan_contract(),
+                            "authoritative_plan_contract": deepcopy(
+                                frozen_policy[
+                                    "authoritative_plan_contract_snapshot"
+                                ]
+                            ),
                             "dataset_profile": dataset_profile or {},
                             "run_constraints": run.constraints,
                             "research_profile": profile,
@@ -1025,7 +1210,9 @@ class WorkflowEngine:
                                 "existing_split_contract": {},
                             },
                         },
-                    ),
+                    )
+                candidate = normalize_plan(
+                    raw_plan,
                     selection,
                     provider_mode=self.llm_provider.mode,
                     fallback_used=self.llm_provider.fallback,
@@ -1052,114 +1239,67 @@ class WorkflowEngine:
                     return {**candidate, "_validation_issues": issues}
                 return self._attach_dataset_card(candidate, dataset_options)
 
-            plan = self._produce_validated(run_id, step_id, build_plan)
-            constraints_reference = {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1}
-            plan["research_constraints_artifact_id"] = constraints_reference["artifact_id"]
-            plan["research_constraints_reference"] = constraints_reference
-            plan_candidate = self.repository.add_artifact(
-                run_id, "research_plan_candidate", "Research Plan Candidate Round 1",
-                {"plan_id": "", "round_index": 1, "parent_plan_id": "", "research_stage": stage,
-                 "normalized_plan": deepcopy(plan), "research_constraints_reference": constraints_reference, "provider": self.llm_provider.mode,
-                 "model": "planning.build_plan", "request_chars": 0, "response_metadata": {}, "status": "review_pending"},
-                step_id, self.planning_agent.name, parent_artifact_id=latest["hypothesis_selection"].id,
+            def produce_initial_plan() -> dict:
+                migration_id = str(
+                    (frozen_policy.get("source_artifact_lineage") or {}).get(
+                        "migration_artifact_id"
+                    )
+                    or ""
+                )
+                candidate = (
+                    normalize_plan(
+                        deepcopy(existing_final_plan.content or {}),
+                        selection,
+                        provider_mode=self.llm_provider.mode,
+                        fallback_used=self.llm_provider.fallback,
+                    )
+                    if existing_final_plan is not None and migration_id
+                    else build_plan(None)
+                )
+                structural_issues = list(candidate.pop("_validation_issues", []) or [])
+                structural_decision = self.supervisor_agent.validate(step_id, candidate)
+                structural_issues.extend(structural_decision.issues)
+                if structural_issues:
+                    raise ValueError(
+                        "MODEL_OUTPUT_VALIDATION_FAILURE:"
+                        + ";".join(dict.fromkeys(str(item) for item in structural_issues))
+                    )
+                candidate["research_constraints_artifact_id"] = constraints_reference["artifact_id"]
+                candidate["research_constraints_reference"] = constraints_reference
+                return candidate
+
+            governance_result = self._execute_plan_review_governance(
+                run_id=run_id,
+                step_id=step_id,
+                run=run,
+                latest=latest,
+                selection=selection,
+                dataset_options=dataset_options,
+                dataset_profile=dataset_profile,
+                policy_artifact=policy_artifact,
+                frozen_policy=frozen_policy,
+                instructions=instructions,
+                constraints_reference=constraints_reference,
+                stage=stage,
+                profile=profile,
+                protocol=protocol,
+                readiness=readiness,
+                dataset_state=dataset_state,
+                produce_initial_plan=produce_initial_plan,
             )
-            # The generated artifact ID is the authoritative plan identity.
-            self._set_artifact_fields(run_id, plan_candidate.id, plan_id=plan_candidate.id)
-            review_context = self._research_plan_review_context(
-                run, latest, selection, plan, dataset_options
-            )
-            review = None
-            review_failure = None
-            issue_ledger: list[dict] = []
-            for review_round in range(self.max_deepseek_plan_revision + 1):
-                try:
-                    review = self._normalize_plan_review(
-                        self.planning_agent.review_plan(review_context, instructions=instructions)
-                    )
-                except LLMRequestCancelled:
-                    raise
-                except Exception as exc:
-                    review_failure = self._plan_review_failure(exc, review_round + 1)
-                    self.repository.add_artifact(
-                        run_id, "failure_record", "Research Plan Review Failure",
-                        review_failure, step_id, "ModelCallReliability",
-                    )
-                    self.repository.update_workflow_state(
-                        run_id, status="RECOVERABLE_PROVIDER_ERROR", current_step="research_plan",
-                        automatic=False, stop_requested=False,
-                    )
-                    # Preserve the validated candidate as a resumable plan
-                    # checkpoint.  A provider outage is not a scientific
-                    # rejection and must not discard the work already done.
-                    break
-                issue_ledger = merge_issue_ledger(issue_ledger, review, round_index=review_round + 1)
-                review["review_id"] = ""
-                review["plan_id"] = plan_candidate.id
-                review["research_constraints_reference"] = constraints_reference
-                review["round_index"] = review_round + 1
-                review["issue_ledger"] = issue_ledger
-                review_artifact = self.repository.add_artifact(
-                    run_id, "plan_review", f"DeepSeek Plan Review {review_round + 1}",
-                    review, step_id, "DeepSeek Research Plan Reviewer", parent_artifact_id=plan_candidate.id,
+            if governance_result is None:
+                return
+            plan, plan_candidate, issue_ledger = governance_result
+            if (
+                existing_final_plan is not None
+                and existing_final_plan.parent_artifact_id == plan_candidate.id
+                and (existing_final_plan.content or {}).get("plan_candidate_id")
+                == plan_candidate.id
+                and is_plan_governance_accepted(
+                    self.repository.get_run(run_id).artifacts
                 )
-                self._set_artifact_fields(run_id, review_artifact.id, review_id=review_artifact.id)
-                if review["verdict"] == "ACCEPT":
-                    break
-                if review["verdict"] == "REJECT" or review_round >= self.max_deepseek_plan_revision:
-                    review_failure = {
-                        "code": "MODEL_OUTPUT_VALIDATION_FAILURE",
-                        "message": "DeepSeek did not produce an acceptable plan within the bounded revision limit.",
-                        "attempt": review_round + 1,
-                        "scientific_state_mutated": False,
-                    }
-                    self.repository.add_artifact(run_id, "plan_revision_required", "Research Plan Revision Required",
-                                                 {**review_failure, "latest_plan_id": plan_candidate.id, "latest_review_id": review_artifact.id,
-                                                  "issue_ledger": issue_ledger, "recoverable": True}, step_id,
-                                                 "Scientific Stability Gate", parent_artifact_id=review_artifact.id)
-                    self.repository.update_workflow_state(run_id, status="NEEDS_PLAN_REVISION", current_step="research_plan",
-                                                          automatic=False, stop_requested=False)
-                    self._persist_scientific_world_state(run_id, run, profile, dataset_state, protocol, readiness, stage, issue_ledger)
-                    return
-                revision_context = {
-                    "selected_hypothesis": selection,
-                    "current_plan": plan,
-                    "issues": review["issues"],
-                    "required_changes": review["required_changes"],
-                    "suggested_fixes": review["suggested_fixes"],
-                    "revised_plan_guidance": review["revised_plan_guidance"],
-                    "experiment_feasibility": review["experiment_feasibility"],
-                    "dataset_options": dataset_options,
-                    "authoritative_plan_contract": authoritative_plan_contract(),
-                    "dataset_profile": dataset_profile or {},
-                    "run_constraints": run.constraints,
-                    "research_constraints_reference": constraints_reference,
-                }
-                plan = normalize_plan(
-                    self.planning_agent.revise_from_review(revision_context, instructions=instructions),
-                    selection, provider_mode=self.llm_provider.mode,
-                    fallback_used=self.llm_provider.fallback,
-                )
-                if dataset_profile:
-                    plan = self._bind_plan_to_dataset(plan, dataset_profile)
-                plan = self._attach_dataset_card(plan, dataset_options)
-                plan["research_profile"] = profile
-                plan["protocol_state"] = protocol
-                plan["readiness_state"] = readiness
-                plan["research_stage"] = stage
-                plan["research_constraints_artifact_id"] = constraints_reference["artifact_id"]
-                plan["research_constraints_reference"] = constraints_reference
-                next_candidate = self.repository.add_artifact(
-                    run_id, "research_plan_candidate", f"Research Plan Candidate Round {review_round + 2}",
-                    {"plan_id": "", "round_index": review_round + 2, "parent_plan_id": plan_candidate.id,
-                     "research_stage": stage, "normalized_plan": deepcopy(plan), "research_constraints_reference": constraints_reference, "provider": self.llm_provider.mode,
-                     "model": "planning.revise_from_review", "request_chars": 0, "response_metadata": {}, "status": "review_pending"},
-                    step_id, self.planning_agent.name, parent_artifact_id=plan_candidate.id,
-                )
-                self._set_artifact_fields(run_id, next_candidate.id, plan_id=next_candidate.id)
-                plan_candidate = next_candidate
-                review_context = self._research_plan_review_context(
-                    run, latest, selection, plan, dataset_options
-                )
+            ):
+                return self.repository.get_run(run_id)
             plan["scientific_contract"] = compile_scientific_contract(
                 run.problem_input, selection.get("selected") or [], plan
             )
@@ -1168,6 +1308,11 @@ class WorkflowEngine:
                 *validate_split_contract(plan.get("split_contract") or (plan.get("dataset") or {}).get("split_contract") or {}),
             ]
             plan["plan_candidate_id"] = plan_candidate.id
+            plan["policy_artifact_id"] = policy_artifact.id
+            plan["policy_payload_sha256"] = frozen_policy["policy_payload_sha256"]
+            plan["accepted_candidate_payload_sha256"] = canonical_sha256(
+                (plan_candidate.content or {}).get("normalized_plan") or {}
+            )
             self.repository.add_artifact(run_id, "plan", "Research Plan", plan, step_id, self.planning_agent.name,
                                          parent_artifact_id=plan_candidate.id)
             self.repository.add_artifact(
@@ -1203,6 +1348,12 @@ class WorkflowEngine:
             )
             self._persist_scientific_world_state(run_id, run, profile, dataset_state, protocol, readiness, stage, issue_ledger)
         elif step_id == "experiment_task":
+            if not is_plan_governance_accepted(
+                self.repository.get_run(run_id).artifacts
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:governance_acceptance_required"
+                )
             self.supervisor_agent.require_agent(delegation, "experiment")
             self._require_tools(package, "build_experiment_bundle")
             experiment_id = self.repository.next_experiment_id(run_id)
@@ -1219,7 +1370,10 @@ class WorkflowEngine:
             fair_contract = latest.get("fair_experiment_contract")
             if fair_contract:
                 base_task["phase2_protocol"] = progressive_protocol(
-                    fair_contract.content, "smoke"
+                    fair_contract.content,
+                    "formal_validation"
+                    if self._formal_validation_pending(run.artifacts)
+                    else "small_scale",
                 )
             base_task["scientific_contract"] = compile_scientific_contract(
                 run.problem_input,
@@ -1303,6 +1457,7 @@ class WorkflowEngine:
                             latest["plan"].content,
                             bundle,
                             require_smoke_test=True,
+                            task=task,
                         )
                 except ExperimentBundleCandidateError as exc:
                     previous_bundle = None
@@ -1443,6 +1598,13 @@ class WorkflowEngine:
             def run_experiment(_revision):
                 nonlocal runtime_candidate
                 if runtime_candidate is None:
+                    smoke_issues = [
+                        issue
+                        for item in bundle.files
+                        for issue in smoke_data_reduction_issues(item.content)
+                    ]
+                    if smoke_issues:
+                        raise RuntimeError(";".join(smoke_issues))
                     attempt_started_at = datetime.now(timezone.utc).isoformat()
                     recover = getattr(
                         self.experiment_provider, "recover_completed_result", None
@@ -1928,7 +2090,11 @@ class WorkflowEngine:
             except (AttributeError, TypeError, ValueError):
                 baseline_by_seed, idea_by_seed = {}, {}
             evidence = result_evidence(baseline_by_seed, idea_by_seed, primary)
-            evidence["stage"] = str((active_task.get("phase2_protocol") or {}).get("stage") or "smoke")
+            evidence["stage"] = str(
+                (result.get("runtime") or {}).get("stage")
+                or (active_task.get("phase2_protocol") or {}).get("stage")
+                or "small_scale"
+            )
             evidence["route"] = route_result(evidence, anomalies=list(result.get("anomalies") or []))
             self.repository.add_artifact(
                 run_id, "result_evidence", "Deterministic Result Evidence", evidence,
@@ -1946,9 +2112,28 @@ class WorkflowEngine:
                 skill_calls=skill_calls,
             )
         elif step_id == "feedback_revision":
+            if not is_plan_governance_accepted(
+                self.repository.get_run(run_id).artifacts
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:governance_acceptance_required"
+                )
+            feedback_policy_artifacts = [
+                item for item in run.artifacts if item.type == "plan_review_policy"
+            ]
+            if len(feedback_policy_artifacts) != 1:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:feedback_policy"
+                )
+            feedback_policy_artifact = feedback_policy_artifacts[0]
+            feedback_frozen_policy = validate_frozen_review_policy(
+                feedback_policy_artifact.content or {}
+            )
             self.supervisor_agent.require_agent(delegation, "critic")
             result_artifact = latest["experiment_result"]
             result = result_artifact.content
+            if self._is_smoke_preflight_failure(result):
+                return self.repository.get_run(run_id)
             historical_iteration = max(
                 [
                     int(artifact.content.get("iteration") or 0)
@@ -2057,8 +2242,11 @@ class WorkflowEngine:
                     ),
                     provider_id="deepseek",
                 )
-            except RuntimeError as exc:
-                if "DEEPSEEK" not in str(exc) and "SECONDARY_REVIEW_UNAVAILABLE" not in str(exc):
+            except (RuntimeError, ValueError) as exc:
+                if not any(token in str(exc) for token in (
+                    "DEEPSEEK", "SECONDARY_REVIEW_UNAVAILABLE", "MODEL_REQUEST_",
+                    "MODEL_PROVIDER_CONFIG_ERROR", "JSONDecodeError",
+                )):
                     raise
                 deepseek_analysis = unavailable_secondary_review(str(exc))
             deepseek_analysis_artifact = self.repository.add_artifact(
@@ -2289,6 +2477,9 @@ class WorkflowEngine:
                             feedback,
                             instructions=refinement_instructions,
                             dataset_options=dataset_options,
+                            authoritative_contract_snapshot=feedback_frozen_policy[
+                                "authoritative_plan_contract_snapshot"
+                            ],
                         ),
                         selection,
                         provider_mode=self.llm_provider.mode,
@@ -2340,11 +2531,28 @@ class WorkflowEngine:
             )
             self.repository.save_run(iteration_run)
             if feedback["requires_follow_up"]:
+                proposal_payload = {
+                    "schema_version": 1,
+                    "policy_artifact_id": feedback_policy_artifact.id,
+                    "policy_payload_sha256": feedback_frozen_policy[
+                        "policy_payload_sha256"
+                    ],
+                    "base_plan_artifact_id": latest["plan"].id,
+                    "base_candidate_id": str(
+                        (latest["plan"].content or {}).get("plan_candidate_id") or ""
+                    ),
+                    "feedback_revision_id": revision_artifact.id,
+                    "iteration": iteration,
+                    "normalized_plan": deepcopy(feedback["revised_plan"]),
+                }
                 self.repository.add_artifact(
                     run_id,
-                    "plan",
-                    f"Refined Research Plan (Feedback {iteration})",
-                    feedback["revised_plan"],
+                    "plan_refinement_proposal",
+                    f"Research Plan Refinement Proposal (Feedback {iteration})",
+                    {
+                        **proposal_payload,
+                        "proposal_payload_sha256": canonical_sha256(proposal_payload),
+                    },
                     "research_plan",
                     self.planning_agent.name,
                     parent_artifact_id=revision_artifact.id,
@@ -2537,7 +2745,7 @@ class WorkflowEngine:
     def _rerun_from(self, run_id: str, step_id: str):
         run = self.repository.get_run(run_id)
         start = ORDER.index(step_id)
-        preserve_requested_step = any(
+        preserve_requested_step = step_id == "research_plan" or any(
             artifact.locked and artifact.source_step == step_id
             for artifact in run.artifacts
         )
@@ -3193,6 +3401,15 @@ class WorkflowEngine:
         return focused[: max(len(scoped), max(1, limit))]
 
     @staticmethod
+    def _focused_evidence_for_candidate(
+        evidence: list[dict], candidate: dict, limit: int = 12
+    ) -> list[dict]:
+        """Choose a bounded provenance-first scope for one critic call."""
+        return WorkflowEngine._focused_evidence_for_candidates(
+            evidence, [candidate], limit
+        )[:limit]
+
+    @staticmethod
     def _stable_hash(value) -> str:
         raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -3369,9 +3586,12 @@ class WorkflowEngine:
                 audit = deepcopy(evidence_audit["candidate_audits"][index])
                 audit["registry"] = deepcopy(evidence_audit["registry"])
                 audit["registry_evidence_ids"] = registry_ids
+                candidate_scope = self._focused_evidence_for_candidate(
+                    cards, candidates[index]
+                )
                 critic = self.critic_agent.evidence_reasoning(
                     candidates[index],
-                    [literature_card(card) for card in cards],
+                    [literature_card(card) for card in candidate_scope],
                     evidence_audit=audit,
                     evaluation=assessment.get("evaluation") or {},
                     instructions=(
@@ -3613,7 +3833,8 @@ class WorkflowEngine:
         if revision.content.get("requires_follow_up") is not True:
             return True
         return any(
-            artifact.type == "plan" and artifact.parent_artifact_id == revision.id
+            artifact.type in {"plan", "plan_refinement_proposal"}
+            and artifact.parent_artifact_id == revision.id
             for artifact in artifacts
         )
 
@@ -3922,6 +4143,8 @@ class WorkflowEngine:
         diagnosis: bool = False,
         validation_context: dict | None = None,
     ) -> dict:
+        if step_id == "research_plan":
+            raise ValueError("PLAN_REVIEW_GOVERNANCE_ONLY")
         revision = None
         revision_limit = self.supervisor_agent.revision_limit(
             step_id, diagnosis=diagnosis
@@ -4159,6 +4382,7 @@ class WorkflowEngine:
                 "file_types": profile["file_types"],
                 "files": list(profile.get("files") or []),
                 "schemas": profile["schemas"],
+                "observed_structure": deepcopy(profile.get("observed_structure") or []),
                 "limitations": list(profile.get("limitations") or []),
                 "semantic_facts": deepcopy(profile.get("semantic_facts") or {}),
                 "preprocessing": list(
@@ -4268,16 +4492,2108 @@ class WorkflowEngine:
         normalized = {
             "verdict": verdict,
             "issues": list(value.get("issues") or []),
+            "closed_issue_ids": list(value.get("closed_issue_ids") or []),
+            "reopened_issue_ids": list(value.get("reopened_issue_ids") or []),
             "required_changes": list(value.get("required_changes") or []),
             "suggested_fixes": list(value.get("suggested_fixes") or []),
             "revised_plan_guidance": list(value.get("revised_plan_guidance") or []),
+            "fix_requirements": dict(value.get("fix_requirements") or {}),
+            "scope_check": dict(value.get("scope_check") or {}),
             "experiment_feasibility": feasibility,
             "provider_mode": str(value.get("provider_mode") or "deepseek"),
             "model_used": str(value.get("model_used") or ""),
         }
-        if verdict == "REVISE" and (not normalized["issues"] or not normalized["suggested_fixes"]):
-            raise ValueError("MODEL_OUTPUT_VALIDATION_FAILURE:REVISE requires issues and suggested fixes")
         return normalized
+
+    def _execute_plan_review_governance(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        run,
+        latest: dict,
+        selection: dict,
+        dataset_options: list[dict],
+        dataset_profile: dict | None,
+        policy_artifact,
+        frozen_policy: dict,
+        instructions: str,
+        constraints_reference: dict,
+        stage: str,
+        profile: dict,
+        protocol: dict,
+        readiness: dict,
+        dataset_state: dict,
+        produce_initial_plan,
+    ):
+        """Execute the sole scientific plan gate from durable append-only state."""
+        revision_limit = int(frozen_policy["max_content_revisions"])
+        current_run = self.repository.get_run(run_id)
+        self._validate_plan_governance_history(
+            current_run.artifacts,
+            policy_artifact,
+            frozen_policy,
+            constraints_reference,
+        )
+        # A historical ledger is immutable, but an old implementation may have
+        # elevated an execution concern into a Plan veto.  Re-adjudicate that
+        # record under the current narrow authority before deciding whether the
+        # user can continue; the resulting append-only audit record is the only
+        # new state.
+        self._recover_plan_review_for_continue(run_id, policy_artifact, frozen_policy)
+        self._reconcile_plan_review_phases(
+            run_id, policy_artifact, frozen_policy
+        )
+        current_run = self.repository.get_run(run_id)
+        candidates = [
+            item
+            for item in current_run.artifacts
+            if item.type == "research_plan_candidate"
+            and (item.content or {}).get("policy_artifact_id") == policy_artifact.id
+        ]
+        by_round: dict[int, object] = {}
+        for candidate in candidates:
+            content = candidate.content or {}
+            round_index = int(content.get("round_index") or 0)
+            if (
+                round_index < 1
+                or round_index in by_round
+                or content.get("plan_id") != candidate.id
+                or content.get("research_constraints_reference") != constraints_reference
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:candidate_lineage"
+                )
+            by_round[round_index] = candidate
+        if by_round and sorted(by_round) != list(range(1, max(by_round) + 1)):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:candidate_round_gap"
+            )
+        artifact_index = {item.id: item for item in current_run.artifacts}
+        for candidate_round, candidate in by_round.items():
+            content = candidate.content or {}
+            if candidate_round == 1:
+                expected_parent = (frozen_policy.get("source_artifact_lineage") or {}).get(
+                    "hypothesis_selection_artifact_id"
+                )
+                if content.get("parent_plan_id") or candidate.parent_artifact_id != expected_parent:
+                    raise PlanReviewPolicyIntegrityError(
+                        "PLAN_REVIEW_POLICY_INTEGRITY:initial_candidate_parent"
+                    )
+                continue
+            parent_plan_id = str(content.get("parent_plan_id") or "")
+            request_id = str(content.get("revision_request_id") or "")
+            request = artifact_index.get(request_id)
+            if (
+                parent_plan_id != by_round[candidate_round - 1].id
+                or candidate.parent_artifact_id != request_id
+                or request is None
+                or request.type
+                not in {"plan_review_revision_request", "plan_review_change_request"}
+                or (request.content or {}).get("plan_id") != parent_plan_id
+                or int((request.content or {}).get("round_index") or 0)
+                != candidate_round - 1
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:revision_candidate_lineage"
+                )
+        proposals = [
+            item
+            for item in current_run.artifacts
+            if item.type == "plan_refinement_proposal"
+            and (item.content or {}).get("policy_artifact_id") == policy_artifact.id
+        ]
+        change_requests = [
+            item
+            for item in current_run.artifacts
+            if item.type == "plan_review_change_request"
+            and (item.content or {}).get("policy_artifact_id") == policy_artifact.id
+        ]
+        requests_by_proposal = {
+            str((item.content or {}).get("proposal_id") or ""): item
+            for item in change_requests
+        }
+        candidate_request_ids = {
+            str((item.content or {}).get("revision_request_id") or "")
+            for item in by_round.values()
+        }
+        pending_proposals = [
+            item
+            for item in proposals
+            if item.id not in requests_by_proposal
+            or requests_by_proposal[item.id].id not in candidate_request_ids
+        ]
+        if len(pending_proposals) > 1:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:multiple_pending_plan_proposals"
+            )
+        if pending_proposals:
+            proposal = pending_proposals[0]
+            proposal_position = next(
+                index
+                for index, artifact in enumerate(current_run.artifacts)
+                if artifact.id == proposal.id
+            )
+            if not by_round or not is_plan_governance_accepted(
+                current_run.artifacts[:proposal_position]
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:proposal_without_accepted_base"
+                )
+            parent_candidate = by_round[max(by_round)]
+            if (proposal.content or {}).get("base_candidate_id") != parent_candidate.id:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:proposal_base_candidate"
+                )
+            parent_round = int((parent_candidate.content or {}).get("round_index") or 0)
+            parent_review = self._single_governance_artifact(
+                current_run.artifacts,
+                "plan_review",
+                policy_artifact.id,
+                round_index=parent_round,
+                plan_id=parent_candidate.id,
+            )
+            parent_ledger = (
+                self._single_governance_artifact(
+                    current_run.artifacts,
+                    "plan_review_issue_ledger",
+                    policy_artifact.id,
+                    round_index=parent_round,
+                    plan_id=parent_candidate.id,
+                    review_id=parent_review.id,
+                )
+                if parent_review is not None
+                else None
+            )
+            if parent_ledger is None or (
+                (parent_ledger.content or {}).get("validated_open_blocker_ids")
+                != []
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:proposal_base_acceptance"
+                )
+            change_request = requests_by_proposal.get(proposal.id)
+            if change_request is None:
+                change_payload = {
+                    "schema_version": 1,
+                    "policy_artifact_id": policy_artifact.id,
+                    "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                    "proposal_id": proposal.id,
+                    "plan_id": parent_candidate.id,
+                    "review_id": parent_review.id,
+                    "ledger_id": parent_ledger.id,
+                    "round_index": parent_round,
+                    "next_round_index": parent_round + 1,
+                    "governance_cycle_index": int(
+                        (parent_candidate.content or {}).get("governance_cycle_index")
+                        or 1
+                    )
+                    + 1,
+                }
+                change_request = self.repository.add_artifact(
+                    run_id,
+                    "plan_review_change_request",
+                    f"Plan Review Change Request {parent_round + 1}",
+                    {
+                        **change_payload,
+                        "change_request_payload_sha256": canonical_sha256(change_payload),
+                    },
+                    step_id,
+                    "Plan Review Governance",
+                    parent_artifact_id=proposal.id,
+                )
+            next_round = parent_round + 1
+            plan_candidate = self.repository.add_artifact(
+                run_id,
+                "research_plan_candidate",
+                f"Research Plan Candidate Round {next_round}",
+                {
+                    "plan_id": "",
+                    "round_index": next_round,
+                    "governance_cycle_index": int(
+                        (change_request.content or {}).get("governance_cycle_index")
+                        or 1
+                    ),
+                    "revision_attempt": 0,
+                    "parent_plan_id": parent_candidate.id,
+                    "revision_request_id": change_request.id,
+                    "source_proposal_id": proposal.id,
+                    "research_stage": stage,
+                    "normalized_plan": deepcopy(
+                        (proposal.content or {}).get("normalized_plan") or {}
+                    ),
+                    "research_constraints_reference": constraints_reference,
+                    "policy_artifact_id": policy_artifact.id,
+                    "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                    "provider": self.llm_provider.mode,
+                    "model": "planning.refine_plan",
+                    "request_chars": 0,
+                    "response_metadata": {},
+                    "status": "review_pending",
+                },
+                step_id,
+                self.planning_agent.name,
+                parent_artifact_id=change_request.id,
+                self_id_field="plan_id",
+            )
+            by_round[next_round] = plan_candidate
+        if not by_round:
+            plan = produce_initial_plan()
+            plan_candidate = self.repository.add_artifact(
+                run_id,
+                "research_plan_candidate",
+                "Research Plan Candidate Round 1",
+                {
+                    "plan_id": "",
+                    "round_index": 1,
+                    "governance_cycle_index": 1,
+                    "revision_attempt": 0,
+                    "parent_plan_id": "",
+                    "research_stage": stage,
+                    "normalized_plan": deepcopy(plan),
+                    "research_constraints_reference": constraints_reference,
+                    "policy_artifact_id": policy_artifact.id,
+                    "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                    "provider": self.llm_provider.mode,
+                    "model": "planning.build_plan",
+                    "request_chars": 0,
+                    "response_metadata": {},
+                    "status": "review_pending",
+                },
+                step_id,
+                self.planning_agent.name,
+                parent_artifact_id=latest["hypothesis_selection"].id,
+                self_id_field="plan_id",
+            )
+            by_round[1] = plan_candidate
+
+        round_index = max(by_round)
+        plan_candidate = by_round[round_index]
+        while True:
+            self._append_plan_review_phase(
+                run_id,
+                policy_artifact,
+                plan_candidate,
+                "CANDIDATE_CREATED",
+                plan_candidate.id,
+            )
+            current_run = self.repository.get_run(run_id)
+            plan = deepcopy((plan_candidate.content or {}).get("normalized_plan") or {})
+            if not plan:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:candidate_payload"
+                )
+            parent_plan_id = str((plan_candidate.content or {}).get("parent_plan_id") or "")
+            previous_plan = self._plan_candidate_content(current_run.artifacts, parent_plan_id)
+            prior_ledger_artifact = self._validated_prior_plan_ledger(
+                current_run.artifacts,
+                policy_artifact.id,
+                frozen_policy["policy_payload_sha256"],
+                round_index,
+                parent_plan_id,
+            )
+            issue_ledger = deepcopy(
+                (prior_ledger_artifact.content or {}).get("issues") or []
+            ) if prior_ledger_artifact else []
+            previous_review_artifact = self._single_governance_artifact(
+                current_run.artifacts,
+                "plan_review",
+                policy_artifact.id,
+                round_index=round_index - 1,
+            ) if round_index > 1 else None
+            changed_fields = changed_contract_fields(
+                previous_plan,
+                plan,
+                field_registry=frozen_policy[
+                    "canonical_contract_field_registry"
+                ],
+                field_aliases=frozen_policy["contract_field_aliases"],
+            )
+            new_evidence_artifact_ids = self._new_plan_review_input_artifact_ids(
+                current_run.artifacts,
+                previous_review_artifact.id if previous_review_artifact else "",
+            )
+            review_artifact = self._single_governance_artifact(
+                current_run.artifacts,
+                "plan_review",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=plan_candidate.id,
+            )
+            if review_artifact is None:
+                revision_attempt = int(
+                    (plan_candidate.content or {}).get("revision_attempt") or 0
+                )
+                review_context = self._research_plan_review_context(
+                    run,
+                    latest,
+                    selection,
+                    plan,
+                    dataset_options,
+                    frozen_policy=frozen_policy,
+                    issue_ledger=issue_ledger,
+                    round_index=revision_attempt + 1,
+                    changed_fields=changed_fields,
+                    new_evidence_artifact_ids=new_evidence_artifact_ids,
+                    candidate_plan_id=plan_candidate.id,
+                )
+                try:
+                    review = self._normalize_plan_review(
+                        self.planning_agent.review_plan(
+                            review_context,
+                            runtime_contract_snapshot=frozen_policy[
+                                "review_runtime_contract_snapshot"
+                            ],
+                            schema_snapshot=frozen_policy[
+                                "review_prompt_schema_snapshot"
+                            ],
+                        )
+                    )
+                except LLMRequestCancelled:
+                    raise
+                except Exception as exc:
+                    self.repository.add_artifact(
+                        run_id,
+                        "failure_record",
+                        "Research Plan Review Failure",
+                        self._plan_review_failure(exc, round_index),
+                        step_id,
+                        "ModelCallReliability",
+                        parent_artifact_id=plan_candidate.id,
+                    )
+                    raise
+                review.update(
+                    reviewer_verdict=review["verdict"],
+                    reviewer_findings=deepcopy(review["issues"]),
+                    review_id="",
+                    plan_id=plan_candidate.id,
+                    research_constraints_reference=constraints_reference,
+                    policy_artifact_id=policy_artifact.id,
+                    policy_payload_sha256=frozen_policy["policy_payload_sha256"],
+                    round_index=round_index,
+                    governance_cycle_index=int(
+                        (plan_candidate.content or {}).get("governance_cycle_index")
+                        or 1
+                    ),
+                    revision_attempt=revision_attempt,
+                    review_mode="initial" if revision_attempt == 0 else "revision",
+                )
+                review_artifact = self.repository.add_artifact(
+                    run_id,
+                    "plan_review",
+                    f"DeepSeek Plan Review {round_index}",
+                    review,
+                    step_id,
+                    "DeepSeek Research Plan Reviewer",
+                    parent_artifact_id=plan_candidate.id,
+                    self_id_field="review_id",
+                )
+            self._validate_review_lineage(
+                review_artifact, policy_artifact, plan_candidate, round_index, frozen_policy
+            )
+            self._append_plan_review_phase(
+                run_id, policy_artifact, plan_candidate, "REVIEW_CREATED", review_artifact.id
+            )
+
+            current_run = self.repository.get_run(run_id)
+            ledger_artifact = self._single_governance_artifact(
+                current_run.artifacts,
+                "plan_review_issue_ledger",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=plan_candidate.id,
+                review_id=review_artifact.id,
+            )
+            if ledger_artifact is None:
+                adjudication = adjudicate_review(
+                    issue_ledger,
+                    review_artifact.content or {},
+                    frozen_policy=frozen_policy,
+                    round_index=int(
+                        (plan_candidate.content or {}).get("revision_attempt") or 0
+                    )
+                    + 1,
+                    changed_fields=changed_fields,
+                    new_evidence_artifact_ids=new_evidence_artifact_ids,
+                    candidate_plan_id=plan_candidate.id,
+                    review_id=review_artifact.id,
+                )
+                issue_ledger = adjudication.issues
+                ledger_payload = {
+                    "schema_version": 2,
+                    "policy_artifact_id": policy_artifact.id,
+                    "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                    "round_identity": self._plan_review_round_identity(
+                        policy_artifact.id, round_index, plan_candidate.id
+                    ),
+                    "round_index": round_index,
+                    "plan_id": plan_candidate.id,
+                    "review_id": review_artifact.id,
+                    "issues": deepcopy(issue_ledger),
+                    "validated_open_blocker_ids": list(adjudication.validated_open_blocker_ids),
+                    "warning_ids": list(adjudication.warning_ids),
+                    "suggestion_ids": list(adjudication.suggestion_ids),
+                    "closed_issue_ids": list(adjudication.closed_issue_ids),
+                    "verdict": adjudication.verdict,
+                }
+                ledger_artifact = self.repository.add_artifact(
+                    run_id,
+                    "plan_review_issue_ledger",
+                    f"Plan Review Issue Ledger Round {round_index}",
+                    {
+                        **ledger_payload,
+                        "ledger_payload_sha256": canonical_sha256(ledger_payload),
+                    },
+                    step_id,
+                    "Plan Review Governance",
+                    parent_artifact_id=review_artifact.id,
+                )
+            ledger_content = self._validate_plan_review_ledger(
+                ledger_artifact,
+                policy_artifact,
+                plan_candidate,
+                review_artifact,
+                round_index,
+                frozen_policy,
+            )
+            recovery = self._plan_review_recovery_for(
+                self.repository.get_run(run_id).artifacts,
+                policy_artifact,
+                frozen_policy,
+                plan_candidate,
+                review_artifact,
+                ledger_artifact,
+            )
+            ledger_proof = recovery or ledger_artifact
+            if recovery is not None:
+                ledger_content = {
+                    **ledger_content,
+                    "issues": deepcopy(recovery.content["issues"]),
+                    "validated_open_blocker_ids": list(
+                        recovery.content["validated_open_blocker_ids"]
+                    ),
+                    "warning_ids": list(recovery.content.get("warning_ids") or []),
+                    "suggestion_ids": list(recovery.content.get("suggestion_ids") or []),
+                    "closed_issue_ids": list(recovery.content.get("closed_issue_ids") or []),
+                    "verdict": recovery.content["verdict"],
+                }
+            issue_ledger = deepcopy(ledger_content["issues"])
+            open_ids = tuple(ledger_content["validated_open_blocker_ids"])
+            self._append_plan_review_phase(
+                run_id, policy_artifact, plan_candidate, "LEDGER_COMMITTED", ledger_artifact.id
+            )
+            if not open_ids:
+                if recovery is None:
+                    self._append_plan_review_phase(
+                        run_id, policy_artifact, plan_candidate, "ROUND_COMPLETE", ledger_proof.id,
+                        outcome="ACCEPT",
+                    )
+                return plan, plan_candidate, issue_ledger
+
+            revision_attempt = int(
+                (plan_candidate.content or {}).get("revision_attempt") or 0
+            )
+            if revision_attempt >= revision_limit:
+                required = self._single_governance_artifact(
+                    self.repository.get_run(run_id).artifacts,
+                    "plan_revision_required",
+                    policy_artifact.id,
+                    round_index=round_index,
+                    plan_id=plan_candidate.id,
+                )
+                message = "DeepSeek did not produce an acceptable plan within the bounded revision limit."
+                if required is None:
+                    required = self.repository.add_artifact(
+                        run_id,
+                        "plan_revision_required",
+                        "Research Plan Revision Required",
+                        {
+                            "code": "PLAN_REVISION_REQUIRED",
+                            "message": message,
+                            "attempt": revision_attempt,
+                            "scientific_state_mutated": False,
+                            "policy_artifact_id": policy_artifact.id,
+                            "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                            "round_index": round_index,
+                            "plan_id": plan_candidate.id,
+                            "review_id": review_artifact.id,
+                            "ledger_id": ledger_artifact.id,
+                            "issue_ledger": issue_ledger,
+                            "recoverable": True,
+                            "user_action_required": True,
+                        },
+                        step_id,
+                        "Scientific Stability Gate",
+                        parent_artifact_id=ledger_artifact.id,
+                    )
+                self._append_plan_review_phase(
+                    run_id, policy_artifact, plan_candidate, "ROUND_COMPLETE", required.id,
+                    outcome="NEEDS_PLAN_REVISION",
+                )
+                self.repository.update_workflow_state(
+                    run_id,
+                    status="NEEDS_PLAN_REVISION",
+                    current_step="research_plan",
+                    automatic=False,
+                    stop_requested=False,
+                )
+                self.repository.update_step_state(
+                    run_id,
+                    "research_plan",
+                    "interrupted",
+                    error={
+                        "code": "PLAN_REVISION_REQUIRED",
+                        "message": message,
+                        "recoverable": True,
+                        "user_action_required": True,
+                    },
+                )
+                self._persist_scientific_world_state(
+                    run_id, run, profile, dataset_state, protocol, readiness, stage, issue_ledger
+                )
+                return None
+
+            open_blockers = [
+                deepcopy(item) for item in issue_ledger if item.get("issue_id") in open_ids
+            ]
+            current_run = self.repository.get_run(run_id)
+            revision_request = self._single_governance_artifact(
+                current_run.artifacts,
+                "plan_review_revision_request",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=plan_candidate.id,
+            )
+            if revision_request is None:
+                revision_request = self.repository.add_artifact(
+                    run_id,
+                    "plan_review_revision_request",
+                    f"Plan Review Revision Request {round_index}",
+                    {
+                        "schema_version": 1,
+                        "policy_artifact_id": policy_artifact.id,
+                        "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                        "round_identity": self._plan_review_round_identity(
+                            policy_artifact.id, round_index, plan_candidate.id
+                        ),
+                        "round_index": round_index,
+                        "plan_id": plan_candidate.id,
+                        "review_id": review_artifact.id,
+                        "ledger_id": ledger_artifact.id,
+                        "validated_open_blocker_ids": list(open_ids),
+                        "open_validated_blockers": deepcopy(open_blockers),
+                    },
+                    step_id,
+                    "Plan Review Governance",
+                    parent_artifact_id=ledger_artifact.id,
+                )
+            request_content = revision_request.content or {}
+            if (
+                revision_request.parent_artifact_id != ledger_artifact.id
+                or request_content.get("policy_payload_sha256")
+                != frozen_policy["policy_payload_sha256"]
+                or request_content.get("round_identity")
+                != self._plan_review_round_identity(
+                    policy_artifact.id, round_index, plan_candidate.id
+                )
+                or request_content.get("review_id") != review_artifact.id
+                or request_content.get("ledger_id") != ledger_artifact.id
+                or list(request_content.get("validated_open_blocker_ids") or [])
+                != list(open_ids)
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:revision_request"
+                )
+            self._append_plan_review_phase(
+                run_id, policy_artifact, plan_candidate, "REVISION_REQUESTED", revision_request.id
+            )
+            current_run = self.repository.get_run(run_id)
+            next_candidates = [
+                item
+                for item in current_run.artifacts
+                if item.type == "research_plan_candidate"
+                and (item.content or {}).get("policy_artifact_id") == policy_artifact.id
+                and (item.content or {}).get("parent_plan_id") == plan_candidate.id
+            ]
+            if len(next_candidates) > 1:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:multiple_revision_candidates"
+                )
+            if next_candidates:
+                next_candidate = next_candidates[0]
+                if int((next_candidate.content or {}).get("round_index") or 0) != round_index + 1:
+                    raise PlanReviewPolicyIntegrityError(
+                        "PLAN_REVIEW_POLICY_INTEGRITY:revision_candidate_round"
+                    )
+            else:
+                closed_ledger = [
+                    deepcopy(item) for item in issue_ledger if item.get("status") == "CLOSED"
+                ]
+                revision_context = {
+                    "selected_hypothesis": selection,
+                    "current_candidate": plan,
+                    "current_plan": plan,
+                    "current_candidate_plan_id": plan_candidate.id,
+                    "revision_request_id": revision_request.id,
+                    "open_validated_blockers": open_blockers,
+                    "closed_issue_ledger": closed_ledger,
+                    "frozen_problem_anchor": deepcopy(frozen_policy["problem_anchor"]),
+                    "issues": open_blockers,
+                    "required_changes": [item.get("required_fix") for item in open_blockers],
+                    "suggested_fixes": [],
+                    "revised_plan_guidance": [
+                        "Patch only Plan Contract fields named by OPEN validated blockers and return an exact fix_map."
+                    ],
+                    "experiment_feasibility": (review_artifact.content or {}).get("experiment_feasibility"),
+                    "dataset_options": dataset_options,
+                    "authoritative_plan_contract": deepcopy(
+                        frozen_policy["authoritative_plan_contract_snapshot"]
+                    ),
+                    "dataset_profile": dataset_profile or {},
+                    "run_constraints": run.constraints,
+                    "research_constraints_reference": constraints_reference,
+                }
+                revised_plan = normalize_plan(
+                    self.planning_agent.revise_from_review(
+                        revision_context,
+                        runtime_contract_snapshot=frozen_policy[
+                            "revision_runtime_contract_snapshot"
+                        ],
+                        schema_snapshot=frozen_policy[
+                            "revision_prompt_schema_snapshot"
+                        ],
+                    ),
+                    selection,
+                    provider_mode=self.llm_provider.mode,
+                    fallback_used=self.llm_provider.fallback,
+                )
+                revised_plan["fix_map"] = canonicalize_fix_map(
+                    revised_plan.get("fix_map"),
+                    field_registry=frozen_policy[
+                        "canonical_contract_field_registry"
+                    ],
+                    field_aliases=frozen_policy["contract_field_aliases"],
+                )
+                comparable_base = {key: plan.get(key) for key in revised_plan}
+                revision_changed_fields = changed_contract_fields(
+                    comparable_base,
+                    revised_plan,
+                    field_registry=frozen_policy[
+                        "canonical_contract_field_registry"
+                    ],
+                    field_aliases=frozen_policy["contract_field_aliases"],
+                )
+                revision_fix_map_issues = fix_map_issues(
+                    revised_plan.get("fix_map"),
+                    open_blockers=open_blockers,
+                    changed_fields=revision_changed_fields,
+                    field_registry=frozen_policy[
+                        "canonical_contract_field_registry"
+                    ],
+                    field_aliases=frozen_policy["contract_field_aliases"],
+                )
+                if revision_fix_map_issues:
+                    if not revision_changed_fields:
+                        raise ValueError(
+                            "MODEL_OUTPUT_VALIDATION_FAILURE:"
+                            + ";".join(revision_fix_map_issues)
+                        )
+                    allowed_fields_by_blocker = canonicalize_fix_map(
+                        {
+                            str(item.get("issue_id") or ""): list(
+                                item.get("contract_fields") or []
+                            )
+                            for item in open_blockers
+                        },
+                        field_registry=frozen_policy[
+                            "canonical_contract_field_registry"
+                        ],
+                        field_aliases=frozen_policy["contract_field_aliases"],
+                    )
+                    repair_payload = self.planning_agent.revise_from_review(
+                        {
+                            "fix_map_repair": True,
+                            "open_validated_blocker_ids": list(open_ids),
+                            "allowed_canonical_fields_by_blocker": (
+                                allowed_fields_by_blocker
+                            ),
+                            "actual_changed_contract_fields": list(
+                                revision_changed_fields
+                            ),
+                            "invalid_fix_map": deepcopy(
+                                revised_plan.get("fix_map") or {}
+                            ),
+                            "validation_errors": list(revision_fix_map_issues),
+                        },
+                        runtime_contract_snapshot=(
+                            frozen_policy["revision_runtime_contract_snapshot"]
+                            + "\n\nFix-map repair only. Return exactly one top-level "
+                            "fix_map object. Its keys must exactly equal the supplied "
+                            "OPEN blocker IDs. Each value must be a non-empty array of "
+                            "allowed canonical top-level fields that actually changed. "
+                            "Return no plan fields, nested paths, text, evidence, values, "
+                            "or metadata."
+                        ),
+                        schema_snapshot={
+                            "fix_map": deepcopy(
+                                frozen_policy["revision_prompt_schema_snapshot"].get(
+                                    "fix_map", {}
+                                )
+                            )
+                        },
+                    )
+                    revised_plan["fix_map"] = canonicalize_fix_map(
+                        (repair_payload or {}).get("fix_map"),
+                        field_registry=frozen_policy[
+                            "canonical_contract_field_registry"
+                        ],
+                        field_aliases=frozen_policy["contract_field_aliases"],
+                    )
+                    revision_fix_map_issues = fix_map_issues(
+                        revised_plan.get("fix_map"),
+                        open_blockers=open_blockers,
+                        changed_fields=revision_changed_fields,
+                        field_registry=frozen_policy[
+                            "canonical_contract_field_registry"
+                        ],
+                        field_aliases=frozen_policy["contract_field_aliases"],
+                    )
+                    if revision_fix_map_issues:
+                        raise ValueError(
+                            "MODEL_OUTPUT_VALIDATION_FAILURE:"
+                            + ";".join(revision_fix_map_issues)
+                        )
+                if dataset_profile:
+                    revised_plan = self._bind_plan_to_dataset(revised_plan, dataset_profile)
+                revised_plan = self._attach_dataset_card(revised_plan, dataset_options)
+                revised_plan.update(
+                    research_profile=profile,
+                    protocol_state=protocol,
+                    readiness_state=readiness,
+                    research_stage=stage,
+                    research_constraints_artifact_id=constraints_reference["artifact_id"],
+                    research_constraints_reference=constraints_reference,
+                )
+                next_candidate = self.repository.add_artifact(
+                    run_id,
+                    "research_plan_candidate",
+                    f"Research Plan Candidate Round {round_index + 1}",
+                    {
+                        "plan_id": "",
+                        "round_index": round_index + 1,
+                        "governance_cycle_index": int(
+                            (plan_candidate.content or {}).get(
+                                "governance_cycle_index"
+                            )
+                            or 1
+                        ),
+                        "revision_attempt": revision_attempt + 1,
+                        "parent_plan_id": plan_candidate.id,
+                        "revision_request_id": revision_request.id,
+                        "research_stage": stage,
+                        "normalized_plan": deepcopy(revised_plan),
+                        "research_constraints_reference": constraints_reference,
+                        "policy_artifact_id": policy_artifact.id,
+                        "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
+                        "provider": self.llm_provider.mode,
+                        "model": "planning.revise_from_review",
+                        "request_chars": 0,
+                        "response_metadata": {},
+                        "status": "review_pending",
+                    },
+                    step_id,
+                    self.planning_agent.name,
+                    parent_artifact_id=revision_request.id,
+                    self_id_field="plan_id",
+                )
+            self._append_plan_review_phase(
+                run_id, policy_artifact, plan_candidate, "REVISION_CREATED", next_candidate.id
+            )
+            self._append_plan_review_phase(
+                run_id, policy_artifact, plan_candidate, "ROUND_COMPLETE", next_candidate.id,
+                outcome="REVISE",
+            )
+            plan_candidate = next_candidate
+            round_index += 1
+
+    def _validate_plan_governance_history(
+        self,
+        artifacts,
+        policy_artifact,
+        frozen_policy: dict,
+        constraints_reference: dict,
+    ) -> None:
+        """Validate every governed child before any model call or child write."""
+        child_types = {
+            "research_plan_candidate",
+            "plan",
+            "plan_refinement_proposal",
+            "plan_review_change_request",
+            "plan_review",
+            "plan_review_issue_ledger",
+            "plan_review_recovery_adjudication",
+            "plan_review_revision_request",
+            "plan_revision_required",
+            "plan_review_round_state",
+        }
+        policy_id = policy_artifact.id
+        policy_hash = frozen_policy["policy_payload_sha256"]
+        index = {item.id: item for item in artifacts}
+        positions = {item.id: position for position, item in enumerate(artifacts)}
+        migration_id = str(
+            (frozen_policy.get("source_artifact_lineage") or {}).get(
+                "migration_artifact_id"
+            )
+            or ""
+        )
+        legacy_ids: set[str] = set()
+        if migration_id:
+            migration = index.get(migration_id)
+            if migration is None:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:migration_missing"
+                )
+            migration_content = validate_plan_governance_migration(
+                migration.content or {},
+                frozen_policy_artifact_id=policy_artifact.id,
+                frozen_policy_payload=frozen_policy,
+            )
+            legacy_ids = {
+                str(row.get("artifact_id") or "")
+                for row in migration_content.get("legacy_lineage") or []
+            }
+        governed = [
+            item
+            for item in artifacts
+            if item.type in child_types and item.id not in legacy_ids
+        ]
+        for item in governed:
+            content = item.content or {}
+            if content.get("policy_artifact_id") != policy_id:
+                raise PlanReviewPolicyIntegrityError(
+                    f"PLAN_REVIEW_POLICY_INTEGRITY:{item.type}_policy_id"
+                )
+            if item.type != "plan_review_round_state" and (
+                content.get("policy_payload_sha256") != policy_hash
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    f"PLAN_REVIEW_POLICY_INTEGRITY:{item.type}_policy_hash"
+                )
+
+        proposals = [
+            item for item in governed if item.type == "plan_refinement_proposal"
+        ]
+        for proposal in proposals:
+            content = deepcopy(proposal.content or {})
+            expected_hash = str(content.pop("proposal_payload_sha256", ""))
+            base_plan = index.get(str(content.get("base_plan_artifact_id") or ""))
+            base_candidate = index.get(str(content.get("base_candidate_id") or ""))
+            feedback = index.get(str(content.get("feedback_revision_id") or ""))
+            if (
+                content.get("schema_version") != 1
+                or not expected_hash
+                or canonical_sha256(content) != expected_hash
+                or base_plan is None
+                or base_plan.type != "plan"
+                or base_candidate is None
+                or base_candidate.type != "research_plan_candidate"
+                or (base_plan.content or {}).get("plan_candidate_id")
+                != base_candidate.id
+                or feedback is None
+                or feedback.type != "revision"
+                or proposal.parent_artifact_id != feedback.id
+                or not isinstance(content.get("normalized_plan"), dict)
+                or not content.get("normalized_plan")
+                or positions[base_plan.id] >= positions[feedback.id]
+                or positions[feedback.id] >= positions[proposal.id]
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:refinement_proposal"
+                )
+
+        change_requests = [
+            item for item in governed if item.type == "plan_review_change_request"
+        ]
+        seen_change_proposals: set[str] = set()
+        for request in change_requests:
+            content = deepcopy(request.content or {})
+            expected_hash = str(content.pop("change_request_payload_sha256", ""))
+            proposal = index.get(str(content.get("proposal_id") or ""))
+            parent_candidate = index.get(str(content.get("plan_id") or ""))
+            ledger = index.get(str(content.get("ledger_id") or ""))
+            proposal_id = str(content.get("proposal_id") or "")
+            if (
+                content.get("schema_version") != 1
+                or not expected_hash
+                or canonical_sha256(content) != expected_hash
+                or proposal is None
+                or proposal.type != "plan_refinement_proposal"
+                or request.parent_artifact_id != proposal.id
+                or parent_candidate is None
+                or parent_candidate.type != "research_plan_candidate"
+                or (proposal.content or {}).get("base_candidate_id")
+                != parent_candidate.id
+                or ledger is None
+                or ledger.type != "plan_review_issue_ledger"
+                or (ledger.content or {}).get("plan_id") != parent_candidate.id
+                or content.get("review_id")
+                != (ledger.content or {}).get("review_id")
+                or (ledger.content or {}).get("validated_open_blocker_ids") != []
+                or (ledger.content or {}).get("verdict") != "ACCEPT"
+                or int(content.get("round_index") or 0)
+                != int((parent_candidate.content or {}).get("round_index") or 0)
+                or int(content.get("next_round_index") or 0)
+                != int(content.get("round_index") or 0) + 1
+                or int(content.get("governance_cycle_index") or 0)
+                != int(
+                    (parent_candidate.content or {}).get("governance_cycle_index")
+                    or 0
+                )
+                + 1
+                or proposal_id in seen_change_proposals
+                or positions[ledger.id] >= positions[proposal.id]
+                or positions[proposal.id] >= positions[request.id]
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:change_request"
+                )
+            seen_change_proposals.add(proposal_id)
+
+        candidates = [item for item in governed if item.type == "research_plan_candidate"]
+        by_round: dict[int, object] = {}
+        for candidate in candidates:
+            content = candidate.content or {}
+            round_index = int(content.get("round_index") or 0)
+            if (
+                round_index < 1
+                or round_index in by_round
+                or content.get("plan_id") != candidate.id
+                or content.get("research_constraints_reference")
+                != constraints_reference
+                or not isinstance(content.get("normalized_plan"), dict)
+                or not content.get("normalized_plan")
+                or int(content.get("governance_cycle_index") or 0) < 1
+                or int(content.get("revision_attempt", -1)) < 0
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:candidate_lineage"
+                )
+            by_round[round_index] = candidate
+
+        for plan in [item for item in governed if item.type == "plan"]:
+            content = plan.content or {}
+            candidate = index.get(str(content.get("plan_candidate_id") or ""))
+            if (
+                candidate is None
+                or candidate.type != "research_plan_candidate"
+                or plan.parent_artifact_id != candidate.id
+                or content.get("accepted_candidate_payload_sha256")
+                != canonical_sha256(
+                    (candidate.content or {}).get("normalized_plan") or {}
+                )
+                or changed_contract_fields(
+                    (candidate.content or {}).get("normalized_plan") or {},
+                    content,
+                    field_registry=frozen_policy[
+                        "canonical_contract_field_registry"
+                    ],
+                    field_aliases=frozen_policy["contract_field_aliases"],
+                )
+                or positions[candidate.id] >= positions[plan.id]
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:accepted_plan_lineage"
+                )
+        if by_round and sorted(by_round) != list(range(1, max(by_round) + 1)):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:candidate_round_gap"
+            )
+        expected_initial_parent = (
+            frozen_policy.get("source_artifact_lineage") or {}
+        ).get("hypothesis_selection_artifact_id")
+        for round_index, candidate in by_round.items():
+            content = candidate.content or {}
+            if round_index == 1:
+                if (
+                    content.get("parent_plan_id")
+                    or candidate.parent_artifact_id != expected_initial_parent
+                    or int(content.get("governance_cycle_index") or 0) != 1
+                    or int(content.get("revision_attempt", -1)) != 0
+                ):
+                    raise PlanReviewPolicyIntegrityError(
+                        "PLAN_REVIEW_POLICY_INTEGRITY:initial_candidate_parent"
+                    )
+                continue
+            request = index.get(str(content.get("revision_request_id") or ""))
+            previous = by_round.get(round_index - 1)
+            if (
+                previous is None
+                or content.get("parent_plan_id") != previous.id
+                or request is None
+                or request.type
+                not in {"plan_review_revision_request", "plan_review_change_request"}
+                or candidate.parent_artifact_id != request.id
+                or (request.content or {}).get("plan_id") != previous.id
+                or int((request.content or {}).get("round_index") or 0)
+                != round_index - 1
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:revision_candidate_lineage"
+                )
+            previous_content = previous.content or {}
+            if request.type == "plan_review_revision_request":
+                valid_counter = (
+                    int(content.get("governance_cycle_index") or 0)
+                    == int(previous_content.get("governance_cycle_index") or 0)
+                    and int(content.get("revision_attempt", -1))
+                    == int(previous_content.get("revision_attempt") or 0) + 1
+                )
+            else:
+                valid_counter = (
+                    int(content.get("governance_cycle_index") or 0)
+                    == int(previous_content.get("governance_cycle_index") or 0) + 1
+                    and int(content.get("revision_attempt", -1)) == 0
+                    and content.get("source_proposal_id")
+                    == (request.content or {}).get("proposal_id")
+                )
+            if not valid_counter:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:candidate_revision_counter"
+                )
+
+        seen: set[tuple] = set()
+        for review in [item for item in governed if item.type == "plan_review"]:
+            content = review.content or {}
+            candidate = index.get(str(content.get("plan_id") or ""))
+            key = ("review", int(content.get("round_index") or 0), content.get("plan_id"))
+            if key in seen or candidate is None or candidate.type != "research_plan_candidate":
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:review_identity"
+                )
+            seen.add(key)
+            self._validate_review_lineage(
+                review,
+                policy_artifact,
+                candidate,
+                int(content.get("round_index") or 0),
+                frozen_policy,
+            )
+
+        for ledger in [
+            item for item in governed if item.type == "plan_review_issue_ledger"
+        ]:
+            content = ledger.content or {}
+            candidate = index.get(str(content.get("plan_id") or ""))
+            review = index.get(str(content.get("review_id") or ""))
+            key = (
+                "ledger",
+                int(content.get("round_index") or 0),
+                content.get("plan_id"),
+                content.get("review_id"),
+            )
+            if (
+                key in seen
+                or candidate is None
+                or candidate.type != "research_plan_candidate"
+                or review is None
+                or review.type != "plan_review"
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:ledger_identity"
+                )
+            seen.add(key)
+            self._validate_plan_review_ledger(
+                ledger,
+                policy_artifact,
+                candidate,
+                review,
+                int(content.get("round_index") or 0),
+                frozen_policy,
+            )
+
+        for recovery in [
+            item for item in governed if item.type == "plan_review_recovery_adjudication"
+        ]:
+            content = recovery.content or {}
+            candidate = index.get(str(content.get("plan_id") or ""))
+            review = index.get(str(content.get("review_id") or ""))
+            ledger = index.get(str(content.get("ledger_id") or ""))
+            if (
+                candidate is None
+                or candidate.type != "research_plan_candidate"
+                or review is None
+                or review.type != "plan_review"
+                or ledger is None
+                or ledger.type != "plan_review_issue_ledger"
+                or recovery.parent_artifact_id != ledger.id
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:recovery_lineage"
+                )
+            validate_plan_review_recovery(
+                content,
+                policy_artifact_id=policy_id,
+                policy_payload_sha256=policy_hash,
+                candidate_plan_id=candidate.id,
+                review_id=review.id,
+                ledger_id=ledger.id,
+            )
+
+        for request in [
+            item for item in governed if item.type == "plan_review_revision_request"
+        ]:
+            content = request.content or {}
+            candidate = index.get(str(content.get("plan_id") or ""))
+            review = index.get(str(content.get("review_id") or ""))
+            ledger = index.get(str(content.get("ledger_id") or ""))
+            round_index = int(content.get("round_index") or 0)
+            key = ("revision_request", round_index, content.get("plan_id"))
+            ledger_open = list((ledger.content or {}).get("validated_open_blocker_ids") or []) if ledger else []
+            if (
+                key in seen
+                or candidate is None
+                or review is None
+                or ledger is None
+                or request.parent_artifact_id != ledger.id
+                or content.get("round_identity")
+                != self._plan_review_round_identity(policy_id, round_index, candidate.id)
+                or content.get("review_id") != review.id
+                or content.get("ledger_id") != ledger.id
+                or list(content.get("validated_open_blocker_ids") or []) != ledger_open
+                or not ledger_open
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:revision_request"
+                )
+            seen.add(key)
+
+        for required in [
+            item for item in governed if item.type == "plan_revision_required"
+        ]:
+            content = required.content or {}
+            candidate = index.get(str(content.get("plan_id") or ""))
+            review = index.get(str(content.get("review_id") or ""))
+            ledger = index.get(str(content.get("ledger_id") or ""))
+            round_index = int(content.get("round_index") or 0)
+            key = ("revision_required", round_index, content.get("plan_id"))
+            if (
+                key in seen
+                or content.get("code") != "PLAN_REVISION_REQUIRED"
+                or candidate is None
+                or review is None
+                or ledger is None
+                or required.parent_artifact_id != ledger.id
+                or int((candidate.content or {}).get("revision_attempt", -1))
+                < int(frozen_policy["max_content_revisions"])
+                or not (ledger.content or {}).get("validated_open_blocker_ids")
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:revision_required"
+                )
+            seen.add(key)
+
+        phase_order = {
+            "CANDIDATE_CREATED": 0,
+            "REVIEW_CREATED": 1,
+            "LEDGER_COMMITTED": 2,
+            "REVISION_REQUESTED": 3,
+            "REVISION_CREATED": 4,
+            "ROUND_COMPLETE": 5,
+        }
+        phase_positions: dict[str, list[tuple[int, int]]] = {}
+        for checkpoint in [
+            item for item in governed if item.type == "plan_review_round_state"
+        ]:
+            content = deepcopy(checkpoint.content or {})
+            expected_hash = str(content.pop("round_state_payload_sha256", ""))
+            phase = str(content.get("phase") or "")
+            candidate = index.get(str(content.get("plan_id") or ""))
+            round_index = int(content.get("round_index") or 0)
+            identity = self._plan_review_round_identity(
+                policy_id, round_index, str(content.get("plan_id") or "")
+            )
+            key = ("phase", content.get("round_identity"), phase)
+            parent_id = str(content.get("phase_parent_id") or "")
+            proof = index.get(parent_id)
+            if (
+                key in seen
+                or phase not in phase_order
+                or candidate is None
+                or candidate.type != "research_plan_candidate"
+                or content.get("policy_payload_sha256") != policy_hash
+                or content.get("round_identity") != identity
+                or int((candidate.content or {}).get("round_index") or 0)
+                != round_index
+                or checkpoint.parent_artifact_id != parent_id
+                or proof is None
+                or positions[proof.id] >= positions[checkpoint.id]
+                or not expected_hash
+                or canonical_sha256(content) != expected_hash
+                or not self._plan_review_phase_proof_valid(
+                    phase, content, proof, candidate, index
+                )
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:round_phase_lineage"
+                )
+            seen.add(key)
+            phase_positions.setdefault(identity, []).append(
+                (positions[checkpoint.id], phase_order[phase])
+            )
+        for rows in phase_positions.values():
+            logical = [order for _, order in sorted(rows)]
+            if logical != sorted(logical):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:round_phase_chronology"
+                )
+
+    @staticmethod
+    def _plan_review_phase_proof_valid(
+        phase: str, content: dict, proof, candidate, index: dict
+    ) -> bool:
+        round_index = int(content.get("round_index") or 0)
+        outcome = str(content.get("outcome") or "")
+        if phase == "CANDIDATE_CREATED":
+            return proof.id == candidate.id and proof.type == "research_plan_candidate"
+        if phase == "REVIEW_CREATED":
+            return (
+                proof.type == "plan_review"
+                and (proof.content or {}).get("plan_id") == candidate.id
+                and int((proof.content or {}).get("round_index") or 0) == round_index
+            )
+        if phase == "LEDGER_COMMITTED":
+            return (
+                proof.type == "plan_review_issue_ledger"
+                and (proof.content or {}).get("plan_id") == candidate.id
+                and int((proof.content or {}).get("round_index") or 0) == round_index
+            )
+        if phase == "REVISION_REQUESTED":
+            return (
+                proof.type == "plan_review_revision_request"
+                and (proof.content or {}).get("plan_id") == candidate.id
+            )
+        if phase == "REVISION_CREATED":
+            return (
+                proof.type == "research_plan_candidate"
+                and (proof.content or {}).get("parent_plan_id") == candidate.id
+                and int((proof.content or {}).get("round_index") or 0)
+                == round_index + 1
+            )
+        if phase != "ROUND_COMPLETE":
+            return False
+        if outcome == "ACCEPT":
+            return (
+                proof.type in {
+                    "plan_review_issue_ledger",
+                    "plan_review_recovery_adjudication",
+                }
+                and (proof.content or {}).get("plan_id") == candidate.id
+                and not (proof.content or {}).get("validated_open_blocker_ids")
+            )
+        if outcome == "REVISE":
+            return (
+                proof.type == "research_plan_candidate"
+                and (proof.content or {}).get("parent_plan_id") == candidate.id
+            )
+        if outcome == "NEEDS_PLAN_REVISION":
+            return (
+                proof.type == "plan_revision_required"
+                and (proof.content or {}).get("plan_id") == candidate.id
+            )
+        return False
+
+    def recover_plan_review_for_continue(self, run_id: str) -> bool:
+        """Attempt the append-only reduced-scope recovery used by Continue."""
+        run = self.repository.get_run(run_id)
+        policies = [item for item in run.artifacts if item.type == "plan_review_policy"]
+        if len(policies) != 1:
+            return False
+        try:
+            frozen = validate_frozen_review_policy(policies[0].content or {})
+            self._validate_plan_governance_history(
+                run.artifacts,
+                policies[0],
+                frozen,
+                (frozen.get("research_constraints_reference") or {}),
+            )
+        except PlanReviewPolicyIntegrityError:
+            return False
+        return self._recover_plan_review_for_continue(run_id, policies[0], frozen) is not None
+
+    def _recover_plan_review_for_continue(self, run_id: str, policy_artifact, frozen_policy: dict):
+        """Re-adjudicate the latest reviewed candidate without rewriting its history."""
+        artifacts = self.repository.get_run(run_id).artifacts
+        candidates = [
+            item for item in artifacts
+            if item.type == "research_plan_candidate"
+            and (item.content or {}).get("policy_artifact_id") == policy_artifact.id
+        ]
+        if not candidates:
+            return None
+        candidate = max(candidates, key=lambda item: int((item.content or {}).get("round_index") or 0))
+        round_index = int((candidate.content or {}).get("round_index") or 0)
+        review = self._single_governance_artifact(
+            artifacts, "plan_review", policy_artifact.id,
+            round_index=round_index, plan_id=candidate.id,
+        )
+        if review is None:
+            return None
+        ledger = self._single_governance_artifact(
+            artifacts, "plan_review_issue_ledger", policy_artifact.id,
+            round_index=round_index, plan_id=candidate.id, review_id=review.id,
+        )
+        if ledger is None:
+            return None
+        existing = self._plan_review_recovery_for(
+            artifacts, policy_artifact, frozen_policy, candidate, review, ledger,
+        )
+        if existing is not None:
+            return existing
+        ledger_content = self._validate_plan_review_ledger(
+            ledger, policy_artifact, candidate, review, round_index, frozen_policy,
+        )
+        if not ledger_content.get("validated_open_blocker_ids"):
+            return ledger
+        previous = self._validated_prior_plan_ledger(
+            artifacts,
+            policy_artifact.id,
+            frozen_policy["policy_payload_sha256"],
+            round_index,
+            str((candidate.content or {}).get("parent_plan_id") or ""),
+        )
+        parent = next(
+            (item for item in artifacts if item.id == (candidate.content or {}).get("parent_plan_id")),
+            None,
+        )
+        changed = changed_contract_fields(
+            (parent.content or {}).get("normalized_plan") if parent else {},
+            (candidate.content or {}).get("normalized_plan") or {},
+            field_registry=frozen_policy["canonical_contract_field_registry"],
+            field_aliases=frozen_policy["contract_field_aliases"],
+        )
+        candidate_position = artifacts.index(candidate)
+        new_evidence = [item.id for item in artifacts[:candidate_position + 1]]
+        adjudication = adjudicate_review(
+            (previous.content or {}).get("issues") if previous else [],
+            review.content or {},
+            frozen_policy=frozen_policy,
+            round_index=round_index,
+            changed_fields=changed,
+            new_evidence_artifact_ids=new_evidence,
+            candidate_plan_id=candidate.id,
+            review_id=review.id,
+        )
+        if adjudication.validated_open_blocker_ids:
+            return None
+        payload = freeze_plan_review_recovery(
+            policy_artifact_id=policy_artifact.id,
+            policy_payload_sha256=frozen_policy["policy_payload_sha256"],
+            candidate_plan_id=candidate.id,
+            review_id=review.id,
+            ledger_id=ledger.id,
+            adjudication=adjudication,
+        )
+        return self.repository.add_artifact(
+            run_id,
+            "plan_review_recovery_adjudication",
+            f"Plan Review Recovery Adjudication Round {round_index}",
+            payload,
+            "research_plan",
+            "Plan Review Governance",
+            parent_artifact_id=ledger.id,
+        )
+
+    def _plan_review_recovery_for(
+        self, artifacts, policy_artifact, frozen_policy: dict, candidate, review, ledger,
+    ):
+        recoveries = [
+            item for item in artifacts
+            if item.type == "plan_review_recovery_adjudication"
+            and item.parent_artifact_id == ledger.id
+        ]
+        if len(recoveries) > 1:
+            raise PlanReviewPolicyIntegrityError("PLAN_REVIEW_POLICY_INTEGRITY:multiple_recovery")
+        if not recoveries:
+            return None
+        validate_plan_review_recovery(
+            recoveries[0].content or {},
+            policy_artifact_id=policy_artifact.id,
+            policy_payload_sha256=frozen_policy["policy_payload_sha256"],
+            candidate_plan_id=candidate.id,
+            review_id=review.id,
+            ledger_id=ledger.id,
+        )
+        return recoveries[0]
+
+    def _reconcile_plan_review_phases(
+        self, run_id: str, policy_artifact, frozen_policy: dict
+    ) -> None:
+        """Append only missing checkpoints whose immutable proof already exists."""
+        artifacts = self.repository.get_run(run_id).artifacts
+        candidates = sorted(
+            (
+                item
+                for item in artifacts
+                if item.type == "research_plan_candidate"
+                and (item.content or {}).get("policy_artifact_id")
+                == policy_artifact.id
+            ),
+            key=lambda item: int((item.content or {}).get("round_index") or 0),
+        )
+        for candidate in candidates:
+            round_index = int((candidate.content or {}).get("round_index") or 0)
+            self._append_plan_review_phase(
+                run_id,
+                policy_artifact,
+                candidate,
+                "CANDIDATE_CREATED",
+                candidate.id,
+            )
+            artifacts = self.repository.get_run(run_id).artifacts
+            review = self._single_governance_artifact(
+                artifacts,
+                "plan_review",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=candidate.id,
+            )
+            if review is None:
+                continue
+            self._append_plan_review_phase(
+                run_id, policy_artifact, candidate, "REVIEW_CREATED", review.id
+            )
+            artifacts = self.repository.get_run(run_id).artifacts
+            ledger = self._single_governance_artifact(
+                artifacts,
+                "plan_review_issue_ledger",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=candidate.id,
+                review_id=review.id,
+            )
+            if ledger is None:
+                continue
+            self._append_plan_review_phase(
+                run_id, policy_artifact, candidate, "LEDGER_COMMITTED", ledger.id
+            )
+            open_ids = list(
+                (ledger.content or {}).get("validated_open_blocker_ids") or []
+            )
+            recovery = self._plan_review_recovery_for(
+                artifacts, policy_artifact, frozen_policy, candidate, review, ledger,
+            )
+            if recovery is not None:
+                open_ids = list(
+                    (recovery.content or {}).get("validated_open_blocker_ids") or []
+                )
+            artifacts = self.repository.get_run(run_id).artifacts
+            if not open_ids:
+                if recovery is None:
+                    self._append_plan_review_phase(
+                        run_id,
+                        policy_artifact,
+                        candidate,
+                        "ROUND_COMPLETE",
+                        ledger.id,
+                        outcome="ACCEPT",
+                    )
+                continue
+            required = self._single_governance_artifact(
+                artifacts,
+                "plan_revision_required",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=candidate.id,
+            )
+            if required is not None:
+                self._append_plan_review_phase(
+                    run_id,
+                    policy_artifact,
+                    candidate,
+                    "ROUND_COMPLETE",
+                    required.id,
+                    outcome="NEEDS_PLAN_REVISION",
+                )
+                continue
+            request = self._single_governance_artifact(
+                artifacts,
+                "plan_review_revision_request",
+                policy_artifact.id,
+                round_index=round_index,
+                plan_id=candidate.id,
+            )
+            if request is None:
+                continue
+            self._append_plan_review_phase(
+                run_id,
+                policy_artifact,
+                candidate,
+                "REVISION_REQUESTED",
+                request.id,
+            )
+            artifacts = self.repository.get_run(run_id).artifacts
+            next_candidates = [
+                item
+                for item in artifacts
+                if item.type == "research_plan_candidate"
+                and (item.content or {}).get("policy_artifact_id")
+                == policy_artifact.id
+                and (item.content or {}).get("parent_plan_id") == candidate.id
+            ]
+            if not next_candidates:
+                continue
+            next_candidate = next_candidates[0]
+            self._append_plan_review_phase(
+                run_id,
+                policy_artifact,
+                candidate,
+                "REVISION_CREATED",
+                next_candidate.id,
+            )
+            self._append_plan_review_phase(
+                run_id,
+                policy_artifact,
+                candidate,
+                "ROUND_COMPLETE",
+                next_candidate.id,
+                outcome="REVISE",
+            )
+
+    @staticmethod
+    def _plan_review_round_identity(policy_id: str, round_index: int, plan_id: str) -> str:
+        return canonical_sha256(
+            {"policy_artifact_id": policy_id, "round_index": round_index, "plan_id": plan_id}
+        )
+
+    def _append_plan_review_phase(
+        self, run_id: str, policy_artifact, plan_candidate, phase: str, parent_id: str,
+        *, outcome: str = "",
+    ):
+        round_index = int((plan_candidate.content or {}).get("round_index") or 0)
+        identity = self._plan_review_round_identity(
+            policy_artifact.id, round_index, plan_candidate.id
+        )
+        policy_hash = str(
+            (policy_artifact.content or {}).get("policy_payload_sha256") or ""
+        )
+        existing = [
+            item
+            for item in self.repository.get_run(run_id).artifacts
+            if item.type == "plan_review_round_state"
+            and (item.content or {}).get("round_identity") == identity
+            and (item.content or {}).get("phase") == phase
+        ]
+        if len(existing) > 1:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:duplicate_round_phase"
+            )
+        if existing:
+            content = deepcopy(existing[0].content or {})
+            expected_hash = str(content.pop("round_state_payload_sha256", ""))
+            if (
+                existing[0].parent_artifact_id != parent_id
+                or not expected_hash
+                or canonical_sha256(content) != expected_hash
+                or content.get("policy_payload_sha256") != policy_hash
+                or content.get("phase_parent_id") != parent_id
+                or content.get("plan_id") != plan_candidate.id
+                or int(content.get("round_index") or 0) != round_index
+                or (outcome and content.get("outcome") != outcome)
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:round_phase_lineage"
+                )
+            return existing[0]
+        payload = {
+            "schema_version": 2,
+            "policy_artifact_id": policy_artifact.id,
+            "policy_payload_sha256": policy_hash,
+            "round_identity": identity,
+            "round_index": round_index,
+            "plan_id": plan_candidate.id,
+            "phase": phase,
+            "outcome": outcome,
+            "phase_parent_id": parent_id,
+        }
+        return self.repository.add_artifact(
+            run_id,
+            "plan_review_round_state",
+            f"Plan Review Round {round_index} {phase}",
+            {
+                **payload,
+                "round_state_payload_sha256": canonical_sha256(payload),
+            },
+            "research_plan",
+            "Plan Review Governance",
+            parent_artifact_id=parent_id,
+        )
+
+    @staticmethod
+    def _single_governance_artifact(
+        artifacts, artifact_type: str, policy_id: str, *, round_index: int,
+        plan_id: str = "", review_id: str = "",
+    ):
+        matches = [
+            item
+            for item in artifacts
+            if item.type == artifact_type
+            and (item.content or {}).get("policy_artifact_id") == policy_id
+            and int((item.content or {}).get("round_index") or 0) == round_index
+            and (not plan_id or (item.content or {}).get("plan_id") == plan_id)
+            and (not review_id or (item.content or {}).get("review_id") == review_id)
+        ]
+        if len(matches) > 1:
+            raise PlanReviewPolicyIntegrityError(
+                f"PLAN_REVIEW_POLICY_INTEGRITY:duplicate_{artifact_type}"
+            )
+        return matches[0] if matches else None
+
+    def _validated_prior_plan_ledger(
+        self, artifacts, policy_id: str, policy_hash: str, round_index: int,
+        parent_plan_id: str,
+    ):
+        if round_index == 1:
+            return None
+        candidate = next(
+            (item for item in artifacts if item.id == parent_plan_id and item.type == "research_plan_candidate"),
+            None,
+        )
+        if candidate is None:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:previous_candidate_missing"
+            )
+        review = self._single_governance_artifact(
+            artifacts, "plan_review", policy_id,
+            round_index=round_index - 1, plan_id=parent_plan_id,
+        )
+        if review is None:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:previous_review_missing"
+            )
+        ledger = self._single_governance_artifact(
+            artifacts, "plan_review_issue_ledger", policy_id,
+            round_index=round_index - 1, plan_id=parent_plan_id, review_id=review.id,
+        )
+        if ledger is None:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:previous_ledger_missing"
+            )
+        content = ledger.content or {}
+        payload = deepcopy(content)
+        expected_hash = str(payload.pop("ledger_payload_sha256", ""))
+        derived_open = [
+            item.get("issue_id")
+            for item in payload.get("issues") or []
+            if isinstance(item, dict)
+            and item.get("severity") == "BLOCKER"
+            and item.get("validated_blocker") is True
+            and item.get("status") in {"OPEN", "REOPENED"}
+        ]
+        if (
+            content.get("policy_payload_sha256") != policy_hash
+            or ledger.parent_artifact_id != review.id
+            or not expected_hash
+            or canonical_sha256(payload) != expected_hash
+            or derived_open != list(payload.get("validated_open_blocker_ids") or [])
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:previous_ledger"
+            )
+        return ledger
+
+    @staticmethod
+    def _validate_review_lineage(review, policy, candidate, round_index: int, frozen_policy: dict) -> None:
+        content = review.content or {}
+        if (
+            review.parent_artifact_id != candidate.id
+            or content.get("review_id") != review.id
+            or content.get("plan_id") != candidate.id
+            or content.get("policy_artifact_id") != policy.id
+            or content.get("policy_payload_sha256") != frozen_policy["policy_payload_sha256"]
+            or int(content.get("round_index") or 0) != round_index
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:review_lineage"
+            )
+
+    def _validate_plan_review_ledger(
+        self, ledger, policy, candidate, review, round_index: int, frozen_policy: dict,
+    ) -> dict:
+        content = deepcopy(ledger.content or {})
+        expected = str(content.pop("ledger_payload_sha256", ""))
+        if (
+            content.get("schema_version") != 2
+            or not expected
+            or canonical_sha256(content) != expected
+            or ledger.parent_artifact_id != review.id
+            or content.get("policy_artifact_id") != policy.id
+            or content.get("policy_payload_sha256") != frozen_policy["policy_payload_sha256"]
+            or content.get("plan_id") != candidate.id
+            or content.get("review_id") != review.id
+            or int(content.get("round_index") or 0) != round_index
+            or content.get("round_identity") != self._plan_review_round_identity(
+                policy.id, round_index, candidate.id
+            )
+            or not isinstance(content.get("issues"), list)
+            or not isinstance(content.get("validated_open_blocker_ids"), list)
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:ledger"
+            )
+        derived_open = [
+            item.get("issue_id")
+            for item in content["issues"]
+            if isinstance(item, dict)
+            and item.get("severity") == "BLOCKER"
+            and item.get("validated_blocker") is True
+            and item.get("status") in {"OPEN", "REOPENED"}
+        ]
+        if derived_open != content["validated_open_blocker_ids"]:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:ledger_open_projection"
+            )
+        return {**content, "ledger_payload_sha256": expected}
+
+    def _ensure_plan_review_policy(
+        self,
+        run_id: str,
+        *,
+        package: RuntimePackage,
+        run,
+        latest: dict,
+        selection: dict,
+        constraints_artifact,
+    ):
+        policies = [item for item in run.artifacts if item.type == "plan_review_policy"]
+        if len(policies) > 1:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:multiple_policy_artifacts"
+            )
+        if policies:
+            existing = policies[0]
+            content = validate_frozen_review_policy(existing.content or {})
+            self._validate_plan_review_policy_lineage(
+                run, existing, content, constraints_artifact
+            )
+            return existing, content
+
+        governance_history = [
+            item
+            for item in run.artifacts
+            if item.type in {
+                "plan_review_issue_ledger",
+                "plan_review_round_state",
+                "plan_review_revision_request",
+                "plan_review_change_request",
+                "plan_refinement_proposal",
+                "plan_revision_required",
+                "plan_governance_migration",
+            }
+            or (
+                item.type in {"research_plan_candidate", "plan_review", "plan"}
+                and bool((item.content or {}).get("policy_artifact_id"))
+            )
+        ]
+        if governance_history:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:policy_missing_with_governance_history"
+            )
+
+        loaded = self.skill_loader.load_policy("plan-review-governance")
+        contexts = [self.skill_loader.load_complete(skill_id) for skill_id in package.skill_ids]
+        skill_snapshots = [
+            {
+                "skill_name": context.id,
+                "normalized_content": normalize_skill_content(context.instructions),
+            }
+            for context in contexts
+        ]
+        problem = deepcopy((latest.get("problem").content if latest.get("problem") else {}) or {})
+        selected = (
+            (selection.get("selected") or [{}])[0]
+            if isinstance(selection, dict)
+            else {}
+        )
+        selected = selected if isinstance(selected, dict) else {}
+        non_goals = problem.get("non_goals") or problem.get("out_of_scope") or []
+        if isinstance(non_goals, str):
+            non_goals = [non_goals]
+        elif not isinstance(non_goals, list):
+            non_goals = []
+        constraints_reference = {
+            "artifact_id": constraints_artifact.id,
+            "schema_version": int((constraints_artifact.content or {}).get("schema_version") or 1),
+        }
+        legacy_plan_artifacts = [
+            item
+            for item in run.artifacts
+            if item.source_step == "research_plan"
+            and item.type not in {"scientific_world_state"}
+        ]
+        migration_artifact_id = ""
+        policy_artifact_id = ""
+        legacy_plan_artifact = None
+        if legacy_plan_artifacts:
+            migration_artifact_id = f"art_{uuid4().hex[:12]}"
+            policy_artifact_id = f"art_{uuid4().hex[:12]}"
+            legacy_plan_artifact = next(
+                (item for item in reversed(legacy_plan_artifacts) if item.type == "plan"),
+                next(
+                    (
+                        item
+                        for item in reversed(legacy_plan_artifacts)
+                        if item.type == "research_plan_candidate"
+                    ),
+                    legacy_plan_artifacts[-1],
+                ),
+            )
+        parent_artifact_id = (
+            migration_artifact_id
+            if migration_artifact_id
+            else latest.get("hypothesis_selection").id
+            if latest.get("hypothesis_selection")
+            else constraints_artifact.id
+        )
+        contract_snapshot = authoritative_plan_contract()
+        review_runtime_contract = build_plan_review_runtime_contract(
+            package.instructions,
+            contract_snapshot,
+            PLAN_REVIEW_FIXED_INSTRUCTIONS,
+        )
+        revision_runtime_contract = build_plan_revision_runtime_contract(
+            package.instructions,
+            contract_snapshot,
+            PLAN_REVISION_FIXED_INSTRUCTIONS,
+        )
+        frozen = freeze_review_policy(
+            loaded.content,
+            policy_sha256=loaded.sha256,
+            active_skill_ids=package.skill_ids,
+            instruction_hashes=package.audit.get("skill_hashes") or {},
+            skill_snapshots=skill_snapshots,
+            runtime_instructions=package.instructions,
+            review_runtime_contract_snapshot=review_runtime_contract,
+            revision_runtime_contract_snapshot=revision_runtime_contract,
+            authoritative_plan_contract_snapshot=contract_snapshot,
+            canonical_contract_field_registry=CANONICAL_PLAN_CONTRACT_FIELDS,
+            contract_field_aliases=FIELD_ALIAS_TO_CANONICAL,
+            planner_fixed_review_instructions=PLAN_REVIEW_FIXED_INSTRUCTIONS,
+            planner_fixed_revision_instructions=PLAN_REVISION_FIXED_INSTRUCTIONS,
+            review_prompt_schema_snapshot=plan_review_schema_snapshot(),
+            revision_prompt_schema_snapshot=plan_revision_schema_snapshot(),
+            prompt_schema_version=PLAN_REVIEW_PROMPT_SCHEMA_VERSION,
+            governance_semantic_version=GOVERNANCE_IMPLEMENTATION_SEMANTIC_VERSION,
+            max_content_revisions=self.max_deepseek_plan_revision,
+            problem_anchor={
+                "original_question": run.problem_input,
+                "selected_primary_claim": str(
+                    selected.get("claim")
+                    or (selected.get("idea_card") or {}).get("claim")
+                    or ""
+                ),
+                "non_goals": deepcopy(non_goals),
+                "frozen_constraints": deepcopy(constraints_artifact.content or {}),
+                "structured_problem_artifact_id": latest.get("problem").id if latest.get("problem") else "",
+                "hypothesis_selection_artifact_id": latest.get("hypothesis_selection").id if latest.get("hypothesis_selection") else "",
+            },
+            research_constraints_reference=constraints_reference,
+            source_artifact_lineage={
+                "parent_artifact_id": parent_artifact_id,
+                "problem_artifact_id": latest.get("problem").id if latest.get("problem") else "",
+                "hypothesis_selection_artifact_id": latest.get("hypothesis_selection").id if latest.get("hypothesis_selection") else "",
+                "constraints_artifact_id": constraints_artifact.id,
+                "migration_artifact_id": migration_artifact_id,
+            },
+        )
+        if migration_artifact_id:
+            legacy_lineage = [
+                {
+                    "artifact_id": item.id,
+                    "artifact_type": item.type,
+                    "artifact_content_sha256": canonical_sha256(item.content or {}),
+                    "parent_artifact_id": item.parent_artifact_id or "",
+                    "version": int(item.version),
+                }
+                for item in legacy_plan_artifacts
+            ]
+            migration_content = freeze_plan_governance_migration(
+                legacy_plan_id=legacy_plan_artifact.id,
+                legacy_plan_content=legacy_plan_artifact.content or {},
+                legacy_lineage=legacy_lineage,
+                frozen_policy_artifact_id=policy_artifact_id,
+                frozen_policy_payload=frozen,
+                migration_source_state={
+                    "run_id": run.id,
+                    "run_status": run.status,
+                    "current_step": run.current_step,
+                    "legacy_artifact_ids": [item.id for item in legacy_plan_artifacts],
+                },
+            )
+            _, artifact = self.repository.add_artifacts_atomic(
+                run_id,
+                [
+                    {
+                        "artifact_id": migration_artifact_id,
+                        "artifact_type": "plan_governance_migration",
+                        "title": "Plan Governance Migration Boundary",
+                        "content": migration_content,
+                        "source_step": "research_plan",
+                        "created_by": "Plan Review Governance",
+                        "parent_artifact_id": legacy_plan_artifact.id,
+                    },
+                    {
+                        "artifact_id": policy_artifact_id,
+                        "artifact_type": "plan_review_policy",
+                        "title": "Frozen Plan Review Policy",
+                        "content": frozen,
+                        "source_step": "research_plan",
+                        "created_by": "Plan Review Governance",
+                        "parent_artifact_id": migration_artifact_id,
+                    },
+                ],
+            )
+        else:
+            artifact = self.repository.add_artifact(
+                run_id,
+                "plan_review_policy",
+                "Frozen Plan Review Policy",
+                frozen,
+                "research_plan",
+                "Plan Review Governance",
+                parent_artifact_id=parent_artifact_id,
+            )
+        return artifact, frozen
+
+    @staticmethod
+    def _validate_plan_review_policy_lineage(run, artifact, content: dict, constraints_artifact) -> None:
+        artifacts = {item.id: item for item in run.artifacts}
+        lineage = content.get("source_artifact_lineage") or {}
+        if artifact.parent_artifact_id != lineage.get("parent_artifact_id"):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:parent_lineage"
+            )
+        typed = {
+            "problem_artifact_id": "problem",
+            "hypothesis_selection_artifact_id": "hypothesis_selection",
+            "constraints_artifact_id": "research_constraints",
+        }
+        for field, artifact_type in typed.items():
+            artifact_id = str(lineage.get(field) or "")
+            if not artifact_id or artifact_id not in artifacts or artifacts[artifact_id].type != artifact_type:
+                raise PlanReviewPolicyIntegrityError(
+                    f"PLAN_REVIEW_POLICY_INTEGRITY:{field}"
+                )
+        constraints_reference = content.get("research_constraints_reference") or {}
+        if (
+            constraints_reference.get("artifact_id") != constraints_artifact.id
+            or lineage.get("constraints_artifact_id") != constraints_artifact.id
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:constraints_lineage"
+            )
+        anchor = content.get("problem_anchor") or {}
+        if (
+            anchor.get("original_question") != run.problem_input
+            or anchor.get("structured_problem_artifact_id") != lineage.get("problem_artifact_id")
+            or anchor.get("hypothesis_selection_artifact_id")
+            != lineage.get("hypothesis_selection_artifact_id")
+            or anchor.get("frozen_constraints") != constraints_artifact.content
+        ):
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:anchor_lineage"
+            )
+        migration_id = str(lineage.get("migration_artifact_id") or "")
+        migrations = [
+            item for item in run.artifacts if item.type == "plan_governance_migration"
+        ]
+        if migration_id:
+            if (
+                len(migrations) != 1
+                or migration_id not in artifacts
+                or artifacts[migration_id].type != "plan_governance_migration"
+                or artifact.parent_artifact_id != migration_id
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:migration_lineage"
+                )
+            migration = artifacts[migration_id]
+            migration_content = validate_plan_governance_migration(
+                migration.content or {},
+                frozen_policy_artifact_id=artifact.id,
+                frozen_policy_payload=content,
+            )
+            legacy_plan_id = str(migration_content.get("legacy_plan_id") or "")
+            legacy_plan = artifacts.get(legacy_plan_id)
+            positions = {item.id: index for index, item in enumerate(run.artifacts)}
+            if (
+                legacy_plan is None
+                or migration.parent_artifact_id != legacy_plan_id
+                or canonical_sha256(legacy_plan.content or {})
+                != migration_content.get("legacy_plan_hash")
+                or not (
+                    positions[legacy_plan_id]
+                    < positions[migration_id]
+                    < positions[artifact.id]
+                )
+            ):
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:migration_legacy_plan"
+                )
+            for row in migration_content.get("legacy_lineage") or []:
+                source = artifacts.get(str(row.get("artifact_id") or ""))
+                if (
+                    source is None
+                    or source.type != row.get("artifact_type")
+                    or int(source.version) != int(row.get("version") or 0)
+                    or (source.parent_artifact_id or "")
+                    != str(row.get("parent_artifact_id") or "")
+                    or canonical_sha256(source.content or {})
+                    != row.get("artifact_content_sha256")
+                    or positions[source.id] >= positions[migration_id]
+                ):
+                    raise PlanReviewPolicyIntegrityError(
+                        "PLAN_REVIEW_POLICY_INTEGRITY:migration_legacy_lineage"
+                    )
+        elif migrations:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:unexpected_migration"
+            )
+
+    @staticmethod
+    def _plan_candidate_content(artifacts, artifact_id: str) -> dict:
+        if not artifact_id:
+            return {}
+        artifact = next(
+            (
+                item
+                for item in artifacts
+                if item.id == artifact_id and item.type == "research_plan_candidate"
+            ),
+            None,
+        )
+        return deepcopy((artifact.content or {}).get("normalized_plan") or {}) if artifact else {}
+
+    @staticmethod
+    def _new_plan_review_input_artifact_ids(
+        artifacts, previous_review_artifact_id: str
+    ) -> tuple[str, ...]:
+        if not previous_review_artifact_id:
+            return ()
+        previous_index = next(
+            (
+                index
+                for index, artifact in enumerate(artifacts)
+                if artifact.id == previous_review_artifact_id
+            ),
+            None,
+        )
+        if previous_index is None:
+            return ()
+        return tuple(
+            artifact.id
+            for artifact in artifacts[previous_index + 1 :]
+            if artifact.source_step != "research_plan"
+        )
 
     @staticmethod
     def _plan_review_failure(exc: Exception, attempt: int) -> dict:
@@ -4297,7 +6613,13 @@ class WorkflowEngine:
 
     @staticmethod
     def _research_plan_review_context(run, latest: dict, selection: dict,
-                                      plan: dict, dataset_options: list[dict]) -> dict:
+                                      plan: dict, dataset_options: list[dict], *,
+                                      frozen_policy: dict | None = None,
+                                      issue_ledger: list[dict] | None = None,
+                                      round_index: int = 1,
+                                      changed_fields: tuple[str, ...] = (),
+                                      new_evidence_artifact_ids: tuple[str, ...] = (),
+                                      candidate_plan_id: str = "") -> dict:
         problem = compact_problem(latest["problem"].content)
         evidence_content = latest.get("evidence").content if latest.get("evidence") else {}
         references = evidence_content.get("core_references") or evidence_content.get("references") or []
@@ -4320,7 +6642,31 @@ class WorkflowEngine:
                 "selected_hypothesis_evidence_digest": selected_digest,
             },
             "current_research_plan": plan,
-            "authoritative_plan_contract": authoritative_plan_contract(),
+            "current_candidate_plan_id": candidate_plan_id,
+            "review_mode": "initial" if round_index == 1 else "revision",
+            "review_round": round_index,
+            "frozen_plan_review_policy": deepcopy(frozen_policy or {}),
+            "previous_issue_ledger": deepcopy(issue_ledger or []),
+            "open_validated_blockers": [
+                deepcopy(item)
+                for item in issue_ledger or []
+                if item.get("severity") == "BLOCKER"
+                and item.get("status") in {"OPEN", "REOPENED"}
+                and item.get("validated_blocker") is True
+            ],
+            "closed_issue_ledger": [
+                deepcopy(item)
+                for item in issue_ledger or []
+                if item.get("status") == "CLOSED"
+            ],
+            "artifact_chronology": {
+                "changed_contract_fields": list(changed_fields),
+                "new_input_artifact_ids": list(new_evidence_artifact_ids),
+            },
+            "authoritative_plan_contract": deepcopy(
+                (frozen_policy or {}).get("authoritative_plan_contract_snapshot")
+                or {}
+            ),
             "dataset_profile": profile,
             "available_split_information": {
                 "dataset_card": ((plan.get("dataset") or {}).get("card") or {}),
@@ -4349,6 +6695,8 @@ class WorkflowEngine:
         )
         if not has_locked:
             return False
+        if step_id == "experiment_task" and self._formal_validation_pending(artifacts):
+            return False
         latest = self._latest_by_type(artifacts)
         if step_id == "feedback_revision":
             result = latest.get("experiment_result")
@@ -4376,6 +6724,36 @@ class WorkflowEngine:
             and reasoning.source_step == "evidence_reasoning"
             and hypothesis is not None
             and reasoning.parent_artifact_id == hypothesis.id
+        )
+
+    @staticmethod
+    def _is_smoke_preflight_failure(result: dict) -> bool:
+        return (
+            str(result.get("status") or "").lower() == "failed"
+            and str(result.get("error") or "").startswith(
+                "EXPERIMENT_BUNDLE_SMOKE_TEST_FAILED:"
+            )
+        )
+
+    @staticmethod
+    def _formal_validation_pending(artifacts) -> bool:
+        latest_evidence = next(
+            (item for item in reversed(artifacts) if item.type == "result_evidence"),
+            None,
+        )
+        if not latest_evidence:
+            return False
+        content = latest_evidence.content or {}
+        if (
+            content.get("stage") != "small_scale"
+            or content.get("route") != "expand_validation"
+        ):
+            return False
+        return not any(
+            item.type == "experiment_task"
+            and (item.content or {}).get("phase2_protocol", {}).get("stage")
+            == "formal_validation"
+            for item in artifacts
         )
 
     def _trace(

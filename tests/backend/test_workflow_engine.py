@@ -122,6 +122,12 @@ class RecordingLLM:
                 "metrics": ["accuracy"],
                 "expected_result": "dropout improves or narrows claim",
             }
+        if task == "planning.review_plan":
+            return {
+                "verdict": "ACCEPT", "issues": [], "required_changes": [],
+                "suggested_fixes": [], "revised_plan_guidance": [],
+                "experiment_feasibility": "FEASIBLE",
+            }
         if task == "planning.refine_plan":
             return {
                 **inputs["current_plan"],
@@ -487,7 +493,7 @@ def test_evidence_reasoning_resume_reuses_completed_candidate_checkpoints(tmp_pa
                 return {"candidates": [{
                         "claim": f"candidate {index}", "verifiability": "test",
                         "novelty_basis": [], "risks": [], "source_gap_ids": ["GAP-001"],
-                } for index in range(4)]}
+                } for index in range(3)]}
             if task == "idea_selection.review":
                 return {"evaluations": [
                     self._idea_evaluation(index, candidate, 4 - index / 10, "GO")
@@ -496,9 +502,9 @@ def test_evidence_reasoning_resume_reuses_completed_candidate_checkpoints(tmp_pa
             if task == "critic.evidence_reasoning":
                 claim = inputs["hypothesis"]["claim"]
                 self.critic_claims.append(claim)
-                if claim == "candidate 3" and not self.failed:
+                if claim == "candidate 2" and not self.failed:
                     self.failed = True
-                    raise RuntimeError("CANDIDATE_PROVIDER_FAILURE")
+                    raise RuntimeError("MODEL_REQUEST_TIMEOUT:provider=deepseek")
             return super().generate_json(task, inputs, schema_hint, instructions)
 
     llm = FailFourthOnce()
@@ -506,19 +512,32 @@ def test_evidence_reasoning_resume_reuses_completed_candidate_checkpoints(tmp_pa
     for step_id in ["problem_understanding", "knowledge_integration", "hypothesis_generation"]:
         run = engine.run_step(run.id, step_id)
 
-    with pytest.raises(RuntimeError, match="CANDIDATE_PROVIDER_FAILURE"):
-        engine.run_step(run.id, "evidence_reasoning")
-    assert llm.critic_claims == ["candidate 0", "candidate 1", "candidate 2", "candidate 3"]
+    from backend.app.workflow.orchestrator import WorkflowOrchestrator
+
+    orchestrator = WorkflowOrchestrator(engine.repository, lambda: engine)
+    orchestrator._drive(run.id)
+    interrupted = engine.repository.get_run(run.id)
+    assert interrupted.status == "RECOVERABLE_PROVIDER_ERROR"
+    step = next(item for item in interrupted.steps if item.id == "evidence_reasoning")
+    assert step.status == "interrupted"
+    assert llm.critic_claims == ["candidate 0", "candidate 1", "candidate 2"]
     checkpoints = [
         artifact for artifact in engine.repository.get_run(run.id).artifacts
         if artifact.type == "candidate_reasoning_checkpoint"
     ]
-    assert [item.content["candidate_index"] for item in checkpoints] == [0, 1, 2]
+    assert [item.content["candidate_index"] for item in checkpoints] == [0, 1]
+    events = [item for item in interrupted.events if item.step_id == "evidence_reasoning"]
+    interrupted_event = next(item for item in events if item.data.get("status") == "interrupted")
+    assert interrupted_event.data == {
+        "status": "interrupted", "candidate_index": 2, "candidate_id": "CAND-003",
+        "completed_count": 2, "recoverable": True,
+        "error_code": "MODEL_REQUEST_TIMEOUT",
+    }
 
-    engine.run_step(run.id, "evidence_reasoning")
+    orchestrator._drive(run.id)
 
     assert llm.critic_claims == [
-        "candidate 0", "candidate 1", "candidate 2", "candidate 3", "candidate 3"
+        "candidate 0", "candidate 1", "candidate 2", "candidate 2"
     ]
 
 
@@ -1109,10 +1128,16 @@ def test_engine_validates_every_workflow_step_before_persisting_output(tmp_path)
     for step_id in ORDER[4:-1]:
         run = engine.run_step(run.id, step_id)
     revision = [artifact for artifact in run.artifacts if artifact.type == "revision"][-1]
+    if revision.content["requires_follow_up"]:
+        run = engine.run_step(run.id, "research_plan")
     while revision.content["requires_follow_up"]:
         for step_id in ["experiment_task", "experiment_run_analysis", "feedback_revision"]:
             run = engine.run_step(run.id, step_id)
         revision = [artifact for artifact in run.artifacts if artifact.type == "revision"][-1]
+        if revision.content["requires_follow_up"]:
+            # Feedback produces an unaccepted plan proposal.  The proposal must
+            # pass the same frozen governance path before another experiment.
+            run = engine.run_step(run.id, "research_plan")
     run = engine.run_step(run.id, "report_export")
 
     assert set(supervisor.validated_steps) == set(ORDER)
@@ -1176,6 +1201,7 @@ def test_research_plan_trace_records_routed_skills(tmp_path):
         "research-refine",
         "hypothesis-experiment-gate",
         "experiment-plan",
+        "plan-review-governance",
     ]
     assert supervisor_call["skills"] == expected_skills
     assert runtime_call["skills"] == expected_skills
@@ -1753,6 +1779,7 @@ def test_rerunning_analysis_keeps_the_latest_feedback_iteration_lineage(tmp_path
         "experiment_task",
         "experiment_run_analysis",
         "feedback_revision",
+        "research_plan",
         "experiment_task",
         "experiment_run_analysis",
     ]:
@@ -2085,16 +2112,22 @@ def test_failed_experiment_result_reaches_feedback_and_enables_second_task(tmp_p
     run = engine.run_step(run.id, "experiment_run_analysis")
 
     run = engine.run_step(run.id, "feedback_revision")
+    feedback_event = run.events[-1]
     feedback = [artifact for artifact in run.artifacts if artifact.type == "revision"][-1]
     route = [
-        call for call in run.events[-1].tool_calls if call["provider"] == "skill_runtime"
+        call for call in feedback_event.tool_calls if call["provider"] == "skill_runtime"
     ][-1]
 
     assert feedback.content["verdict"] == "failed"
     assert feedback.content["requires_follow_up"] is True
     assert "ablation-planner" in route["skills"]
-    assert len([artifact for artifact in run.artifacts if artifact.type == "plan"]) == 2
+    assert len([artifact for artifact in run.artifacts if artifact.type == "plan"]) == 1
+    assert len(
+        [artifact for artifact in run.artifacts if artifact.type == "plan_refinement_proposal"]
+    ) == 1
 
+    run = engine.run_step(run.id, "research_plan")
+    assert len([artifact for artifact in run.artifacts if artifact.type == "plan"]) == 2
     run = engine.run_step(run.id, "experiment_task")
     assert len([artifact for artifact in run.artifacts if artifact.type == "experiment_task"]) == 2
 
@@ -2215,10 +2248,11 @@ def test_planning_agent_refinement_uses_full_plan_schema_and_inputs():
         "selection": selection,
         "current_plan": current_plan,
         "experiment_result": experiment_result,
-        "feedback": feedback,
-        "dataset_options": [],
-        "plan_context": {},
-    }
+            "feedback": feedback,
+            "dataset_options": [],
+            "observed_structure": [],
+            "plan_context": {},
+        }
     assert refine_call[2] == build_call[2]
     assert refine_call[3].startswith("refine\n\nAuthoritative Plan Contract")
     assert "capacity_confounder" in refine_call[2]
@@ -2424,9 +2458,15 @@ def test_first_partial_feedback_refines_plan_and_preserves_history(tmp_path):
     result = [artifact for artifact in run.artifacts if artifact.type == "experiment_result"][-1]
 
     run = engine.run_step(run.id, "feedback_revision")
+    feedback_event = run.events[-1]
 
     revisions = [artifact for artifact in run.artifacts if artifact.type == "revision"]
     plans = [artifact for artifact in run.artifacts if artifact.type == "plan"]
+    proposals = [
+        artifact
+        for artifact in run.artifacts
+        if artifact.type == "plan_refinement_proposal"
+    ]
     feedback = revisions[-1].content
     assert feedback["verdict"] == "partial"
     assert feedback["iteration"] == 1
@@ -2437,15 +2477,20 @@ def test_first_partial_feedback_refines_plan_and_preserves_history(tmp_path):
     assert feedback["unsupported_claims"] == []
     assert feedback["next_action"] == "add a fixed-seed ablation"
     assert feedback["evidence_links"] == []
-    assert feedback["revised_plan"] == plans[-1].content
+    assert feedback["revised_plan"] == proposals[-1].content["normalized_plan"]
     assert revisions[-1].parent_artifact_id == result.id
-    assert len(plans) == 2
+    assert len(plans) == 1
     assert plans[0].id == original_plan.id
-    assert plans[-1].source_step == "research_plan"
-    assert plans[-1].parent_artifact_id == revisions[-1].id
+    assert proposals[-1].source_step == "research_plan"
+    assert proposals[-1].parent_artifact_id == revisions[-1].id
     assert len([artifact for artifact in run.artifacts if artifact.type == "experiment_task"]) == 1
     assert len([artifact for artifact in run.artifacts if artifact.type == "experiment_bundle"]) == 1
     assert len([artifact for artifact in run.artifacts if artifact.type == "experiment_result"]) == 1
+
+    run = engine.run_step(run.id, "research_plan")
+    plans = [artifact for artifact in run.artifacts if artifact.type == "plan"]
+    assert len(plans) == 2
+    assert plans[-1].parent_artifact_id == plans[-1].content["plan_candidate_id"]
 
     refine_inputs = next(inputs for task, inputs in llm.inputs if task == "planning.refine_plan")
     selection = [
@@ -2460,7 +2505,7 @@ def test_first_partial_feedback_refines_plan_and_preserves_history(tmp_path):
     assert claim_inputs["analysis"] == result.content["analysis"]
     assert claim_inputs["audit"] == result.content["audit"]
     route = [
-        call for call in run.events[-1].tool_calls if call["provider"] == "skill_runtime"
+        call for call in feedback_event.tool_calls if call["provider"] == "skill_runtime"
     ][-1]
     assert route["skills"] == [
         "experiment-iteration",
@@ -2469,8 +2514,8 @@ def test_first_partial_feedback_refines_plan_and_preserves_history(tmp_path):
         "experiment-plan",
         "ablation-planner",
     ]
-    assert run.events[-1].output_summary["iteration"] == 1
-    assert run.events[-1].output_summary["requires_follow_up"] is True
+    assert feedback_event.output_summary["iteration"] == 1
+    assert feedback_event.output_summary["requires_follow_up"] is True
 
 
 def test_feedback_iteration_retrieves_evidence_and_selects_a_direction(tmp_path):
@@ -2531,6 +2576,7 @@ def test_second_partial_feedback_stops_without_creating_third_plan(tmp_path):
     run = _selected_hypothesis_run(engine, repository)
     run = _run_through_experiment(engine, run)
     run = engine.run_step(run.id, "feedback_revision")
+    run = engine.run_step(run.id, "research_plan")
     run = engine.run_step(run.id, "experiment_task")
     run = engine.run_step(run.id, "experiment_run_analysis")
 
@@ -2620,7 +2666,10 @@ def test_duplicate_feedback_for_same_result_is_idempotent(tmp_path):
     duplicate = engine.run_step(run.id, "feedback_revision")
 
     assert len([artifact for artifact in duplicate.artifacts if artifact.type == "revision"]) == 1
-    assert len([artifact for artifact in duplicate.artifacts if artifact.type == "plan"]) == 2
+    assert len([artifact for artifact in duplicate.artifacts if artifact.type == "plan"]) == 1
+    assert len(
+        [artifact for artifact in duplicate.artifacts if artifact.type == "plan_refinement_proposal"]
+    ) == 1
     assert llm.review_count == 1
     assert duplicate.updated_at == first.updated_at
 
@@ -2633,6 +2682,7 @@ def test_locked_feedback_for_previous_result_does_not_skip_new_result(tmp_path):
     run = engine.run_step(run.id, "feedback_revision")
     first_revision = [artifact for artifact in run.artifacts if artifact.type == "revision"][-1]
     repository.lock_artifact(run.id, first_revision.id, True)
+    run = engine.run_step(run.id, "research_plan")
     run = engine.run_step(run.id, "experiment_task")
     run = engine.run_step(run.id, "experiment_run_analysis")
 

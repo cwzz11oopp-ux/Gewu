@@ -23,14 +23,23 @@ test("create research resets to a blank topic and Part A starts research", async
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
   const controls = await readSource("src/components/RunControls.tsx");
 
-  assert.match(app, /const EMPTY_TOPIC = \{\s*domain: "",\s*problem: "",\s*constraints: "",\s*\}/);
+  assert.match(app, /const EMPTY_TOPIC = \{\s*domain: "",\s*problem: "",\s*constraints: "",\s*githubRepositoryUrl: "",\s*\}/);
   assert.match(app, /function createResearch\(\)/);
   assert.match(app, /setRun\(null\)/);
   assert.match(app, /setTopicDraft\(EMPTY_TOPIC\)/);
   assert.match(workbench, /onStartResearch/);
-  assert.match(workbench, /topicChanged \? "新建并开始研究" : "开始研究"/);
+  assert.match(workbench, /onCreate=\{onCreate\}/);
+  assert.match(workbench, /onStart=\{handleResearchStart\}/);
   assert.match(controls, />\s*创建研究\s*<\/button>/);
   assert.doesNotMatch(controls, /创建研究 Run/);
+});
+
+test("hypothesis revision starts an append-only hypothesis round while other runs continue normally", async () => {
+  const workbench = await readSource("src/pages/WorkbenchPage.tsx");
+
+  assert.match(workbench, /onStartResearch, onRerunFrom, onContinuePipeline/);
+  assert.match(workbench, /const handleResearchStart = !run\s*\? onStartResearch\s*: run\.status === "hypothesis_revision_required"\s*\? \(\) => onRerunFrom\("hypothesis_generation"\)\s*: governanceHold\s*\? \(\) => undefined\s*: onContinuePipeline/);
+  assert.match(workbench, /onStart=\{handleResearchStart\}/);
 });
 
 test("edited topic creates a new run instead of continuing mismatched artifacts", async () => {
@@ -40,16 +49,14 @@ test("edited topic creates a new run instead of continuing mismatched artifacts"
 
   assert.match(app, /function topicMatchesRun\(run: RunRecord, draft: typeof EMPTY_TOPIC\)/);
   assert.match(startBody, /current === null \|\| !topicMatchesRun\(current, topicDraft\)/);
-  assert.match(startBody, /api\.createRun\(title, topicDraft\.problem, topicDraft\.domain, topicDraft\.constraints\)/);
-  assert.match(workbench, /const topicChanged = Boolean\(/);
-  assert.match(workbench, /检测到研究主题已修改。点击下方按钮会自动创建一个新 Run/);
-  assert.match(workbench, /topicChanged \? "新建并开始研究" : "开始研究"/);
+  assert.match(startBody, /api\.createRun\(title, topicDraft\.problem, topicDraft\.domain, topicDraft\.constraints, topicDraft\.githubRepositoryUrl\)/);
+  assert.match(workbench, /onQuestionChange=\{\(problem\) => onTopicDraftChange/);
+  assert.match(workbench, /githubRepositoryUrl=\{topicDraft\.githubRepositoryUrl\}/);
 });
 
-test("run-changing entry points are guarded and their controls are disabled while busy", async () => {
+test("run-changing entry points are guarded and their current workspace controls receive busy state", async () => {
   const app = await readSource("src/App.tsx");
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
-  const controls = await readSource("src/components/RunControls.tsx");
   const modal = await readSource("src/components/ProjectSettingsModal.tsx");
   const createBody = extractFunction(app, "createResearch");
   const startBody = extractFunction(app, "startResearch");
@@ -60,14 +67,11 @@ test("run-changing entry points are guarded and their controls are disabled whil
   assert.match(startBody, /^\s*if \(!topicDraft\.problem\.trim\(\) \|\| researchRunning \|\| activeStepId !== null\) return/);
   assert.match(loadBody, /^\s*if \(researchRunning \|\| activeStepId !== null\) return/);
   assert.match(deleteBody, /^\s*if \(researchRunning \|\| activeStepId !== null\) return/);
-  assert.match(workbench, /<RunControls[^>]*isBusy=\{isBusy\}/s);
-  assert.match(app, /<ProjectSettingsModal[\s\S]*?isBusy=\{isBusy\}[\s\S]*?\/>/);
-  assert.match(controls, /isBusy: boolean/);
-  assert.equal((controls.match(/disabled=\{isBusy\}/g) ?? []).length, 2);
+  assert.match(workbench, /const busy = researchRunning \|\| activeStepId !== null/);
+  assert.match(workbench, /busy=\{busy\}/);
+  assert.match(app, /<ProjectSettingsModal[\s\S]*?isBusy=\{isBusy\}/);
   assert.match(modal, /isBusy: boolean/);
-  assert.match(extractFunction(modal, "loadRun"), /^\s*if \(isBusy\) return/);
-  assert.match(extractFunction(modal, "deleteRun"), /^\s*if \(isBusy\) return/);
-  assert.match(modal, /className="history-item"[^>]*disabled=\{isBusy\}/s);
+  assert.match(modal, /disabled=\{isBusy\}/);
   assert.match(modal, /className="danger-button"[^>]*disabled=\{isBusy\}/s);
 });
 
@@ -169,7 +173,7 @@ test("step API calls expose active and failed step state and always clear activi
   assert.match(rerunBody, /^\s*if \(!run \|\| researchRunning \|\| activeStepId !== null\) return/);
   assert.match(workbench, /activeStepId=\{activeStepId\}/);
   assert.match(workbench, /failedStepId=\{failedStepId\}/);
-  assert.match(workbench, /<HypothesisBoard[\s\S]*activeStepId=\{activeStepId\}/);
+  assert.match(workbench, /busy=\{busy\}/);
 });
 
 test("failed experiment result does not count as completed pipeline output", async () => {
@@ -257,44 +261,36 @@ test("backend automatic research performs a bounded feedback loop before export"
   assert.match(rerunBody, /AUTO_RESUME_AFTER_RERUN\.has\(stepId\)[\s\S]*api\.startPipeline\(updated\.id\)/);
 });
 
-test("research and literature cards appear before the pipeline", async () => {
+test("workspace routes research, idea, experiment, and results views through one model", async () => {
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
-  const topicIndex = workbench.indexOf("research-topic-card");
-  const literatureIndex = workbench.indexOf("<EvidenceTable");
-  const pipelineIndex = workbench.indexOf("<PipelineTimeline");
-
-  assert.ok(topicIndex >= 0 && literatureIndex > topicIndex && pipelineIndex > literatureIndex);
+  assert.match(workbench, /buildResearchViewModel\(run, report, experimentProgress\)/);
+  assert.match(workbench, /<ResearchPage/);
+  assert.match(workbench, /<IdeaPage/);
+  assert.match(workbench, /<ExperimentPage/);
+  assert.match(workbench, /<ResultsPage/);
 });
 
-test("running-state banner spans the workspace without displacing the topic and literature cards", async () => {
+test("workspace passes run activity state into the current research and experiment views", async () => {
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
-  const styles = await readSource("src/styles.css");
-
-  assert.match(workbench, /<main className="workspace-grid">[\s\S]*run-stop-banner[\s\S]*research-topic-card[\s\S]*<EvidenceTable/);
-  assert.match(styles, /\.run-stop-banner\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/);
+  assert.match(workbench, /const busy = researchRunning \|\| activeStepId !== null/);
+  assert.match(workbench, /busy=\{busy\}/);
+  assert.match(workbench, /stopRequested=\{pipelineStopRequested\}/);
 });
 
 test("stopped runs do not keep the running banner because of a stale step status", async () => {
   const app = await readSource("src/App.tsx");
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
 
-  assert.match(workbench, /const showStopControl = Boolean\(run && isBusy\)/);
+  assert.match(workbench, /const busy = researchRunning \|\| activeStepId !== null/);
   assert.doesNotMatch(workbench, /hasRunningStep|step\.status === "running"/);
   assert.match(app, /setPipelineStopRequested\(active && refreshed\.stop_requested\)/);
   assert.match(app, /setPipelineStopRequested\(active && stopped\.stop_requested\)/);
 });
 
-test("manual experiment and report controls are disabled while the pipeline is busy", async () => {
+test("manual experiment and results views receive the pipeline busy state", async () => {
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
-  const experimentPanel = await readSource("src/components/ExperimentPanel.tsx");
-  const reportPreview = await readSource("src/components/ReportPreview.tsx");
-
-  assert.match(workbench, /<ExperimentPanel[^>]*isBusy=\{isBusy\}/s);
-  assert.match(workbench, /<ReportPreview[^>]*isBusy=\{isBusy\}/s);
-  assert.match(experimentPanel, /isBusy: boolean/);
-  assert.match(experimentPanel, /disabled=\{!canRerunExperiment \|\| isBusy\}/);
-  assert.match(reportPreview, /isBusy: boolean/);
-  assert.match(reportPreview, /disabled=\{!canGenerate \|\| isBusy\}/);
+  assert.match(workbench, /<ExperimentPage[\s\S]*busy=\{busy\}/);
+  assert.match(workbench, /<ResearchPage[\s\S]*busy=\{busy\}/);
 });
 
 test("latest feedback requiring follow-up blocks report export", async () => {
@@ -330,14 +326,8 @@ test("report audit failures are translated and retain actionable diagnosis", asy
   assert.match(reportPreview, /required_correction/);
 });
 
-test("pipeline is a full-width grouped data-flow card with feedback and all visual states", async () => {
-  const workbench = await readSource("src/pages/WorkbenchPage.tsx");
+test("pipeline retains grouped steps and visual state contracts", async () => {
   const timeline = await readSource("src/components/PipelineTimeline.tsx");
-  const styles = await readSource("src/styles.css");
-  const leftRail = workbench.match(/<aside className="left-rail">[\s\S]*?<\/aside>/)?.[0] ?? "";
-
-  assert.match(workbench, /<main className="workspace-grid">[\s\S]*<PipelineTimeline/);
-  assert.doesNotMatch(leftRail, /<PipelineTimeline/);
   assert.match(timeline, /pipeline-stage-group/);
   assert.match(timeline, /pipeline-connector/);
   assert.match(timeline, /pipeline-feedback-loop/);
@@ -348,10 +338,7 @@ test("pipeline is a full-width grouped data-flow card with feedback and all visu
   assert.match(timeline, /"waiting"|state-waiting/);
   assert.match(timeline, /"needs-revision"|state-needs-revision/);
   assert.match(timeline, /"failed"|state-failed/);
-  assert.match(timeline, /isBusy: boolean/);
-  assert.match(timeline, /const canRerun = Boolean\(runId\)[^;]*&& !isBusy/);
-  assert.match(workbench, /<PipelineTimeline[^>]*isBusy=\{isBusy\}/s);
-  assert.match(styles, /\.pipeline-card[\s\S]*grid-column: 1 \/ -1/);
+  assert.match(timeline, /runId/);
 });
 
 test("pipeline nodes summarize artifact counts, versions, iteration, and report status", async () => {
@@ -373,9 +360,9 @@ test("hypothesis board renders candidate reasoning and requires user selection",
 
   assert.match(board, /content\.candidate_assessments/);
   assert.match(board, /activeStepId === "evidence_reasoning"/);
-  assert.match(board, /const statusLabel = isSelected[\s\S]*\? "用户已选择"[\s\S]*: isReasoning[\s\S]*\? "正在推理"/);
-  assert.match(board, /isReasoning \? "status-reasoning" :/);
-  assert.match(board, /正在推理/);
+  assert.match(board, /assessmentsByCandidateIndex\.size/);
+  assert.match(board, /正在处理 CAND-/);
+  assert.match(board, /status-reasoning/);
   assert.match(board, /verified: "验证通过"/);
   assert.match(board, /evidence_insufficient: "证据不足"/);
   assert.match(board, /rejected: "未通过"/);
@@ -455,14 +442,14 @@ test("execution derives its rows and optional chart from plan and result artifac
   assert.doesNotMatch(experimentPanel, /20,140 55,105/);
 });
 
-test("experiment settings label CUDA indexes and render runtime diagnostics", async () => {
+test("experiment settings expose dataset-parent-directory guidance and runtime API contracts", async () => {
   const settings = await readSource("src/components/ProjectSettingsModal.tsx");
   const types = await readSource("src/api/types.ts");
 
-  assert.match(settings, /CUDA 设备索引/);
-  assert.match(settings, /device_names/);
-  assert.match(settings, /python_version/);
-  assert.match(settings, /dependency_status/);
+  assert.match(settings, /数据集父目录/);
+  assert.match(settings, /D:\\\\Gewu\\\\datasets/);
+  assert.match(settings, /系统自动解析具体数据集目录/);
+  assert.match(settings, /api\.testExperimentSettings/);
   assert.match(types, /device_names\?: string\[\]/);
   assert.match(types, /available_device_indexes\?: number\[\]/);
 });
@@ -534,106 +521,37 @@ test("local literature upload accepts verification metadata and shows provenance
   assert.match(client, /body\.append\("year", metadata\.year/);
 });
 
-test("frontend routes root and /v2 to V2 while preserving /legacy", async () => {
+test("frontend boots the maintained workspace from one root entry point", async () => {
   const main = await readSource("src/main.tsx");
 
-  assert.match(main, /const isLegacyRoute = window\.location\.pathname\.startsWith\("\/legacy"\)/);
-  assert.match(main, /const RootApp = isLegacyRoute \? App : V2BetaPage/);
-  assert.match(main, /document\.title = isLegacyRoute \? "AI Scientist Legacy Workbench" : "AI Scientist"/);
+  assert.match(main, /import App from "\.\/App"/);
+  assert.match(main, /createRoot\(/);
+  assert.match(main, /<App \/>/);
 });
 
-test("V2 exposes Greenfield and Repository Research with local-first bootstrap controls", async () => {
-  const page = await readSource("src/pages/V2BetaPage.tsx");
-  const settings = await readSource("src/pages/V2ProjectSettingsDrawer.tsx");
+test("maintained workspace exposes local-first repository and dataset inputs", async () => {
+  const research = await readSource("src/components/workspace/ResearchPage.tsx");
+  const settings = await readSource("src/components/ProjectSettingsModal.tsx");
   const client = await readSource("src/api/client.ts");
-  const research = await readSource("src/pages/v2Research.ts");
 
-  assert.match(research, /"greenfield" \| "repository"/);
-  assert.match(settings, /从零开始研究/);
-  assert.match(settings, /基于已有代码研究/);
-  assert.match(settings, /project\.researchKind === "repository"/);
-  assert.match(settings, /本地 Repository 路径/);
-  assert.match(settings, /Git URL/);
-  assert.match(settings, /Dataset Root/);
-  assert.match(settings, /本地数据集/);
-  assert.match(settings, /自动匹配本地数据集/);
-  assert.match(settings, /在线数据集/);
-  assert.match(settings, /allowOnlineDatasetDownload/);
-  assert.match(settings, /检查数据集/);
-  assert.match(page, /api\.bootstrapGreenfield/);
-  assert.match(page, /GREENFIELD RESEARCH BOOTSTRAP/);
-  assert.match(page, /online_download_performed/);
-  assert.match(client, /\/api\/v2\/research\/sessions\/bootstrap\/datasets\/inspect/);
-  assert.match(client, /\/api\/v2\/research\/sessions\/bootstrap/);
-});
-
-test("V2 Research Workspace reuses versioned lifecycle and mature configuration APIs", async () => {
-  const page = await readSource("src/pages/V2BetaPage.tsx");
-  const client = await readSource("src/api/client.ts");
-  const demo = await readSource("src/pages/v2Demo.ts");
-  const presentation = await readSource("src/pages/v2Presentation.ts");
-
-  const settings = await readSource("src/pages/V2ProjectSettingsDrawer.tsx");
-  const literature = await readSource("src/pages/V2LiteratureWorkspace.tsx");
-  const workspace = await readSource("src/pages/v2Workspace.ts");
-  for (const label of ["研究工作台", "文献", "假设", "实验", "科研轨迹", "证据", "报告"]) assert.match(page, new RegExp(label));
-  assert.match(page, /当前 Controller 决策/);
-  assert.match(page, /完整 ExperimentRecord/);
-  assert.match(page, /科研轨迹/);
-  assert.match(page, /结论—证据图/);
-  assert.match(page, /参数响应/);
-  assert.match(page, /支持实验/);
-  assert.match(page, /反证 \/ 边界证据/);
-  assert.match(page, /审计 \/ 协议/);
-  assert.match(page, /Research Question/);
-  assert.match(page, /Linked experiments/);
-  assert.match(page, /Diff summary/);
-  assert.match(page, /Critic analysis/);
-  assert.match(page, /本轮未持久化独立记录/);
-  assert.match(page, /阶段进度为界面估算/);
-  assert.match(workspace, /RESEARCH_STAGES/);
-  assert.match(settings, /Local GPU/);
-  assert.match(settings, /Remote GPU/);
+  assert.match(research, /githubRepositoryUrl/);
+  assert.match(research, /GitHub/);
+  assert.match(settings, /数据集父目录/);
   assert.match(settings, /api\.getExperimentSettings/);
   assert.match(settings, /api\.saveExperimentSettings/);
   assert.match(settings, /api\.testExperimentSettings/);
-  assert.match(settings, /api\.saveQwenKey/);
-  assert.match(settings, /不会回显/);
-  assert.match(literature, /api\.searchLiterature/);
-  assert.match(literature, /api\.uploadLiterature/);
-  assert.match(literature, /api\.verifyLiterature/);
-  assert.match(literature, /api\.attachLiteratureToV2Session/);
-  assert.match(literature, /abstract_only/);
-  assert.match(page, /api\.createV2Session/);
-  assert.match(page, /api\.startV2Session/);
-  assert.match(page, /api\.stopV2Session/);
-  assert.match(client, /\/api\/v2\/research\/sessions/);
-  assert.match(client, /\/summary/);
-  assert.match(client, /\/events/);
-  assert.match(client, /\/findings/);
-  assert.match(client, /\/claims/);
-  assert.match(client, /\/parameter-sweep/);
-  assert.match(client, /\/trajectory/);
-  assert.match(demo, /model_live_validation: "ready"/);
-  assert.match(demo, /research_936ac26929a4/);
-  assert.match(demo, /research_dc8671de582b/);
-  assert.match(demo, /micrograd_live_exp_2_ablation/);
-  assert.match(demo, /micrograd_live_exp_3_robustness/);
-  assert.match(demo, /Final Conclusion/);
-  assert.match(page, /Demo A/);
-  assert.match(page, /Demo B/);
-  assert.match(demo, /PARTIALLY_SUPPORTED/);
-  assert.match(demo, /NOT_SUPPORTED/);
-  assert.match(demo, /status: "stopped"/);
-  assert.match(demo, /current_decision: null/);
-  assert.match(demo, /iterations: 3/);
-  assert.match(demo, /frontier: \[publicBranch, \.\.\.publicAlternativeBranches\]/);
-  assert.match(presentation, /RUN_ABLATION: "消融实验"/);
-  assert.match(presentation, /PARTIALLY_SUPPORTED: "部分支持"/);
-  assert.match(presentation, /VALIDATED: "已验证"/);
-  assert.doesNotMatch(page, />Research</);
-  assert.doesNotMatch(page, />Frontier</);
-  assert.doesNotMatch(page, />Trajectory</);
-  assert.doesNotMatch(page, />Claims</);
-  assert.doesNotMatch(page, /Agent Trace/);
+  assert.match(client, /createRun\(/);
+});
+
+test("maintained workspace reuses durable lifecycle and mature configuration APIs", async () => {
+  const app = await readSource("src/App.tsx");
+  const workbench = await readSource("src/pages/WorkbenchPage.tsx");
+  const client = await readSource("src/api/client.ts");
+  assert.match(app, /api\.startPipeline/);
+  assert.match(app, /api\.stopPipeline/);
+  assert.match(workbench, /ResearchSidebar/);
+  assert.match(workbench, /ResultsPage/);
+  assert.match(client, /pipeline\/start/);
+  assert.match(client, /pipeline\/stop/);
+  assert.match(client, /getExperimentSettings/);
 });

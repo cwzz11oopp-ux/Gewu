@@ -61,6 +61,17 @@ def test_generated_code_failure_requests_bounded_source_repair():
     assert diagnosis["repair_scope"] == "current experiment bundle only"
 
 
+def test_legacy_smoke_data_reduction_repairs_only_the_current_bundle():
+    diagnosis = _diagnose(
+        ExperimentDiagnosticAgent(RecordingLLM()),
+        "EXPERIMENT_SMOKE_DATA_REDUCTION_FORBIDDEN:X",
+    )
+
+    assert diagnosis["auto_repairable"] is True
+    assert diagnosis["repair_action"] == "repair_experiment_code"
+    assert diagnosis["repair_scope"] == "current experiment bundle only"
+
+
 def test_unknown_model_diagnosis_cannot_grant_mutation_permission():
     llm = RecordingLLM()
     diagnosis = _diagnose(
