@@ -77,7 +77,7 @@ def build_research_synthesis(references: list[dict[str, Any]]) -> dict[str, Any]
         })
         theme["source_paper_ids"].append(paper_id)
 
-        source_text = _text(raw.get("available_text"), raw.get("abstract"), raw.get("claim"), raw.get("summary"))
+        source_text = _text(raw.get("available_text"), raw.get("abstract"), raw.get("summary"))
         sentences = _sentences(source_text) or [title]
         for sentence_index, sentence in enumerate(sentences):
             if len(sentence) < 12:
@@ -370,6 +370,17 @@ def evaluate_literature_coverage(
     )
     saturated = sufficient and previous_synthesis is not None and gap_stability >= minimum_gap_stability and new_information_rate <= saturation_new_information_rate
     hard_cap_reached = int(verified_count) >= int(hard_cap)
+    insufficient_reasons = []
+    if len(themes) < minimum_theme_count:
+        insufficient_reasons.append(f"themes={len(themes)}<{minimum_theme_count}")
+    if method_coverage < minimum_method_coverage:
+        insufficient_reasons.append(f"method_coverage={method_coverage:.2f}<{minimum_method_coverage:.2f}")
+    if conclusion_coverage < minimum_conclusion_coverage:
+        insufficient_reasons.append(f"conclusion_coverage={conclusion_coverage:.2f}<{minimum_conclusion_coverage:.2f}")
+    if limitations_coverage < minimum_limitations_coverage:
+        insufficient_reasons.append(f"limitations_coverage={limitations_coverage:.2f}<{minimum_limitations_coverage:.2f}")
+    if future_work_coverage < minimum_future_work_coverage:
+        insufficient_reasons.append(f"future_work_coverage={future_work_coverage:.2f}<{minimum_future_work_coverage:.2f}")
     return {
         "retrieved_count": int(retrieved_count),
         "verified_count": int(verified_count),
@@ -381,6 +392,7 @@ def evaluate_literature_coverage(
         "gap_stability": round(gap_stability, 3),
         "new_information_rate": round(new_information_rate, 3),
         "coverage_score": coverage_score, "saturation_score": saturation_score,
+        "sufficient": sufficient, "insufficient_reasons": insufficient_reasons,
         "hard_cap": int(hard_cap), "hard_cap_reached": hard_cap_reached,
         "decision": "saturated" if saturated else "hard_cap_reached" if hard_cap_reached else "continue",
     }

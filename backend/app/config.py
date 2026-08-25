@@ -33,11 +33,14 @@ class Settings:
     qwen_code_timeout_seconds: int
     qwen_fast_timeout_seconds: int
     qwen_retries_per_model: int
+    workflow_provider_retry_limit: int
+    workflow_provider_retry_backoff_seconds: float
     deepseek_api_key: str
     deepseek_base_url: str
     deepseek_model: str
     max_deepseek_plan_revision: int
     model_role_assignments: dict[str, dict[str, str]]
+    model_provider_configs: dict[str, dict[str, object]]
     feedback_max_iterations: int
     literature_provider: str
     semantic_scholar_api_key: str
@@ -101,13 +104,21 @@ class Settings:
             qwen_retries_per_model=max(
                 0, int(source.get("QWEN_RETRIES_PER_MODEL", "1"))
             ),
+            workflow_provider_retry_limit=max(
+                0, int(source.get("WORKFLOW_PROVIDER_RETRY_LIMIT", "3"))
+            ),
+            workflow_provider_retry_backoff_seconds=max(
+                0.0,
+                float(source.get("WORKFLOW_PROVIDER_RETRY_BACKOFF_SECONDS", "1")),
+            ),
             deepseek_api_key=source.get("DEEPSEEK_API_KEY", ""),
             deepseek_base_url=source.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
             deepseek_model=source.get("DEEPSEEK_MODEL", "deepseek-chat"),
             max_deepseek_plan_revision=max(
-                0, int(source.get("MAX_DEEPSEEK_PLAN_REVISION", "2"))
+                0, int(source.get("MAX_DEEPSEEK_PLAN_REVISION", "3"))
             ),
             model_role_assignments={},
+            model_provider_configs={},
             feedback_max_iterations=max(
                 1, int(source.get("FEEDBACK_MAX_ITERATIONS", "4"))
             ),

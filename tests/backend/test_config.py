@@ -24,6 +24,8 @@ def test_qwen_uses_separate_task_models_with_legacy_general_alias():
     assert defaults.qwen_general_timeout_seconds == 300
     assert defaults.qwen_code_timeout_seconds == 600
     assert defaults.qwen_fast_timeout_seconds == 120
+    assert defaults.workflow_provider_retry_limit == 3
+    assert defaults.workflow_provider_retry_backoff_seconds == 1.0
     assert defaults.feedback_max_iterations == 4
     assert configured.qwen_model == "general-model"
     assert configured.qwen_reasoning_model == "reasoning-model"

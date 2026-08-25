@@ -81,6 +81,12 @@ class CriticAgent:
             },
             {
                 "verdict": "supported|partial|failed",
+                "decision": (
+                    "REPORT|REVISE|PIVOT. Use REPORT when the current path should "
+                    "stop and be reported, including an honest negative result. "
+                    "Use REVISE or PIVOT only when a concrete legal follow-up "
+                    "experiment exists within the frozen research constraints."
+                ),
                 "result_analysis": {
                     "measured_facts": ["string"],
                     "failed_criteria": ["string"],
@@ -160,6 +166,10 @@ class CriticAgent:
                 "iteration_evidence": iteration_evidence,
             },
             {
+                "decision": (
+                    "REPORT|REVISE|PIVOT. Use REPORT when no executable, "
+                    "evidence-grounded follow-up should be run."
+                ),
                 "evidence_sufficiency": "SUFFICIENT|EVIDENCE_INSUFFICIENT",
                 "evidence_assessment": [{
                     "statement": "string",

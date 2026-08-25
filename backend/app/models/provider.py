@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class EvidenceCard(BaseModel):
@@ -12,7 +12,10 @@ class EvidenceCard(BaseModel):
     source: str
     source_kind: Literal["external", "local", "wiki"] = "external"
     local_document_id: str | None = None
-    claim: str
+    # A literature card carries source text, not a generated hypothesis claim.
+    # `claim` remains an input-only alias so existing callers can be upgraded
+    # independently; serialized cards and all new persistence use `abstract`.
+    abstract: str = Field(validation_alias=AliasChoices("abstract", "claim"))
     url: str
     identifiers: dict[str, str] = Field(default_factory=dict)
     verified: bool = False
@@ -28,6 +31,11 @@ class EvidenceCard(BaseModel):
             bool(str(self.identifiers.get(key) or "").strip())
             for key in ("doi", "arxiv")
         )
+
+    @property
+    def claim(self) -> str:
+        """Temporary read compatibility for in-process callers."""
+        return self.abstract
 
 
 class ProviderError(BaseModel):

@@ -8,6 +8,7 @@ from backend.app.providers.experiment_runtime import (
     cuda_probe_command,
     parse_cuda_probe,
     validate_result_file,
+    validate_result_payload,
 )
 
 
@@ -85,6 +86,24 @@ def test_result_file_missing_and_invalid_json_are_stable_errors(tmp_path, bundle
     invalid.write_text("not-json", encoding="utf-8")
     with pytest.raises(RuntimeError, match="EXPERIMENT_RESULT_INVALID_JSON"):
         validate_result_file(invalid, bundle.manifest)
+
+
+def test_result_file_accepts_flattened_scalar_components_for_per_measure(bundle):
+    bundle.manifest.expected_metrics = ["KL divergence per latent dimension"]
+
+    payload = {
+        "run_id": "run_1",
+        "experiment_id": "experiment_1",
+        "result_id": "experiment_1_result",
+        "metrics": {
+            "KL divergence per latent dimension_dim_0": 0.1,
+            "KL divergence per latent dimension_dim_1": 0.2,
+        },
+    }
+
+    # Exercise the shared payload validator directly: no result-file I/O is
+    # relevant to the flattened-metric contract.
+    assert validate_result_payload(payload, bundle.manifest) == payload
 
 
 def test_cuda_probe_is_structured_json_and_unavailable_state_is_preserved():

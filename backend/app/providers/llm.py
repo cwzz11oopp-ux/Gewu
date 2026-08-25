@@ -30,8 +30,6 @@ _CODE_TASKS = frozenset({
     "experiment.generate_bundle",
     "experiment.repair_bundle",
     "diagnostic.diagnose_experiment",
-    "v2.repository.implementation_plan",
-    "v2.greenfield.generate_repository",
 })
 
 _TASK_OUTPUT_ROOT_KEYS: dict[str, tuple[str, ...]] = {
@@ -40,7 +38,7 @@ _TASK_OUTPUT_ROOT_KEYS: dict[str, tuple[str, ...]] = {
     "hypothesis.analyze_user_hypothesis": ("claim",),
     "idea_selection.review": ("evaluations",),
     "critic.evidence_reasoning": ("status",),
-    "critic.review_result": ("verdict",),
+    "critic.review_result": ("verdict", "decision"),
     "reviewer.semantic": ("accepted", "issues"),
     "planning.build_plan": ("objective", "procedure"),
     "planning.refine_plan": ("objective", "procedure"),
@@ -53,16 +51,6 @@ _TASK_OUTPUT_ROOT_KEYS: dict[str, tuple[str, ...]] = {
     "experiment.audit_result": ("integrity_status",),
     "diagnostic.diagnose_experiment": ("category", "root_cause"),
     "writer.build_report": ("Problem Statement", "Methods"),
-    "v2.ideator.construct_branches": ("proposals",),
-    "v2.repository.inspect": ("files", "rationale"),
-    "v2.repository.implementation_plan": ("summary", "edits"),
-    "v2.critic.review_experiment": ("supported_claims", "recommended_actions"),
-    "v2.greenfield.design_baseline": ("project_name", "method_summary", "entrypoint"),
-    "v2.greenfield.generate_repository": ("files", "smoke_description"),
-    "v2.critic.review_parameter_sweep": (
-        "calibration_supported",
-        "recommended_actions",
-    ),
 }
 
 
@@ -92,6 +80,57 @@ def normalize_task_output_shape(task: str, value: object) -> tuple[dict, bool]:
         return value, False
     return dict(next(iter(unique.values()))), True
 
+# Task-scoped output caps.  hypothesis.generate must emit 3-4 candidates with
+# 20+ fields each; without a bounded max_tokens the model can run past the
+# reasoning timeout and surface as a MODAL_REQUEST_TIMEOUT.  Giving only this
+# task an explicit cap keeps its output complete (3000-4000 tokens) while every
+# other task keeps the provider's configured default.
+_TASK_MAX_TOKENS: dict[str, int] = {
+    "hypothesis.generate": 4000,
+    # Full-plan regeneration tasks: cap runaway generation (~30k tokens is far
+    # above any real ~17k-char plan) so an unbounded output cannot hang a request
+    # for 20+ min, while a genuine plan is never truncated.
+    "planning.build_plan": 30000,
+    "planning.revise_from_review": 30000,
+}
+
+# Tasks that must run WITHOUT model reasoning/thinking.  Thinking is now
+# disabled at the policy level for every task (see _REASONING_POLICY /
+# _CODE_POLICY below): the unbounded thinking phase of the qwen reasoning and
+# coder models exceeded the request timeout (600-900s) on multiple tasks, while
+# enable_thinking=false returned complete high-quality output in tens of
+# seconds.  This set is kept as a belt-and-suspenders override so these tasks
+# never regress to a thinking path even if a policy default is flipped back.
+_TASK_DISABLE_THINKING: frozenset[str] = frozenset({
+    "hypothesis.generate",
+    "idea_selection.review",
+    "critic.evidence_reasoning",
+})
+
+# Tasks that MUST run WITH model reasoning/thinking regardless of the global
+# policy default.  planning.revise_from_review regressed to repeated
+# PLAN_REVIEW_FIX_MAP_UNCHANGED validation failures with thinking OFF (measured
+# A/B on the failed run: OFF leaves the BLOCK-03 dataset/split_contract/
+# procedure contract fields materially unchanged while its fix_map over-claims
+# them, so the revision never passes governance), whereas thinking ON, when it
+# completes, produces a valid revision.  These tasks also STREAM: the
+# unbounded thinking phase would otherwise trip the total read-timeout (900s),
+# but streamed reasoning chunks keep the connection alive for as long as the
+# model needs to finish thinking.
+_TASK_ENABLE_THINKING: frozenset[str] = frozenset({
+    "planning.revise_from_review",
+})
+
+
+def _max_tokens_payload(task: str, qwen_max_tokens: int) -> dict[str, int]:
+    override = _TASK_MAX_TOKENS.get(task)
+    if override:
+        return {"max_tokens": override}
+    if qwen_max_tokens > 0:
+        return {"max_tokens": qwen_max_tokens}
+    return {}
+
+
 _REASONING_TASKS = frozenset({
     "hypothesis.generate",
     "hypothesis.analyze_user_hypothesis",
@@ -103,10 +142,6 @@ _REASONING_TASKS = frozenset({
     "planning.review_plan",
     "experiment.analyze_results",
     "experiment.audit_result",
-    "v2.ideator.construct_branches",
-    "v2.repository.inspect",
-    "v2.critic.review_experiment",
-    "v2.greenfield.design_baseline",
 })
 
 
@@ -119,11 +154,15 @@ class _TaskPolicy:
     timeout_setting: str
 
 
+# Thinking is disabled globally.  Measured on qwen3.7-plus / qwen3.7-max:
+# reasoning tasks with enable_thinking=true routinely exceeded the 600-900s
+# request timeout without emitting any content, while the same tasks with
+# enable_thinking=false completed in tens of seconds with full-quality output.
 _REASONING_POLICY = _TaskPolicy(
     route="reasoning",
     primary_setting="qwen_reasoning_model",
     fallback_setting="qwen_model",
-    enable_thinking=True,
+    enable_thinking=False,
     timeout_setting="qwen_reasoning_timeout_seconds",
 )
 _GENERAL_POLICY = _TaskPolicy(
@@ -137,8 +176,13 @@ _CODE_POLICY = _TaskPolicy(
     route="code",
     primary_setting="qwen_code_model",
     fallback_setting="qwen_code_fallback_model",
-    # Coder model variants do not all accept the thinking switch.
-    enable_thinking=None,
+    # Thinking disabled globally (same reasoning as _REASONING_POLICY).
+    # Previously None (switch not sent), which let qwen3.7-max keep its server
+    # default thinking ON: experiment.generate_bundle then timed out at 900s on
+    # every attempt, while enable_thinking=false returned in ~40s.  The switch
+    # IS accepted by the qwen coder models (verified by A/B test), so send it
+    # explicitly.
+    enable_thinking=False,
     timeout_setting="qwen_code_timeout_seconds",
 )
 _FAST_POLICY = _TaskPolicy(
@@ -280,6 +324,7 @@ class MockLLMProvider:
         if task == "critic.review_result":
             return {
                 "verdict": "partial",
+                "decision": "REVISE",
                 "feedback": "Development fallback cannot validate a scientific claim.",
                 "required_revision": "Review real metrics and verified evidence with Qwen.",
                 "supported_claims": [],
@@ -325,6 +370,7 @@ class MockLLMProvider:
                 "stop_rule": "完成该消融后依据预设阈值停止或形成新假设",
             }
             return {
+                "decision": "REVISE",
                 "evidence_sufficiency": "SUFFICIENT",
                 "evidence_assessment": [],
                 "optimization_candidates": [
@@ -650,6 +696,13 @@ class QwenLLMProvider:
         if not self.settings.qwen_api_key:
             raise RuntimeError("QWEN_API_KEY_MISSING")
         policy = self._policy_for_task(task)
+        # Task-level overrides win: a whitelist forces thinking ON (these tasks
+        # also stream, see _post), a denylist forces it OFF, otherwise the
+        # policy default (now globally disabled) applies.
+        if task in _TASK_ENABLE_THINKING:
+            enable_thinking = True
+        else:
+            enable_thinking = False if task in _TASK_DISABLE_THINKING else policy.enable_thinking
         models = self._models_for_policy(policy)
         timeout_seconds = int(getattr(self.settings, policy.timeout_setting))
         failures: list[str] = []
@@ -676,7 +729,7 @@ class QwenLLMProvider:
                             "attempt": attempt_number,
                             "attempt_limit": self.settings.qwen_retries_per_model + 1,
                             "timeout_seconds": timeout_seconds,
-                            "enable_thinking": policy.enable_thinking,
+                            "enable_thinking": enable_thinking,
                             **metrics,
                         },
                     )
@@ -687,7 +740,7 @@ class QwenLLMProvider:
                         schema_hint,
                         instructions,
                         model,
-                        policy.enable_thinking,
+                        enable_thinking,
                         timeout_seconds,
                     )
                 except httpx.TimeoutException as exc:
@@ -806,8 +859,14 @@ class QwenLLMProvider:
             ) from last_exception
 
         choice = response.json()["choices"][0]
-        message = choice["message"]["content"]
+        message = str((choice.get("message") or {}).get("content") or "")
         finish_reason = str(choice.get("finish_reason") or "unknown")
+        if not message.strip():
+            raise ValueError(
+                "MODEL_EMPTY_OUTPUT:"
+                f"provider={self.mode}:model={model}:task={task}:"
+                f"finish_reason={finish_reason}"
+            )
         if finish_reason == "length":
             code = (
                 "EXPERIMENT_CODE_OUTPUT_TRUNCATED"
@@ -840,7 +899,7 @@ class QwenLLMProvider:
         parsed["model_route"] = policy.route
         parsed["model_fallback_used"] = model != models[0]
         parsed["model_fallback_reason"] = ",".join(failures) if model != models[0] else ""
-        parsed["thinking_enabled"] = policy.enable_thinking is True
+        parsed["thinking_enabled"] = enable_thinking is True
         parsed["json_repaired"] = json_repaired
         parsed["shape_normalized"] = shape_normalized
         self._call_state.metadata = {
@@ -849,7 +908,7 @@ class QwenLLMProvider:
             "model_route": policy.route,
             "model_fallback_used": model != models[0],
             "model_fallback_reason": parsed["model_fallback_reason"],
-            "thinking_enabled": policy.enable_thinking is True,
+            "thinking_enabled": enable_thinking is True,
             "json_repaired": json_repaired,
             "shape_normalized": shape_normalized,
         }
@@ -931,11 +990,7 @@ class QwenLLMProvider:
                     if enable_thinking is not None
                     else {}
                 ),
-                **(
-                    {"max_tokens": self.settings.qwen_max_tokens}
-                    if self.settings.qwen_max_tokens > 0
-                    else {}
-                ),
+                **_max_tokens_payload(task, self.settings.qwen_max_tokens),
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {
@@ -966,6 +1021,18 @@ class QwenLLMProvider:
             },
         )
         cancel_event = getattr(self._call_state, "cancel_event", None)
+        if enable_thinking is True:
+            # Thinking-ON tasks stream.  With non-streaming the total read
+            # timeout covers the WHOLE response, so the unbounded thinking phase
+            # trips it (measured: qwen3.7-plus revise >600s).  Streaming makes
+            # the read timeout per-chunk: as long as reasoning deltas keep
+            # arriving the request completes whenever thinking finishes.
+            request_kwargs["json"]["stream"] = True
+            if cancel_event is None or not self._owns_client:
+                return self._post_stream(url, request_kwargs)
+            return asyncio.run(
+                self._post_stream_cancellable(url, request_kwargs, cancel_event)
+            )
         if cancel_event is None or not self._owns_client:
             return self.client.post(url, **request_kwargs)
         return asyncio.run(self._post_cancellable(url, request_kwargs, cancel_event))
@@ -998,14 +1065,173 @@ class QwenLLMProvider:
             cancel_task.cancel()
             return await request_task
 
+    def _post_stream(self, url: str, request_kwargs: dict) -> httpx.Response:
+        """SSE-stream a chat-completions call and rebuild a single JSON response.
+
+        Accumulates ``delta.content`` (and ``delta.reasoning_content`` when the
+        model thinks) across chunks, captures usage + finish_reason, and returns
+        a synthetic ``httpx.Response`` shaped exactly like the non-streaming
+        body so every caller (``generate_json`` / ``_repair_json``) is
+        unchanged.  On an HTTP error the raw body is preserved so the retry
+        loop can inspect status/text/request-id as usual.
+        """
+        with self.client.stream("POST", url, **request_kwargs) as response:
+            if response.status_code >= 400:
+                error_body = response.read()
+                return httpx.Response(
+                    response.status_code,
+                    content=error_body,
+                    headers=dict(response.headers),
+                    request=response.request,
+                )
+            content: list[str] = []
+            reasoning: list[str] = []
+            usage: dict = {}
+            finish_reason = None
+            for line in response.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
+                if delta.get("content"):
+                    content.append(delta["content"])
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0].get("finish_reason")
+            body = {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "".join(content),
+                            **(
+                                {"reasoning_content": "".join(reasoning)}
+                                if reasoning
+                                else {}
+                            ),
+                        },
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": usage or {},
+            }
+            return httpx.Response(
+                200,
+                json=body,
+                headers=dict(response.headers),
+                request=response.request,
+            )
+
+    @staticmethod
+    async def _post_stream_cancellable(
+        url: str,
+        request_kwargs: dict,
+        cancel_event: Event,
+    ) -> httpx.Response:
+        async with httpx.AsyncClient() as client:
+            async def read_stream() -> httpx.Response:
+                async with client.stream("POST", url, **request_kwargs) as response:
+                    if response.status_code >= 400:
+                        error_body = await response.aread()
+                        return httpx.Response(
+                            response.status_code,
+                            content=error_body,
+                            headers=dict(response.headers),
+                            request=response.request,
+                        )
+                    content: list[str] = []
+                    reasoning: list[str] = []
+                    usage: dict = {}
+                    finish_reason = None
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        if delta.get("reasoning_content"):
+                            reasoning.append(delta["reasoning_content"])
+                        if delta.get("content"):
+                            content.append(delta["content"])
+                        if choices[0].get("finish_reason"):
+                            finish_reason = choices[0].get("finish_reason")
+                    body = {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "".join(content),
+                                    **(
+                                        {"reasoning_content": "".join(reasoning)}
+                                        if reasoning
+                                        else {}
+                                    ),
+                                },
+                                "finish_reason": finish_reason,
+                            }
+                        ],
+                        "usage": usage or {},
+                    }
+                    return httpx.Response(
+                        200,
+                        json=body,
+                        headers=dict(response.headers),
+                        request=response.request,
+                    )
+
+            stream_task = asyncio.create_task(read_stream())
+
+            async def wait_for_cancel() -> None:
+                while not cancel_event.is_set():
+                    await asyncio.sleep(0.1)
+
+            cancel_task = asyncio.create_task(wait_for_cancel())
+            done, _ = await asyncio.wait(
+                {stream_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done:
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+                raise LLMRequestCancelled()
+            cancel_task.cancel()
+            return await stream_task
+
 
 def get_llm_provider(settings: Settings, client: httpx.Client | None = None) -> LLMProvider:
     if settings.llm_provider == "mock":
         if settings.competition_mode:
             raise RuntimeError("QWEN_PROVIDER_REQUIRED")
         return MockLLMProvider()
-    qwen = QwenLLMProvider(settings, client=client)
-    return ModelRoleRouter(settings, qwen, DeepSeekLLMProvider(settings, client=client))
+    instances = _build_role_providers(settings, client=client)
+    return ModelRoleRouter(settings, instances)
 
 
 class DeepSeekLLMProvider(QwenLLMProvider):
@@ -1034,20 +1260,81 @@ class DeepSeekLLMProvider(QwenLLMProvider):
     def _models_for_policy(self, policy: _TaskPolicy) -> list[str]:
         return [self.settings.deepseek_model]
 
+
+class _ConfiguredProvider(QwenLLMProvider):
+    """A role-routed provider bound to one concrete provider_id + model."""
+
+    def __init__(self, settings: Settings, provider_id: str, client: httpx.Client | None = None) -> None:
+        super().__init__(settings, client=client)
+        self.mode = provider_id
+
+
+def _build_role_providers(settings: Settings, client: httpx.Client | None = None) -> dict[tuple[str, str], QwenLLMProvider]:
+    """Build one provider instance per (provider_id, model) the roles actually use.
+
+    The user's saved model config is the single source of truth: a role's
+    provider_id and model come only from ``model_role_assignments``, and each
+    provider's base_url / api_key come only from ``model_provider_configs``.
+    """
+    configs: dict[str, dict[str, object]] = getattr(settings, "model_provider_configs", {}) or {}
+    instances: dict[tuple[str, str], QwenLLMProvider] = {}
+    for assignment in (settings.model_role_assignments or {}).values():
+        provider_id = str((assignment or {}).get("provider_id") or "").strip()
+        model = str((assignment or {}).get("model") or "").strip()
+        if not provider_id or not model:
+            continue
+        config = configs.get(provider_id)
+        if not config or not str(config.get("base_url") or ""):
+            continue
+        key = (provider_id, model)
+        if key in instances:
+            continue
+        compatible = replace(
+            settings,
+            qwen_api_key=str(config.get("api_key") or ""),
+            qwen_base_url=str(config.get("base_url") or ""),
+            qwen_model=model,
+            qwen_reasoning_model=model,
+            qwen_code_model=model,
+            qwen_code_fallback_model=model,
+            qwen_fast_model=model,
+        )
+        instances[key] = _ConfiguredProvider(compatible, provider_id, client=client)
+    return instances
+
+
 class ModelRoleRouter:
-    """Routes scientific roles to configured providers without changing workflow code."""
+    """Routes scientific roles to the provider/model pairs the user configured."""
 
     mode = "role_router"
     fallback = False
 
-    def __init__(self, settings: Settings, qwen: LLMProvider, deepseek: LLMProvider) -> None:
+    def __init__(self, settings: Settings, providers: dict[tuple[str, str], LLMProvider]) -> None:
         self.settings = settings
-        self.qwen = qwen
-        self.deepseek = deepseek
+        self.providers = providers
         self._last_provider: LLMProvider | None = None
 
+    def _route(self, role: str):
+        assignment = self.settings.model_role_assignments.get(role) or {}
+        provider_id = str(assignment.get("provider_id") or "").strip()
+        model = str(assignment.get("model") or "").strip()
+        if not provider_id or not model:
+            raise RuntimeError(f"MODEL_ROLE_NOT_CONFIGURED:{role}")
+        provider = self.providers.get((provider_id, model))
+        if provider is None:
+            raise RuntimeError(
+                f"MODEL_PROVIDER_NOT_CONFIGURED:{provider_id}:{model}:role={role}"
+            )
+        return provider
+
+    def _provider_for_id(self, provider_id: str):
+        for (pid, _model), provider in self.providers.items():
+            if pid == provider_id:
+                return provider
+        return None
+
     def generate_json(self, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
-        role = {
+        role = "WRITER" if task.startswith("writer.") else {
             "research.structure_problem": "RESEARCH",
             "hypothesis.generate": "HYPOTHESIS_GENERATION",
             "hypothesis.analyze_user_hypothesis": "HYPOTHESIS_GENERATION",
@@ -1060,24 +1347,22 @@ class ModelRoleRouter:
             "experiment.generate_bundle": "EXPERIMENT_CODE_GENERATION",
             "experiment.repair_bundle": "EXPERIMENT_CODE_GENERATION",
             "critic.review_result": "CRITIC",
-            "writer.build_report": "WRITER",
+            # Semantic review must be independent of report generation.  Reuse
+            # the configured critic role rather than adding another workflow role.
+            "reviewer.semantic": "CRITIC",
         }.get(task, "GENERAL_REASONING")
-        assignment = self.settings.model_role_assignments.get(role) or {}
-        provider = self.deepseek if assignment.get("provider_id") == "deepseek" else self.qwen
+        provider = self._route(role)
         self._last_provider = provider
         return provider.generate_json(task, inputs, schema_hint, instructions)
 
     def generate_json_for_provider(self, provider_id: str, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
-        provider = self.qwen if provider_id == "qwen" else self.deepseek if provider_id == "deepseek" else None
+        provider = self._provider_for_id(provider_id)
         if provider is None:
-            raise RuntimeError(f"SCIENTIFIC_PROVIDER_UNKNOWN:{provider_id}")
+            raise RuntimeError(f"MODEL_PROVIDER_NOT_CONFIGURED:{provider_id}")
         self._last_provider = provider
         return provider.generate_json(task, inputs, schema_hint, instructions)
 
-    def preflight(self, provider_id: str) -> dict:
-        provider = self.qwen if provider_id == "qwen" else self.deepseek if provider_id == "deepseek" else None
-        if provider is None:
-            raise RuntimeError(f"SCIENTIFIC_PROVIDER_UNKNOWN:{provider_id}")
+    def _preflight_instance(self, provider, provider_id: str) -> dict:
         check = getattr(provider, "preflight", None)
         if callable(check):
             return check(provider_id)
@@ -1090,27 +1375,46 @@ class ModelRoleRouter:
         )
         return {"provider": provider_id, "structured": True}
 
+    def preflight(self, provider_id: str) -> dict:
+        provider = self._provider_for_id(provider_id)
+        if provider is None:
+            raise RuntimeError(f"MODEL_PROVIDER_NOT_CONFIGURED:{provider_id}")
+        return self._preflight_instance(provider, provider_id)
+
+    def preflight_model(self, provider_id: str, model: str) -> dict:
+        provider = self.providers.get((provider_id, model))
+        if provider is None:
+            raise RuntimeError(f"MODEL_PROVIDER_NOT_CONFIGURED:{provider_id}:{model}")
+        return self._preflight_instance(provider, provider_id)
+
+    def configured_provider_models(self) -> list[tuple[str, str]]:
+        return sorted(self.providers.keys())
+
     def begin_run(self, run_id: str) -> None:
-        for provider in (self.qwen, self.deepseek):
+        for provider in self.providers.values():
             provider.begin_run(run_id)
 
     def end_run(self, run_id: str) -> None:
-        for provider in (self.qwen, self.deepseek):
+        for provider in self.providers.values():
             provider.end_run(run_id)
 
     def cancel_run(self, run_id: str) -> bool:
-        return any(provider.cancel_run(run_id) for provider in (self.qwen, self.deepseek))
+        return any(provider.cancel_run(run_id) for provider in self.providers.values())
 
     def consume_call_metadata(self) -> dict:
         provider = self._last_provider
         self._last_provider = None
         if provider is not None:
             metadata = provider.consume_call_metadata()
-            for other in (self.qwen, self.deepseek):
+            for other in self.providers.values():
                 if other is not provider:
                     other.consume_call_metadata()
             return metadata
-        return self.qwen.consume_call_metadata() or self.deepseek.consume_call_metadata()
+        for provider in self.providers.values():
+            metadata = provider.consume_call_metadata()
+            if metadata:
+                return metadata
+        return {}
 class DuplicateJSONKeyError(ValueError):
     def __init__(self, key: str) -> None:
         super().__init__(key)

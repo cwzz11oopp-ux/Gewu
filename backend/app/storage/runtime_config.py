@@ -11,17 +11,11 @@ EXPERIMENT_CONFIG_FILE = "provider_config.json"
 LOCAL_SECRETS_FILE = "local_secrets.json"
 MODEL_CONFIG_FILE = "model_config.json"
 
-DEFAULT_MODEL_ROLES = {
-    "GENERAL_REASONING": {"provider_id": "qwen", "model": "qwen3.7-plus"},
-    "RESEARCH": {"provider_id": "qwen", "model": "qwen3.7-plus"},
-    "HYPOTHESIS_GENERATION": {"provider_id": "qwen", "model": "qwen3.7-max"},
-    "EVIDENCE_REASONING": {"provider_id": "qwen", "model": "qwen3.7-max"},
-    "RESEARCH_PLAN_GENERATION": {"provider_id": "qwen", "model": "qwen3.7-plus"},
-    "RESEARCH_PLAN_REVIEW": {"provider_id": "deepseek", "model": "deepseek-chat"},
-    "EXPERIMENT_CODE_GENERATION": {"provider_id": "qwen", "model": "qwen3-coder-plus"},
-    "CRITIC": {"provider_id": "qwen", "model": "qwen3.7-max"},
-    "WRITER": {"provider_id": "qwen", "model": "qwen3.7-plus"},
-}
+# Model roles come exclusively from the operator-saved model_config.json. There
+# is intentionally no DEFAULT_MODEL_ROLES fallback: an unconfigured role must
+# fail with MODEL_ROLE_NOT_CONFIGURED instead of silently routing to a default
+# qwen/deepseek model, and no Settings.from_env model value may act as a role
+# fallback.
 
 
 class RuntimeConfigStore:
@@ -43,8 +37,24 @@ class RuntimeConfigStore:
         saved = self.store.read(MODEL_CONFIG_FILE)
         return {
             "providers": list(saved.get("providers") or []),
-            "roles": {**DEFAULT_MODEL_ROLES, **(saved.get("roles") or {})},
+            "roles": dict(saved.get("roles") or {}),
         }
+
+    def model_config_fingerprint(self) -> str:
+        """Content hash of the persisted files that shape runtime provider
+        instances (model_config.json + local_secrets.json). Every backend
+        process compares this against the fingerprint it last applied so it can
+        detect a config saved by another process without restarting."""
+        import hashlib
+
+        digest = hashlib.sha256()
+        for filename in (MODEL_CONFIG_FILE, LOCAL_SECRETS_FILE):
+            path = self.store.data_dir / filename
+            raw = path.read_bytes() if path.is_file() else b""
+            digest.update(filename.encode("utf-8"))
+            digest.update(b"\x00")
+            digest.update(raw)
+        return digest.hexdigest()
 
     def save_model_provider(self, value: dict[str, Any]) -> dict[str, Any]:
         config = self.model_config()
@@ -97,33 +107,35 @@ class RuntimeConfigStore:
 
     def _apply_model_providers(self, settings: Settings) -> Settings:
         config = self.model_config()
-        saved_config = self.store.read(MODEL_CONFIG_FILE)
         providers = {item.get("provider_id"): item for item in config["providers"]}
         secrets = self.local_secrets().get("model_providers") or {}
-        qwen = providers.get("qwen") or {}
-        deepseek = providers.get("deepseek") or {}
         roles = config["roles"]
-        experiment_code_role = roles.get("EXPERIMENT_CODE_GENERATION") or {}
+
+        # Each configured provider carries its own base_url, api_key and models.
+        # Roles only reference a (provider_id, model) pair; no role may infer or
+        # overwrite another provider's model.
+        model_provider_configs: dict[str, dict[str, object]] = {}
+        for provider_id, item in providers.items():
+            model_provider_configs[provider_id] = {
+                "provider_id": provider_id,
+                "base_url": str(item.get("base_url") or ""),
+                "api_key": str((secrets.get(provider_id) or {}).get("api_key") or ""),
+                "models": [str(m) for m in (item.get("models") or []) if str(m).strip()],
+                "enabled": bool(item.get("enabled", True)),
+            }
+
+        qwen = model_provider_configs.get("qwen") or {}
+        deepseek = model_provider_configs.get("deepseek") or {}
         return replace(
             settings,
-            model_role_assignments=config["roles"],
-            qwen_api_key=str((secrets.get("qwen") or {}).get("api_key") or settings.qwen_api_key),
+            model_role_assignments=roles,
+            model_provider_configs=model_provider_configs,
+            qwen_api_key=str(qwen.get("api_key") or settings.qwen_api_key),
             qwen_base_url=str(qwen.get("base_url") or settings.qwen_base_url),
-            qwen_model=str(
-                (((saved_config.get("roles") or {}).get("RESEARCH_PLAN_GENERATION") or {}).get("model"))
-                or settings.qwen_model
-            ),
-            qwen_code_model=(
-                str(experiment_code_role.get("model") or settings.qwen_code_model)
-                if experiment_code_role.get("provider_id") == "qwen"
-                else settings.qwen_code_model
-            ),
-            deepseek_api_key=str((secrets.get("deepseek") or {}).get("api_key") or settings.deepseek_api_key),
+            qwen_model=str((qwen.get("models") or [settings.qwen_model])[0]),
+            deepseek_api_key=str(deepseek.get("api_key") or settings.deepseek_api_key),
             deepseek_base_url=str(deepseek.get("base_url") or settings.deepseek_base_url),
-            deepseek_model=str(
-                (((saved_config.get("roles") or {}).get("RESEARCH_PLAN_REVIEW") or {}).get("model"))
-                or settings.deepseek_model
-            ),
+            deepseek_model=str((deepseek.get("models") or [settings.deepseek_model])[0]),
         )
 
     def _apply_experiment(self, settings: Settings, config: dict[str, Any]) -> Settings:

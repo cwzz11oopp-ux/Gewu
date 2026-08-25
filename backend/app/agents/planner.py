@@ -1,7 +1,12 @@
 from copy import deepcopy
 
 from backend.app.providers.llm import LLMProvider
-from backend.app.workflow.plan_contract import authoritative_plan_contract
+from backend.app.workflow.plan_contract import (
+    CANONICAL_PLAN_CONTRACT_FIELDS,
+    FIELD_ALIAS_TO_CANONICAL,
+    authoritative_plan_contract,
+    canonical_contract_field,
+)
 
 
 PLAN_REVIEW_PROMPT_SCHEMA_VERSION = 3
@@ -20,18 +25,35 @@ PLAN_REVIEW_FIXED_INSTRUCTIONS = (
     "frozen review policy and return stable structured issue IDs. On revision rounds, first mark "
     "every prior OPEN blocker fixed or not fixed and check CLOSED issues only for policy-authorized "
     "regression or new evidence. A CLOSED finding must include resolution and evidence_artifact_ids "
-    "pointing to the current candidate; required_fix may be null after closure. A new later-round "
+    "pointing to the current candidate; its contract_fields may name the fields that demonstrate the "
+    "repair, while the original blocker's recorded scope remains unchanged. required_fix may be null after closure. A new later-round "
     "BLOCKER requires artifact-backed regression or new_evidence. closed_issue_ids is informational "
     "only. Warnings and suggestions never block; only the governance ledger determines ACCEPT or "
-    "REVISE. All contract_fields must use the frozen canonical Plan Contract field registry."
+    "REVISE. All contract_fields must use the frozen canonical Plan Contract field registry. A PIVOT "
+    "may not alter frozen controls (including split, architecture/capacity, or primary metric) within "
+    "the current contract; such a change requires a separately authorized child experiment."
 )
 PLAN_REVISION_FIXED_INSTRUCTIONS = (
-    "Return the complete revised Research Plan, not an explanation. Use the current "
-    "candidate as the base and patch only fields required by validated OPEN blockers. "
-    "Preserve the frozen problem anchor and CLOSED ledger. fix_map is only a mapping "
-    "from each blocker ID to a non-empty list of exact frozen canonical top-level Plan "
-    "Contract fields actually changed for that blocker. Do not use nested paths, text, "
-    "evidence, values, or metadata in fix_map; it is not a complete plan diff manifest."
+    "Apply a patch to the current Plan Contract. Return ONLY the canonical top-level "
+    "Plan Contract fields that must change to close the OPEN blockers, with their new "
+    "values. Do NOT return unchanged fields and do NOT repeat the fields of the current "
+    "candidate verbatim; every field you omit is carried forward from the current "
+    "candidate exactly as-is. The schema below lists every field you are allowed to "
+    "patch in this round; if a field is not listed, do not output it. Return fix_map "
+    "as the exact mapping from each blocker ID to a non-empty list of frozen canonical "
+    "top-level Plan Contract fields actually changed for that blocker. Do not use "
+    "nested paths, text, evidence, values, or metadata in fix_map; it is not a complete "
+    "plan diff manifest. Preserve the frozen problem anchor and CLOSED ledger."
+)
+MODEL_TRAINING_BUDGET_INSTRUCTIONS = (
+    "The planning model, not a global backend default or incoming research constraint, owns the "
+    "formal training budget. Set parameters.epochs to a positive integer chosen from the method's "
+    "training semantics, observed dataset scale, convergence needs, and available resources; do not "
+    "copy a universal value across unrelated studies. Explain the choice in "
+    "additional_sections.training_budget_rationale. For estimators that are not trained by epochs, "
+    "set parameters.epochs to 1 and declare the real optimizer limit separately as parameters.max_iter; "
+    "never fabricate repeated epochs by calling a converged fit() multiple times. Once the first Plan "
+    "is accepted, follow-up experimental revisions must preserve that formal epoch budget."
 )
 
 
@@ -63,8 +85,10 @@ _PLAN_SCHEMA = {
         "method": "字符串：统计或判定方法",
     }],
     "procedure": {"steps": ["字符串：执行步骤"], "repetitions": "整数：重复次数"},
-    "parameters": {"参数名称": "固定值或候选值"},
-    "seeds": ["整数：随机种子"],
+    "parameters": {
+        "epochs": "正整数：模型依据训练语义、数据规模、收敛需求和资源制定的正式训练轮数",
+        "参数名称": "其他固定值；非 epoch 训练器应另列 max_iter 等真实优化预算",
+    },
     "statistical_summary": {
         "aggregation": "字符串：如 mean/std 或置信区间",
         "significance_test": "字符串：统计检验；不适用时说明原因",
@@ -157,6 +181,48 @@ def plan_review_schema_snapshot() -> dict:
 
 def plan_revision_schema_snapshot() -> dict:
     return deepcopy(_PLAN_SCHEMA)
+
+
+def plan_revision_patch_schema(
+    open_blockers: list[dict],
+    *,
+    schema_snapshot: dict | None = None,
+    field_registry: dict[str, str] | None = None,
+    field_aliases: dict[str, str] | None = None,
+) -> dict:
+    """Narrow the revision schema to only the fields named by OPEN blockers.
+
+    Patch-only revision: the model may only return the Plan Contract fields the
+    reviewers asked it to change (plus fix_map).  The full candidate lives in the
+    context, so every omitted field is carried forward unchanged by the engine's
+    merge.  If no blocker names a contract field the full optional schema is
+    returned as a fallback so a revision can still express any required change.
+    """
+    registry = dict(field_registry or CANONICAL_PLAN_CONTRACT_FIELDS)
+    aliases = dict(field_aliases or FIELD_ALIAS_TO_CANONICAL)
+    full = deepcopy(schema_snapshot) if schema_snapshot is not None else plan_revision_schema_snapshot()
+    named: list[str] = []
+    for item in open_blockers or ():
+        if not isinstance(item, dict):
+            continue
+        for raw in item.get("contract_fields") or ():
+            canonical = canonical_contract_field(raw)
+            if canonical in registry and canonical not in named:
+                named.append(canonical)
+    if not named:
+        return full
+    patch = {}
+    for canonical in named:
+        if canonical in full:
+            patch[canonical] = deepcopy(full[canonical])
+        else:
+            # Canonical fields outside _PLAN_SCHEMA (iteration_contract,
+            # split_contract, progressive_experiment) fall back to the registry
+            # description so the model still knows their shape.
+            patch[canonical] = str(registry[canonical])
+    if "fix_map" in full:
+        patch["fix_map"] = deepcopy(full["fix_map"])
+    return patch
 
 
 def build_plan_review_runtime_contract(
@@ -306,7 +372,16 @@ class PlanningAgent:
             f"- {name}: {description}" for name, description in contract_fields.items()
         )
         dataset_contract = _DATASET_CONTRACT if dataset_options else ""
-        return "\n\n".join(part for part in (instructions, contract, dataset_contract) if part)
+        return "\n\n".join(
+            part
+            for part in (
+                instructions,
+                contract,
+                dataset_contract,
+                MODEL_TRAINING_BUDGET_INSTRUCTIONS,
+            )
+            if part
+        )
 
     @staticmethod
     def _observed_structure(dataset_options: list[dict] | None) -> list[dict]:

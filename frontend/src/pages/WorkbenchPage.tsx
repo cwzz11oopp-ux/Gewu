@@ -8,7 +8,7 @@ import { IdeaPage } from "../components/workspace/IdeaPage";
 import { ExperimentPage } from "../components/workspace/ExperimentPage";
 import { ResultsPage } from "../components/workspace/ResultsPage";
 
-type TopicDraft = { domain: string; problem: string; constraints: string; githubRepositoryUrl: string };
+type TopicDraft = { domain: string; problem: string; constraints: string; githubRepositoryUrl: string; knowledgeBaseId: string };
 
 type Props = {
   run: RunRecord | null;
@@ -28,14 +28,16 @@ type Props = {
   onOpenSettings: () => void;
   onAddUserHypothesis: (claim: string, replacementIndex?: number) => Promise<void>;
   onSelectHypothesis: (candidateIndex: number) => Promise<void>;
+  onRegenerateHypothesis: () => Promise<void>;
   onRunRefresh: () => Promise<void>;
   experimentProgress: ExperimentProgress | null;
+  onHome: () => void;
 };
 
 export function WorkbenchPage({
   run, report, topicDraft, activeStepId, failedStepId, researchRunning, pipelineStopRequested,
   onTopicDraftChange, onCreate, onStartResearch, onRerunFrom, onContinuePipeline, onStopPipeline,
-  onOpenSettings, onSelectHypothesis, experimentProgress,
+  onOpenSettings, onSelectHypothesis, onRegenerateHypothesis, onRunRefresh, experimentProgress, onHome,
 }: Props) {
   const [activeView, setActiveView] = useState<ResearchView>("research");
   const [focusHypothesisId, setFocusHypothesisId] = useState<string>();
@@ -54,6 +56,7 @@ export function WorkbenchPage({
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: "instant" }); }, [activeView]);
   const content = activeView === "research" ? <ResearchPage
     model={model}
+    run={run}
     question={topicDraft.problem}
     busy={busy}
     activeStepId={activeStepId}
@@ -61,8 +64,14 @@ export function WorkbenchPage({
     onQuestionChange={(problem) => onTopicDraftChange({ ...topicDraft, problem })}
     githubRepositoryUrl={topicDraft.githubRepositoryUrl}
     onGithubRepositoryUrlChange={(githubRepositoryUrl) => onTopicDraftChange({ ...topicDraft, githubRepositoryUrl })}
+    artifacts={run?.artifacts ?? []}
+    knowledgeBaseId={topicDraft.knowledgeBaseId}
+    onKnowledgeBaseIdChange={(knowledgeBaseId) => onTopicDraftChange({ ...topicDraft, knowledgeBaseId })}
+    onRunRefresh={onRunRefresh}
     onCreate={onCreate}
     onStart={handleResearchStart}
+    onStop={onStopPipeline}
+    stopRequested={pipelineStopRequested}
     governanceHold={governanceHold}
     onOpenHypothesis={(id) => { setFocusHypothesisId(id); setActiveView("idea"); }}
     onOpenExperiment={(id, log = false) => { setFocusExperimentId(id); setOpenExperimentLog(log); setActiveView("experiment"); }}
@@ -71,6 +80,7 @@ export function WorkbenchPage({
     busy={busy}
     onSelectHypothesis={onSelectHypothesis}
     focusHypothesisId={focusHypothesisId}
+    onRegenerate={onRegenerateHypothesis}
     onOpenExperiment={(id) => { setFocusExperimentId(id); setOpenExperimentLog(false); setActiveView("experiment"); }}
   /> : activeView === "experiment" ? <ExperimentPage
     model={model}
@@ -84,7 +94,7 @@ export function WorkbenchPage({
   /> : <ResultsPage model={model} run={run}/>;
 
   return <main className="gew-shell">
-    <ResearchSidebar activeView={activeView} onNavigate={setActiveView} onSettings={onOpenSettings}/>
+    <ResearchSidebar activeView={activeView} onNavigate={setActiveView} onSettings={onOpenSettings} onHome={onHome}/>
     <div className="gew-stage" data-view={activeView}>{content}</div>
   </main>;
 }

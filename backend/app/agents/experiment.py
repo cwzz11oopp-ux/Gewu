@@ -23,17 +23,10 @@ _CLASSIFICATION_SMOKE_INSTRUCTIONS = (
     "split, preprocessing, labels/targets, and validation code as scientific runs. "
     "Never create a smoke subset or resample data: no X[:N], y[:N], Subset, random "
     "sampling, class reduction, anomaly-ratio reduction, or alternate split. Smoke "
-    "uses one Harness-selected seed and stops only after one real train batch and one "
-    "real validation/evaluation batch with prediction and metric computation. Read "
-    "GEWU_EXECUTION_STAGE and GEWU_EXECUTION_EPOCHS from the environment for the "
-    "system-bound execution budget; do not redefine them. If the frozen split has "
-    "fewer than two train classes, raise a clear data error instead. "
-    "For IPIX17, load DATA_ROOT/IPIX17/clutter.mat and DATA_ROOT/IPIX17/mubiao.mat, "
-    "construct complete X/y in clutter-to-target order, and keep stratify=y for the "
-    "shared classification split. "
-    "When repairing a failure containing 'The number of classes has to be greater "
-    "than one', inspect and correct the shared split/label handling; do not add a "
-    "smoke-only data subset."
+    "seed and execution budget are provided by the Harness through "
+    "GEWU_EXECUTION_STAGE and GEWU_EXECUTION_EPOCHS; do not redefine them. Keep "
+    "the existing Skill and Validator-required training-progress and result-output "
+    "protocol."
 )
 
 _OBSERVED_STRUCTURE_INSTRUCTIONS = (
@@ -42,6 +35,59 @@ _OBSERVED_STRUCTURE_INSTRUCTIONS = (
     "that is absent. Do not put data values into code or prompts, and never change or truncate "
     "the dataset scale for Smoke."
 )
+
+_RUNTIME_SEED_INSTRUCTIONS = (
+    "--seed is the authoritative runtime seed. Use args.seed to initialize every "
+    "random source actually used by train.py (for example random, numpy, and torch). "
+    "Use the same args.seed for baseline, variant, training, validation, and result "
+    "output; result seed must equal args.seed. Do not hardcode a seed or select one "
+    "from Plan seeds inside train.py."
+)
+
+
+def _system_bundle_payload(raw: dict, plan: dict, task: dict) -> dict:
+    """Attach the system-owned execution contract to model-produced source.
+
+    The code model owns only ``files`` and ``requirements``.  Requiring it to
+    echo seeds, metrics, parameters, or runtime flags proved fragile and made a
+    missing transport field poison every repair attempt.
+    """
+    dataset = plan.get("dataset") or {}
+    resources = plan.get("resources") or {}
+    gpu_value = str(resources.get("gpu") or task.get("compute_resource") or "").strip().lower()
+    requires_gpu = gpu_value not in {"", "cpu", "none", "false", "0"}
+    metrics = [
+        str(item.get("metric") or "").strip()
+        for item in plan.get("evaluations") or []
+        if isinstance(item, dict) and str(item.get("metric") or "").strip()
+    ]
+    return {
+        "entrypoint": "train.py",
+        "files": raw.get("files"),
+        "requirements": raw.get("requirements") or [],
+        "requires_gpu": requires_gpu,
+        "dataset": contract_canonical_name(dataset) or str(task.get("dataset") or ""),
+        "expected_metrics": list(dict.fromkeys(metrics)) or ["test_accuracy"],
+        "parameters": dict(plan.get("parameters") or {}),
+        "seeds": [int(item) for item in plan.get("seeds") or []],
+        "supports_smoke_test": True,
+    }
+
+
+def _result_contract_instructions(expected_metrics: list[str]) -> str:
+    """Keep generated result keys aligned with the immutable Bundle contract."""
+    metrics = [str(item) for item in expected_metrics if str(item).strip()]
+    return (
+        "Result-output contract: import gewu_runtime as gr and finish each run with "
+        "exactly one gr.write_result(metrics, seed=args.seed) call after every planned "
+        "variant has completed. For a baseline-versus-intervention comparison, retain both "
+        "sets of scalar metrics using Baseline_ and intervention-prefixed keys, and copy the "
+        "intervention values to the required exact keys. Never write one result per variant, "
+        "because the later write overwrites the baseline evidence. The metrics dictionary must declare "
+        "every required key as an exact string literal; do not use aliases, shortened "
+        "names, or only Baseline_/ECA_ prefixed variants. Required exact keys: "
+        + json.dumps(metrics, ensure_ascii=False)
+    )
 from backend.app.workflow.experiment_code import (
     ExperimentBundleValidationError,
     default_mock_experiment_bundle,
@@ -58,6 +104,27 @@ class ExperimentBundleCandidateError(ValueError):
     def __init__(self, cause: ValueError, candidate: dict) -> None:
         super().__init__(str(cause))
         self.candidate = dict(candidate)
+
+
+def _compact_result_for_audit(result: dict) -> dict:
+    """Strip observational epoch history before semantic review.
+
+    The audit verifies final scalar metrics and source integrity; a full per-epoch
+    training curve would only inflate the review context.  Scientific scalar
+    fields (metrics, seed_results, runtime) are preserved verbatim.
+    """
+    compact = {key: value for key, value in result.items() if key != "epoch_metrics"}
+    seed_results = compact.get("seed_results")
+    if isinstance(seed_results, list):
+        compact["seed_results"] = [
+            (
+                {key: value for key, value in item.items() if key != "epoch_metrics"}
+                if isinstance(item, dict)
+                else item
+            )
+            for item in seed_results
+        ]
+    return compact
 
 
 def _validated_comparisons(value, metrics: dict) -> list[dict]:
@@ -105,7 +172,25 @@ class ExperimentAgent:
         self.llm_provider = llm_provider
 
     def build_task(self, plan: dict) -> dict:
-        task = self.experiment_provider.plan(plan, plan.get("experiment_constraints", {"seed": 7}))
+        raw_constraints = plan.get("experiment_constraints")
+        constraints = dict(raw_constraints) if isinstance(raw_constraints, dict) else {}
+        execution_seeds = [
+            int(seed)
+            for seed in (plan.get("seeds") or [])
+            if isinstance(seed, int) and not isinstance(seed, bool)
+        ]
+        if execution_seeds:
+            # The backend-preregistered plan contract is authoritative.  Keep the
+            # provider command, task metadata, and multi-seed harness on the same
+            # primary seed instead of leaking the historical placeholder ``7``.
+            constraints["seed"] = execution_seeds[0]
+            constraints["seeds"] = list(execution_seeds)
+        else:
+            constraints.setdefault("seed", 7)
+        task = self.experiment_provider.plan(plan, constraints)
+        if execution_seeds:
+            task["seed"] = execution_seeds[0]
+            task["seeds"] = list(execution_seeds)
         dataset = plan.get("dataset") or {}
         # The plan is authoritative; providers may not select a replacement.
         task["dataset"] = dataset.get("canonical_name") or ""
@@ -137,7 +222,12 @@ class ExperimentAgent:
             },
             instructions="\n\n".join(
                 part
-                for part in (instructions, _CLASSIFICATION_SMOKE_INSTRUCTIONS, output_contract)
+                for part in (
+                    instructions,
+                    _CLASSIFICATION_SMOKE_INSTRUCTIONS,
+                    _RUNTIME_SEED_INSTRUCTIONS,
+                    output_contract,
+                )
                 if part
             ),
         )
@@ -155,6 +245,7 @@ class ExperimentAgent:
         require_smoke_test: bool = False,
         validate: bool = True,
         capture: dict | None = None,
+        implementation_base: dict | None = None,
     ) -> ExperimentBundle:
         if self.llm_provider is None or self.llm_provider.fallback:
             if (plan.get("dataset") or {}).get("contract_id"):
@@ -173,10 +264,8 @@ class ExperimentAgent:
             for key in ("name", "dataset", "dataset_contract_id", "dataset_root", "seed")
             if key in task
         }
-        # Agent-local text is limited to the transport representation.  The assigned
-        # experiment-implementation Skill is the single source for behavior.
-        plan_parameters = dict(plan.get("parameters") or {})
-        plan_seeds = [int(item) for item in plan.get("seeds") or []]
+        # Agent-local text is limited to the transport representation. The
+        # backend injects every execution-contract field after generation.
         plan_metrics = [
             str(item.get("metric"))
             for item in plan.get("evaluations") or []
@@ -185,9 +274,10 @@ class ExperimentAgent:
         output_contract = "\n\n".join(
             part for part in (
                 _BUNDLE_TRANSPORT_INSTRUCTIONS,
-                "Accepted Plan fields are immutable runtime inputs. Return these exact "
-                f"values in the Bundle: seeds={plan_seeds}; parameters={json.dumps(plan_parameters, ensure_ascii=False, sort_keys=True)}; "
-                f"expected_metrics={plan_metrics or ['test_accuracy']}. Do not replace them with schema examples.",
+                "Return only train.py source files and third-party requirements. "
+                "The backend owns and injects dataset identity, runtime flags, metrics, "
+                "parameters, seeds, identifiers, and output paths; do not return them.",
+                _result_contract_instructions(plan_metrics or ["test_accuracy"]),
             ) if part
         )
         raw = self.llm_provider.generate_json(
@@ -204,6 +294,9 @@ class ExperimentAgent:
                 },
                 "dataset_card": card,
                 "observed_structure": self._observed_structure_for(plan, task),
+                # A PIVOT may reuse a previously audited implementation as a
+                # read-only source base. The model still returns a full bundle.
+                "implementation_base": deepcopy(implementation_base or {}),
             },
             {
                 "files": [
@@ -217,12 +310,6 @@ class ExperimentAgent:
                     }
                 ],
                 "requirements": ["numpy", "torch", "torchvision"],
-                "requires_gpu": True,
-                "dataset": "" if local_contract else "cifar-10",
-                "expected_metrics": plan_metrics or ["test_accuracy"],
-                "parameters": plan_parameters,
-                "seeds": plan_seeds,
-                "supports_smoke_test": True,
             },
             instructions="\n\n".join(
                 part
@@ -230,6 +317,7 @@ class ExperimentAgent:
                     instructions,
                     self._local_dataset_layout_instructions(plan),
                     _OBSERVED_STRUCTURE_INSTRUCTIONS,
+                    _RUNTIME_SEED_INSTRUCTIONS,
                     (
                         "Locked Dataset\n"
                         f"Canonical Name: {contract_canonical_name(locked_dataset) or '(generic local dataset)'}\n"
@@ -242,6 +330,15 @@ class ExperimentAgent:
                         else ""
                     ),
                     _CLASSIFICATION_SMOKE_INSTRUCTIONS,
+                    (
+                        "PIVOT implementation rule: implementation_base is a read-only, "
+                        "previously audited source snapshot. Start from it and make only the "
+                        "declared change_set needed by the current Plan. Preserve the loader, "
+                        "split, controls, metric calculation, runtime scaffold, and result "
+                        "serialization unless the current Plan explicitly changes one of them."
+                        if implementation_base
+                        else ""
+                    ),
                     output_contract,
                 )
                 if part
@@ -251,7 +348,7 @@ class ExperimentAgent:
             capture["raw_model_output"] = deepcopy(raw)
         try:
             bundle = normalize_experiment_bundle(
-                raw,
+                _system_bundle_payload(raw, plan, task),
                 run_id,
                 experiment_id,
                 {**task, "plan": task.get("plan") or plan},
@@ -356,7 +453,11 @@ class ExperimentAgent:
                     instructions,
                     self._local_dataset_layout_instructions(plan),
                     _OBSERVED_STRUCTURE_INSTRUCTIONS,
+                    _RUNTIME_SEED_INSTRUCTIONS,
                     _CLASSIFICATION_SMOKE_INSTRUCTIONS,
+                    _result_contract_instructions(
+                        list(frozen.get("expected_metrics") or [])
+                    ),
                     "Return only the schema-conforming repaired files and requirements. "
                     "The accepted manifest is immutable and will be enforced by the runtime.",
                     (
@@ -381,16 +482,11 @@ class ExperimentAgent:
             capture["raw_model_output"] = deepcopy(raw)
         try:
             repaired = normalize_experiment_bundle(
-                {
-                    "files": raw.get("files"),
-                    "requirements": raw.get("requirements") or previous_requirements,
-                    "requires_gpu": bool(frozen.get("requires_gpu")),
-                    "dataset": str(frozen.get("dataset") or ""),
-                    "expected_metrics": list(frozen.get("expected_metrics") or []),
-                    "parameters": dict(frozen.get("parameters") or {}),
-                    "seeds": list(frozen.get("seeds") or []),
-                    "supports_smoke_test": bool(frozen.get("supports_smoke_test")),
-                },
+                _system_bundle_payload(
+                    {**raw, "requirements": raw.get("requirements") or previous_requirements},
+                    plan,
+                    task,
+                ),
                 str(frozen.get("run_id") or task.get("run_id") or "run_1"),
                 str(frozen.get("experiment_id") or task.get("experiment_id") or "experiment_1"),
                 {**task, "plan": task.get("plan") or plan},
@@ -413,17 +509,17 @@ class ExperimentAgent:
             "run_id": str(task.get("run_id") or ""),
             "experiment_id": str(task.get("experiment_id") or ""),
             "result_id": str(task.get("result_id") or ""),
-            "requires_gpu": bool(candidate.get("requires_gpu")),
+            "requires_gpu": bool(_system_bundle_payload({}, plan, task).get("requires_gpu")),
             "dataset": contract_canonical_name(dataset) or "",
             "dataset_contract_id": str(dataset.get("contract_id") or ""),
             "dataset_fingerprint": str(dataset.get("content_fingerprint") or ""),
-            "expected_metrics": [str(item) for item in candidate.get("expected_metrics") or []],
+            "expected_metrics": _system_bundle_payload({}, plan, task)["expected_metrics"],
             # A rejected model candidate has no authority to redefine the
             # accepted Plan.  Freezing its schema-example defaults poisons every
             # subsequent repair, so preserve the Plan's scientific inputs here.
             "parameters": dict(plan.get("parameters") or {}),
             "seeds": [int(item) for item in plan.get("seeds") or []],
-            "supports_smoke_test": bool(candidate.get("supports_smoke_test")),
+            "supports_smoke_test": True,
         }
 
     @staticmethod
@@ -520,7 +616,7 @@ class ExperimentAgent:
                 {
                     "plan": plan,
                     "manifest": task.get("manifest") or {},
-                    "result": result,
+                    "result": _compact_result_for_audit(result),
                 },
                 {
                     "experiment_id": "string",
@@ -627,11 +723,19 @@ class ExperimentAgent:
                         issues.append("FORMAL_SEED_RESULT_METRICS_INVALID")
                         break
 
-        if self.llm_provider is not None:
+        # A runtime-bound result has already been checked against the compiled
+        # Harness contract above. Keep that deterministic audit authoritative;
+        # an LLM review must not reject or rewrite a successfully executed run.
+        if self.llm_provider is not None and not runtime_bound:
             semantic = self.llm_provider.generate_json(
                 "experiment.audit_result",
                 {
                     "manifest": manifest.model_dump(),
+                    "runtime_contract": (
+                        bundle.runtime_contract.model_dump()
+                        if bundle.runtime_contract is not None
+                        else None
+                    ),
                     "files": [
                         {
                             "path": item.path,
@@ -640,7 +744,7 @@ class ExperimentAgent:
                         }
                         for item in bundle.files
                     ],
-                    "result": result,
+                    "result": _compact_result_for_audit(result),
                 },
                 {
                     "integrity_status": "passed|failed",
@@ -651,7 +755,15 @@ class ExperimentAgent:
                 },
                 instructions=instructions,
             )
-            issues.extend(_string_list(semantic.get("issues")))
+            # The semantic reviewer may include contextual observations.  Only
+            # concrete inconsistencies belong in the failure set; an advisory
+            # explicitly labelled INFO/NOTE must not turn a valid real result
+            # into an audit failure.
+            issues.extend(
+                item
+                for item in _string_list(semantic.get("issues"))
+                if not item.strip().upper().startswith(("INFO:", "NOTE:"))
+            )
 
         provider_reports_real = bool(result.get("is_real_experiment"))
         issues = list(dict.fromkeys(issues))
@@ -713,7 +825,10 @@ class ExperimentAgent:
                     f"planned={expected_fingerprint}:bundle={bundle.manifest.dataset_fingerprint or '(missing)'}"
                 )
             source = "\n".join(item.content for item in bundle.files)
-            if "DATA_ROOT" not in source:
+            uses_runtime_data_root = bool(
+                re.search(r"\b(?:gewu_runtime|gr)\.\s*data_root\s*\(", source)
+            )
+            if "DATA_ROOT" not in source and not uses_runtime_data_root:
                 issues.append(
                     f"EXPERIMENT_DATASET_ROOT_REQUIRED:contract={contract_id}"
                 )

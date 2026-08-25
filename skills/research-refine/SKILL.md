@@ -10,7 +10,15 @@ Freeze the problem anchor and supported parts of the selected hypothesis. For fe
 
 State the proposed method, mechanism, why it should address the observed weakness, and the evidence or measured observation motivating it. Distinguish verified evidence, measured result, and assumption.
 
-Return the complete shared Plan Contract: `objective`, `hypotheses`, `method`, `dataset`, `comparisons`, `evaluations`, `procedure`, `parameters`, `seeds`, `statistical_summary`, `success_criteria`, `failure_criteria`, `expected_artifacts`, `stop_conditions`, `traceability`, `diagnosis`, `revised_hypothesis`, `mechanism_and_evidence`, `boundary_conditions`, `alignment_contract`, `baseline_and_controls`, `feasibility_risks`, `staged_gates`, `formal_experiment_entry_conditions`, `positive_negative_inconclusive_rules`, `remaining_unknowns`, `capacity_confounder`, and `local_dataset_loader_verification`. Map every method component to a mechanism, every change to feedback, and every decision criterion to a measurable metric. Do not widen the contribution or add optional complexity unless it resolves a concrete failure.
+Return the complete shared Plan Contract: `objective`, `hypotheses`, `method`, `dataset`, `comparisons`, `evaluations`, `procedure`, `parameters`, `statistical_summary`, `success_criteria`, `failure_criteria`, `expected_artifacts`, `stop_conditions`, `traceability`, `diagnosis`, `revised_hypothesis`, `mechanism_and_evidence`, `boundary_conditions`, `alignment_contract`, `baseline_and_controls`, `feasibility_risks`, `staged_gates`, `formal_experiment_entry_conditions`, `positive_negative_inconclusive_rules`, `remaining_unknowns`, `capacity_confounder`, and `local_dataset_loader_verification`. The backend owns concrete seeds: give only `procedure.repetitions`. Map every method component to a mechanism, every change to feedback, and every decision criterion to a measurable metric. Do not widen the contribution or add optional complexity unless it resolves a concrete failure.
+
+For a `PIVOT`, write one unitary new claim identically in `objective`,
+`hypotheses`, `primary_claim`, and `revised_hypothesis.claim`; do not retain the
+contradicted parent wording in any of those fields. State the minimal code-level
+intent (file/area and semantic change), and mark inherited loader, split,
+baseline, controls, metrics, and runtime protocol as unchanged. Do not make a
+historical failed variant a new required arm unless the new claim directly
+compares against it.
 
 ## Bounded review revision
 

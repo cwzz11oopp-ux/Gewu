@@ -47,14 +47,64 @@ def validate_result_payload(payload: object, manifest: ExperimentManifest) -> di
     if not isinstance(metrics, dict):
         raise RuntimeError("EXPERIMENT_METRICS_INVALID")
     for metric in manifest.expected_metrics:
-        if metric not in metrics:
+        if metric in metrics:
+            continue
+        # Runtime metrics are intentionally scalar-only.  A plan can declare a
+        # decomposed measure such as "per latent dimension"; in that case the
+        # implementation must flatten it into uniquely named scalar entries
+        # instead of overwriting one dictionary key with every component.
+        derived_scalar_metrics = (
+            " per " in metric.lower()
+            and any(name.startswith(f"{metric}_") for name in metrics)
+        )
+        if not derived_scalar_metrics:
             raise RuntimeError(f"EXPERIMENT_METRIC_MISSING:{metric}")
     for name, value in metrics.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise RuntimeError(f"EXPERIMENT_METRIC_INVALID:{name}")
         if not math.isfinite(float(value)):
             raise RuntimeError(f"EXPERIMENT_METRIC_NON_FINITE:{name}")
-    return payload
+    return _lenient_epoch_history(payload)
+
+
+def _lenient_epoch_history(payload: dict) -> dict:
+    """Pass through a validated observational epoch history, dropping bad rows.
+
+    Per-epoch arrays are observational only and never gate a scientific result.
+    A malformed history is sanitized here rather than failing the experiment.
+    """
+    history = payload.get("epoch_metrics")
+    if history is None:
+        return payload
+    if not isinstance(history, list) or not history:
+        return _without_epoch_history(payload)
+    cleaned: list[dict[str, object]] = []
+    for item in history:
+        if not isinstance(item, dict) or "epoch" not in item:
+            continue
+        epoch = item.get("epoch")
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, (int, float))
+            or not math.isfinite(float(epoch))
+            or float(epoch) < 1
+        ):
+            continue
+        row: dict[str, object] = {"epoch": int(epoch)}
+        for name, value in item.items():
+            if name == "epoch":
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                continue
+            row[str(name)] = float(value)
+        cleaned.append(row)
+    if not cleaned:
+        return _without_epoch_history(payload)
+    return {**payload, "epoch_metrics": cleaned}
+
+
+def _without_epoch_history(payload: dict) -> dict:
+    return {key: value for key, value in payload.items() if key != "epoch_metrics"}
 
 
 def cuda_probe_command(python: str) -> list[str]:

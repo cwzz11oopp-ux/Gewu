@@ -2,7 +2,7 @@ from docx import Document
 
 from backend.app.models.artifact import Artifact
 from backend.app.report_visualization import build_report_spec, render_figure_png
-from backend.app.reporting import build_report_docx
+from backend.app.reporting import FIGURE_SECTION, build_report_docx
 
 
 def artifact(kind: str, content: dict, identifier: str) -> Artifact:
@@ -47,6 +47,50 @@ def test_report_spec_uses_persisted_values_and_never_invents_training_curve():
     assert render_figure_png(figures["main_comparison"]).startswith(b"\x89PNG")
 
 
+def test_visual_anchors_are_selected_and_distributed_before_results():
+    plan = artifact(
+        "plan",
+        {
+            "comparisons": [{"baseline": "CNN", "variant": "CNN + Label Smoothing"}],
+            "parameters": {"learning_rate": 0.001, "batch_size": 64},
+            "seeds": [1, 2],
+            "procedure": {"steps": ["train", "evaluate"]},
+        },
+        "art_plan",
+    )
+    result = artifact(
+        "experiment_result",
+        {
+            "metrics": {"Baseline_Test_Accuracy": 0.88, "LS_Test_Accuracy": 0.89},
+            "seed_results": [
+                {"seed": 1, "Baseline_Test_Accuracy": 0.87, "LS_Test_Accuracy": 0.89},
+                {"seed": 2, "Baseline_Test_Accuracy": 0.89, "LS_Test_Accuracy": 0.90},
+            ],
+            "epoch_metrics": [
+                {"epoch": 1, "loss": 1.2},
+                {"epoch": 2, "loss": 0.8},
+            ],
+        },
+        "art_result",
+    )
+
+    spec = build_report_spec(
+        [plan, result],
+        selected_figure_ids=[
+            "model_structure", "method_pipeline", "control_variables", "workflow_timeline",
+            "training_curve", "main_comparison", "seed_comparison", "seed_delta",
+        ],
+    )
+
+    figure_ids = [item["figure_id"] for item in spec["figures"]]
+    assert figure_ids[:5] == [
+        "model_structure", "method_pipeline", "control_variables", "workflow_timeline", "training_curve",
+    ]
+    assert [FIGURE_SECTION[figure_id] for figure_id in figure_ids] == [
+        "method", "design", "design", "iteration", "iteration", "results", "results", "results",
+    ]
+
+
 def test_docx_embeds_only_report_spec_figures_and_lists_missing_data_reason():
     result = artifact("experiment_result", {"metrics": {"A": 0.8, "B": 0.9}}, "art_result")
     spec = build_report_spec([result], selected_figure_ids=["main_comparison"], decision_rationale="主比较图即可。")
@@ -58,3 +102,173 @@ def test_docx_embeds_only_report_spec_figures_and_lists_missing_data_reason():
     document = Document(__import__("io").BytesIO(payload))
     assert len(document.inline_shapes) == 1
     assert any("未生成 training_curve" in paragraph.text for paragraph in document.paragraphs)
+
+
+def test_model_comparison_figure_uses_frozen_plan_and_never_invents_eca():
+    plan = artifact(
+        "plan",
+        {
+            "method": {
+                "name": "固定预算下的标签平滑实验",
+                "components": ["仅修改损失函数"],
+            },
+            "comparisons": [
+                {
+                    "baseline": "Standard Cross-Entropy Loss",
+                    "variant": "Label Smoothing Loss (epsilon=0.1)",
+                }
+            ],
+        },
+        "art_plan",
+    )
+
+    spec = build_report_spec(
+        [plan],
+        selected_figure_ids=["model_structure"],
+    )
+
+    figure = next(item for item in spec["figures"] if item["figure_id"] == "model_structure")
+    serialized = str(figure)
+    assert "Standard Cross-Entropy Loss" in serialized
+    assert "Label Smoothing Loss (epsilon=0.1)" in serialized
+    assert "ECA" not in serialized
+    assert "四层卷积" not in serialized
+    assert "浅层特征" not in serialized
+
+
+def test_model_comparison_figure_is_omitted_without_explicit_comparison():
+    plan = artifact(
+        "plan",
+        {"method": {"name": "ECA method", "components": ["ECA"]}},
+        "art_plan",
+    )
+
+    spec = build_report_spec([plan], selected_figure_ids=["model_structure"])
+
+    assert not any(item["figure_id"] == "model_structure" for item in spec["figures"])
+
+
+def test_harness_metric_aliases_produce_accuracy_and_seed_delta_figures():
+    result = artifact(
+        "experiment_result",
+        {
+            "metrics": {
+                "Baseline_Test_Accuracy": 0.883,
+                "LS_Test_Accuracy": 0.8857,
+                "Test Accuracy": 0.8857,
+                "Baseline_Final_Training_Loss": 0.2736,
+                "Final Training Loss": 0.7408,
+            },
+            "seed_results": [
+                {
+                    "seed": 1,
+                    "metrics": {
+                        "Baseline_Test_Accuracy": 0.8834,
+                        "LS_Test_Accuracy": 0.8889,
+                        "Test Accuracy": 0.8889,
+                    },
+                },
+                {
+                    "seed": 2,
+                    "metrics": {
+                        "Baseline_Test_Accuracy": 0.8822,
+                        "LS_Test_Accuracy": 0.8849,
+                        "Test Accuracy": 0.8849,
+                    },
+                },
+            ],
+        },
+        "art_result",
+    )
+
+    spec = build_report_spec(
+        [result],
+        selected_figure_ids=["main_comparison", "seed_comparison", "seed_delta"],
+    )
+    figures = {item["figure_id"]: item for item in spec["figures"]}
+
+    assert figures["main_comparison"]["chart"]["labels"] == ["测试准确率"]
+    assert figures["main_comparison"]["chart"]["series"][0]["values"] == [0.883]
+    assert figures["main_comparison"]["chart"]["series"][1]["values"] == [0.8857]
+    assert figures["seed_comparison"]["chart"]["series"][1]["values"] == [0.8889, 0.8849]
+    assert figures["seed_delta"]["chart"]["series"][0]["values"] == [
+        0.8889 - 0.8834,
+        0.8849 - 0.8822,
+    ]
+
+
+def test_narrative_support_tables_hide_planning_metadata_and_deduplicate_aliases():
+    report = {
+        "Paper Title": "Label Smoothing 报告",
+        "Paper Abstract": "摘要",
+        "Narrative Sections": [
+            {"id": "design", "title": "实验设计", "paragraphs": ["设计正文"]},
+            {"id": "results", "title": "实验结果", "paragraphs": ["结果正文"]},
+            {"id": "conclusion", "title": "研究结论", "paragraphs": ["结论正文"]},
+        ],
+        "Experiments": {
+            "parameters": {
+                "epochs": 5,
+                "optimizer": "SGD",
+                "label_smoothing_epsilon": 0.1,
+                "additional_sections": {
+                    "training_budget_rationale": "unverified planning rationale"
+                },
+            },
+            "seeds": [1, 2],
+        },
+        "Results": {
+            "metric_summary": {
+                "Baseline_Test_Accuracy": {"mean": 0.883, "std": 0.001},
+                "LS_Test_Accuracy": {"mean": 0.886, "std": 0.002},
+                "Test Accuracy": {"mean": 0.886, "std": 0.002},
+            },
+            "seed_results": [
+                {
+                    "seed": 1,
+                    "metrics": {
+                        "Baseline_Test_Accuracy": 0.883,
+                        "LS_Test_Accuracy": 0.887,
+                        "Test Accuracy": 0.887,
+                    },
+                },
+                {
+                    "seed": 2,
+                    "metrics": {
+                        "Baseline_Test_Accuracy": 0.882,
+                        "LS_Test_Accuracy": 0.885,
+                        "Test Accuracy": 0.885,
+                    },
+                },
+            ],
+        },
+        "Reproducibility": {
+            "experiment_id": "experiment_1",
+            "parameters": {
+                "epochs": 5,
+                "optimizer": "SGD",
+                "label_smoothing_epsilon": 0.1,
+                "additional_sections": {
+                    "training_budget_rationale": "unverified planning rationale"
+                },
+            },
+            "seeds": [1, 2],
+        },
+    }
+
+    document = Document(
+        __import__("io").BytesIO(
+            build_report_docx(report, run_id="run_visual", run_title="Label Smoothing 报告")
+        )
+    )
+    text = "\n".join(
+        [paragraph.text for paragraph in document.paragraphs]
+        + [cell.text for table in document.tables for row in table.rows for cell in row.cells]
+    )
+
+    assert "additional sections" not in text.lower()
+    assert "training budget rationale" not in text.lower()
+    assert "unverified planning rationale" not in text
+    assert "标签平滑系数 ε" in text
+    assert "LS Test Accuracy" not in text
+    assert "逐随机种子的测试准确率配对结果" in text

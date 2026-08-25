@@ -27,6 +27,7 @@ class WikiChangeSet(BaseModel):
     gaps: list[dict] = Field(default_factory=list)
     edges: list[dict] = Field(default_factory=list)
     origin_run_id: str
+    knowledge_base_id: str = "default"
 
 
 class WikiCommitResult(BaseModel):
@@ -54,7 +55,15 @@ class ResearchWikiStore:
             if not path.exists():
                 path.write_text(content, encoding="utf-8")
 
-    def query(self, topic: str, limit: int = 8) -> WikiQueryResult:
+    def query(
+        self,
+        topic: str,
+        limit: int = 8,
+        knowledge_base_id: str = "default",
+    ) -> WikiQueryResult:
+        scoped = self._scoped_store(knowledge_base_id)
+        if scoped is not self:
+            return scoped.query(topic, limit=limit)
         self.initialize()
         degraded = not self._edges_are_valid()
         papers = self._load_nodes("papers")
@@ -117,7 +126,10 @@ class ResearchWikiStore:
         temp.replace(path)
         return content
 
-    def stats(self) -> dict[str, int]:
+    def stats(self, knowledge_base_id: str = "default") -> dict[str, int]:
+        scoped = self._scoped_store(knowledge_base_id)
+        if scoped is not self:
+            return scoped.stats()
         self.initialize()
         return {
             "papers": len(self._load_nodes("papers")),
@@ -132,6 +144,12 @@ class ResearchWikiStore:
         changes: WikiChangeSet,
         actor: str,
     ) -> WikiCommitResult:
+        scoped = self._scoped_store(changes.knowledge_base_id)
+        if scoped is not self:
+            return scoped.commit_changes(
+                changes.model_copy(update={"knowledge_base_id": "default"}),
+                actor,
+            )
         if actor != "supervisor":
             raise ValueError("WIKI_COMMIT_REJECTED")
         for gap in changes.gaps:
@@ -239,6 +257,16 @@ class ResearchWikiStore:
             gap_count=gap_count,
             edge_count=edge_count,
             node_ids=list(dict.fromkeys(node_ids)),
+        )
+
+    def _scoped_store(self, knowledge_base_id: str) -> "ResearchWikiStore":
+        scope = knowledge_base_id.strip() or "default"
+        if scope == "default":
+            return self
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+        return ResearchWikiStore(
+            self.root / "knowledge-bases" / digest,
+            query_pack_limit=self.query_pack_limit,
         )
 
     def _load_nodes(self, directory: str) -> list[dict]:

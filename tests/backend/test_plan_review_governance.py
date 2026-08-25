@@ -20,6 +20,7 @@ from backend.app.workflow.orchestrator import WorkflowOrchestrator
 from backend.app.workflow.plan_review_governance import (
     PlanReviewPolicyIntegrityError,
     adjudicate_review,
+    canonical_sha256,
     fix_map_issues,
     is_plan_governance_accepted,
 )
@@ -113,7 +114,11 @@ class BoundedReviewLLM(MockLLMProvider):
                     issue_id: ["additional_sections"] for issue_id in blocker_ids
                 },
             }
-        return super().generate_json(task, inputs, schema_hint, instructions)
+        result = super().generate_json(task, inputs, schema_hint, instructions)
+        if task == "planning.build_plan":
+            result = deepcopy(result)
+            result.setdefault("parameters", {})["epochs"] = 1
+        return result
 
 
 def _ready_engine(tmp_path, llm, *, skill_loader=None):
@@ -275,6 +280,34 @@ def test_closed_blocker_with_legal_closure_evidence_does_not_require_required_fi
     )
     assert closed.verdict == "ACCEPT"
     assert closed.issues[0]["status"] == "CLOSED"
+
+
+def test_closure_can_cite_actual_repair_fields_without_mutating_blocker_scope():
+    opened = adjudicate_review(
+        [], _review(_issue(field="capacity_confounder")), frozen_policy=POLICY, round_index=1
+    )
+    closed = adjudicate_review(
+        opened.issues,
+        _review(
+            _issue(
+                field="primary_experiment",
+                status="CLOSED",
+                required_fix=None,
+                resolution="The candidate restores the frozen 16/32 architecture.",
+                evidence_artifact_ids=["plan-2"],
+            ),
+            verdict="ACCEPT",
+            closed=("PRI-control",),
+        ),
+        frozen_policy=POLICY,
+        round_index=2,
+        changed_fields=("primary_experiment",),
+        candidate_plan_id="plan-2",
+        review_id="review-2",
+    )
+    assert closed.verdict == "ACCEPT"
+    assert closed.validated_open_blocker_ids == ()
+    assert closed.issues[0]["contract_fields"] == ["capacity_confounder"]
 
 
 @pytest.mark.parametrize("term", ["tensor axis", "dtype", "FFT window", "loader mapping"])
@@ -723,6 +756,82 @@ def test_continue_endpoint_path_reaches_experiment_after_old_plan_recovery(tmp_p
     )
 
 
+def test_recovered_acceptance_allows_feedback_proposal_and_change_request(tmp_path):
+    llm = BoundedReviewLLM([_review(_issue()), _review(_issue()), _review(_issue())])
+    repo, engine, run = _ready_engine(tmp_path, llm)
+    WorkflowOrchestrator(repo, lambda: engine)._drive(run.id)
+    stopped = repo.get_run(run.id)
+    latest_review = next(
+        item for item in reversed(stopped.artifacts) if item.type == "plan_review"
+    )
+    latest_review.content["issues"][0].update(
+        title="tensor axis needs runtime confirmation",
+        reason="tensor axis is an implementation detail",
+        required_fix="Confirm the tensor axis in the loader/harness.",
+    )
+    repo.save_run(stopped)
+
+    assert engine.recover_plan_review_for_continue(run.id) is True
+    accepted = engine.run_step(run.id, "research_plan")
+    policy = next(item for item in accepted.artifacts if item.type == "plan_review_policy")
+    base_plan = next(item for item in reversed(accepted.artifacts) if item.type == "plan")
+    base_candidate = next(
+        item
+        for item in accepted.artifacts
+        if item.id == base_plan.content["plan_candidate_id"]
+    )
+    feedback = repo.add_artifact(
+        run.id,
+        "revision",
+        "Feedback Revision",
+        {"verdict": "partial", "requires_follow_up": True},
+        "feedback_revision",
+        "test",
+        parent_artifact_id=base_plan.id,
+    )
+    proposal_payload = {
+        "schema_version": 1,
+        "policy_artifact_id": policy.id,
+        "policy_payload_sha256": policy.content["policy_payload_sha256"],
+        "base_plan_artifact_id": base_plan.id,
+        "base_candidate_id": base_candidate.id,
+        "feedback_revision_id": feedback.id,
+        "iteration": 1,
+        "normalized_plan": deepcopy(base_plan.content),
+    }
+    proposal = repo.add_artifact(
+        run.id,
+        "plan_refinement_proposal",
+        "Research Plan Refinement Proposal",
+        {
+            **proposal_payload,
+            "proposal_payload_sha256": canonical_sha256(proposal_payload),
+        },
+        "research_plan",
+        "test",
+        parent_artifact_id=feedback.id,
+    )
+    llm.reviews.append(_review(verdict="ACCEPT"))
+
+    continued = engine.run_step(run.id, "research_plan")
+    requests = [
+        item
+        for item in continued.artifacts
+        if item.type == "plan_review_change_request"
+        and (item.content or {}).get("proposal_id") == proposal.id
+    ]
+    assert len(requests) == 1
+    assert is_plan_governance_accepted(continued.artifacts)
+
+    frozen = engine_module.validate_frozen_review_policy(policy.content or {})
+    engine._validate_plan_governance_history(
+        continued.artifacts,
+        policy,
+        frozen,
+        frozen["research_constraints_reference"],
+    )
+
+
 @pytest.mark.parametrize("corruption", ["missing", "multiple", "policy_hash", "skill_hash"])
 def test_policy_corruption_fails_closed_with_recoverable_state(tmp_path, corruption):
     repo, engine, run = _ready_engine(
@@ -1152,3 +1261,86 @@ def test_round_checkpoint_resume_is_idempotent(tmp_path, crash_point):
     assert len([item for item in completed.artifacts if item.type == "research_plan_candidate"]) == 2
     assert len([item for item in completed.artifacts if item.type == "plan_review_issue_ledger"]) == 2
     assert len({(item.content["round_index"], item.content["plan_id"]) for item in completed.artifacts if item.type == "plan_review_issue_ledger"}) == 2
+
+
+def test_revision_patch_schema_narrows_to_blocker_fields_only():
+    from backend.app.agents.planner import plan_revision_patch_schema
+
+    blockers = [
+        {"issue_id": "PRI-a", "contract_fields": ["comparisons"]},
+        {"issue_id": "PRI-b", "contract_fields": ["dataset_identity"]},
+    ]
+    schema = plan_revision_patch_schema(blockers)
+    # Named fields (alias canonicalized) plus fix_map.
+    assert set(schema) == {"comparisons", "dataset", "fix_map"}
+    # Unnamed fields are structurally impossible for the model to output.
+    assert "objective" not in schema
+    assert "procedure" not in schema
+    assert "statistical_summary" not in schema
+
+
+def test_revision_patch_schema_handles_canonical_fields_outside_full_schema():
+    from backend.app.agents.planner import plan_revision_patch_schema
+
+    schema = plan_revision_patch_schema(
+        [{"issue_id": "PRI-split", "contract_fields": ["split_contract"]}]
+    )
+    # split_contract is a canonical registry field not present in _PLAN_SCHEMA;
+    # the builder still emits an entry from the registry description.
+    assert "split_contract" in schema
+    assert isinstance(schema["split_contract"], str) and schema["split_contract"]
+    assert schema["fix_map"] is not None
+
+
+def test_revision_patch_schema_ignores_unknown_fields_and_falls_back_when_empty():
+    from backend.app.agents.planner import plan_revision_patch_schema
+
+    # Unknown field is silently dropped, known field kept.
+    schema = plan_revision_patch_schema(
+        [{"issue_id": "PRI-x", "contract_fields": ["not_a_real_field", "evaluations"]}]
+    )
+    assert set(schema) == {"evaluations", "fix_map"}
+    # No blocker names a field -> the full optional schema is the fallback.
+    full = plan_revision_patch_schema([])
+    assert "objective" in full
+    assert "procedure" in full
+    assert "fix_map" in full
+
+
+def test_backend_preregisters_seeds_before_plan_review_and_reuses_them(tmp_path):
+    llm = BoundedReviewLLM([_review(verdict="ACCEPT")])
+    repo, engine, run = _ready_engine(tmp_path, llm)
+    stored = repo.get_run(run.id)
+    stored.research_constraints = {
+        "seed_policy": {"count": 3, "fixed": True},
+    }
+    repo.save_run(stored)
+
+    completed = engine.run_step(run.id, "research_plan")
+    contracts = [
+        item for item in completed.artifacts
+        if item.type == "execution_seed_contract"
+    ]
+    assert len(contracts) == 1
+    seeds = contracts[0].content["seeds"]
+    assert len(seeds) == 3
+    assert len(set(seeds)) == 3
+    assert contracts[0].content["allocation"] == "backend_preregistered"
+
+    candidate = next(
+        item for item in completed.artifacts
+        if item.type == "research_plan_candidate"
+    )
+    final_plan = next(item for item in completed.artifacts if item.type == "plan")
+    assert candidate.content["normalized_plan"]["seeds"] == seeds
+    assert final_plan.content["seeds"] == seeds
+    review_call = next(call for call in llm.calls if call[0] == "planning.review_plan")
+    assert review_call[1]["current_research_plan"]["seeds"] == seeds
+
+    reused = engine._ensure_backend_execution_seed_contract(
+        run.id,
+        constraints={"seed_policy": {"count": 3}},
+        plan={"procedure": {"repetitions": 5}},
+    )
+    assert reused.id == contracts[0].id
+    assert reused.content["seeds"] == seeds

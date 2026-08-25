@@ -3,12 +3,12 @@ from __future__ import annotations
 from io import BytesIO
 from html import escape
 import json
+import re
 from typing import Any
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -40,6 +40,19 @@ BLUE = RGBColor(31, 78, 121)
 DARK = RGBColor(31, 41, 55)
 MUTED = RGBColor(100, 116, 139)
 LIGHT_FILL = "F2F4F7"
+TABLE_INDENT_DXA = 120
+TABLE_CELL_MARGIN_DXA = {"top": 80, "bottom": 80, "start": 120, "end": 120}
+
+FIGURE_SECTION = {
+    "model_structure": "method",
+    "method_pipeline": "design",
+    "control_variables": "design",
+    "workflow_timeline": "iteration",
+    "training_curve": "iteration",
+    "main_comparison": "results",
+    "seed_comparison": "results",
+    "seed_delta": "results",
+}
 
 
 def render_report_html(report: dict, *, run_id: str, run_title: str) -> str:
@@ -48,17 +61,7 @@ def render_report_html(report: dict, *, run_id: str, run_title: str) -> str:
     status = report.get("Report Status") if isinstance(report.get("Report Status"), dict) else {}
     experiment_label = "真实实验" if status.get("real_experiment") is True else "未通过真实实验审计"
     sections = []
-    v2_sections = report.get("V2 Sections")
-    narrative_sections = []
-    if isinstance(v2_sections, list):
-        for section in v2_sections:
-            if not isinstance(section, dict) or not section.get("title"):
-                continue
-            sections.append(
-                f"<section><h2>{escape(str(section['title']))}</h2>"
-                f"<pre>{escape(_short_text(section.get('content'), 12000))}</pre></section>"
-            )
-    for heading, aliases in (() if sections else SECTION_ALIASES):
+    for heading, aliases in SECTION_ALIASES:
         value = _pick(report, *aliases)
         if value in (None, "", [], {}):
             continue
@@ -95,25 +98,15 @@ def build_report_docx(report: dict, *, run_id: str, run_title: str) -> bytes:
             paragraph.add_run("关键词：").bold = True
             paragraph.add_run("；".join(str(item) for item in keywords[:6]))
 
-    _add_report_figures(document, report)
-
-    v2_sections = report.get("V2 Sections")
-    narrative_sections = []
-    if isinstance(v2_sections, list) and v2_sections:
-        for section in v2_sections:
-            if not isinstance(section, dict) or not section.get("title"):
-                continue
-            document.add_heading(str(section["title"]), level=1)
-            _add_human_value(document, section.get("content"))
-    else:
-        narrative_sections = report.get("Narrative Sections")
-    if not (isinstance(v2_sections, list) and v2_sections) and isinstance(narrative_sections, list) and narrative_sections:
+    narrative_sections = report.get("Narrative Sections")
+    if isinstance(narrative_sections, list) and narrative_sections:
         _add_narrative_sections(document, narrative_sections, report)
         references = report.get("References")
         if references:
             document.add_heading("参考文献", level=1)
             _add_references(document, references)
-    elif not (isinstance(v2_sections, list) and v2_sections):
+    else:
+        _add_report_figures(document, report)
         for heading, aliases in SECTION_ALIASES:
             value = _pick(report, *aliases)
             if value in (None, "", [], {}):
@@ -159,30 +152,48 @@ def build_report_zip(report: dict, *, run_id: str, run_title: str, artifacts: li
 
 
 def _add_report_figures(document: Document, report: dict) -> None:
-    """Embed only figures already validated in the persisted ReportSpec."""
+    """Legacy reports place all grounded figures in one block."""
+    for number, figure in _report_figures(report):
+        _add_figure(document, figure, number)
     raw_spec = report.get("Report Spec")
     if not isinstance(raw_spec, dict):
         return
     spec = ReportSpec.model_validate(raw_spec)
-    if not spec.figures and not spec.omitted_figures:
-        return
-    document.add_heading("研究图表与数据来源", level=1)
-    for figure in spec.figures:
-        png = render_figure_png(figure)
-        paragraph = document.add_paragraph()
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.add_run().add_picture(BytesIO(png), width=Inches(6.45))
-        caption = document.add_paragraph()
-        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        caption.paragraph_format.space_after = Pt(8)
-        run = caption.add_run(
-            f"{figure.caption} 数据来源：{'、'.join(figure.source_artifact_ids) or '无'}。"
-        )
-        _set_run_font(run, "宋体", 9, MUTED)
     for omitted in spec.omitted_figures:
-        paragraph = document.add_paragraph(style="List Bullet")
+        paragraph = document.add_paragraph()
+        paragraph.paragraph_format.space_after = Pt(4)
         run = paragraph.add_run(f"未生成 {omitted.figure_id}：{omitted.reason}")
         _set_run_font(run, "宋体", 9, MUTED)
+
+
+def _report_figures(report: dict) -> list[tuple[int, FigureSpec]]:
+    raw_spec = report.get("Report Spec")
+    if not isinstance(raw_spec, dict):
+        return []
+    spec = ReportSpec.model_validate(raw_spec)
+    return list(enumerate(spec.figures, 1))
+
+
+def _add_section_figures(document: Document, report: dict, section_id: str) -> None:
+    for number, figure in _report_figures(report):
+        if FIGURE_SECTION.get(figure.figure_id) == section_id:
+            _add_figure(document, figure, number)
+
+
+def _add_figure(document: Document, figure: FigureSpec, number: int) -> None:
+    png = render_figure_png(figure)
+    paragraph = document.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = Pt(8)
+    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.keep_with_next = True
+    paragraph.add_run().add_picture(BytesIO(png), width=Inches(6.45))
+
+    caption = document.add_paragraph()
+    caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    caption.paragraph_format.space_after = Pt(10)
+    run = caption.add_run(f"图 {number}  {figure.title}。{figure.caption}")
+    _set_run_font(run, "宋体", 9, DARK)
 
 
 def build_experiment_package(*, run_id: str, artifacts: list) -> bytes:
@@ -219,27 +230,27 @@ def _configure_document(document: Document) -> None:
     section = document.sections[0]
     section.page_width = Inches(8.5)
     section.page_height = Inches(11)
-    section.top_margin = Inches(0.86)
-    section.bottom_margin = Inches(0.82)
-    section.left_margin = Inches(0.9)
-    section.right_margin = Inches(0.9)
-    section.header_distance = Inches(0.42)
-    section.footer_distance = Inches(0.42)
+    section.top_margin = Inches(1.0)
+    section.bottom_margin = Inches(1.0)
+    section.left_margin = Inches(1.0)
+    section.right_margin = Inches(1.0)
+    section.header_distance = Inches(0.492)
+    section.footer_distance = Inches(0.492)
 
     styles = document.styles
     normal = styles["Normal"]
     normal.font.name = "宋体"
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    normal.font.size = Pt(10.5)
+    normal.font.size = Pt(11)
     normal.font.color.rgb = DARK
-    normal.paragraph_format.space_after = Pt(7)
-    normal.paragraph_format.line_spacing = 1.35
+    normal.paragraph_format.space_after = Pt(8)
+    normal.paragraph_format.line_spacing = 1.333
 
     for name, size, before, after in (
-        ("Title", 22, 0, 12),
-        ("Heading 1", 15, 16, 8),
-        ("Heading 2", 12, 10, 5),
-        ("Heading 3", 11, 8, 4),
+        ("Title", 28, 0, 12),
+        ("Heading 1", 16, 18, 10),
+        ("Heading 2", 13, 12, 6),
+        ("Heading 3", 12, 8, 4),
     ):
         style = styles[name]
         style.font.name = "微软雅黑"
@@ -255,9 +266,9 @@ def _configure_document(document: Document) -> None:
         style = styles[name]
         style.font.name = "宋体"
         style._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-        style.font.size = Pt(10.5)
-        style.paragraph_format.left_indent = Inches(0.32)
-        style.paragraph_format.first_line_indent = Inches(-0.18)
+        style.font.size = Pt(11)
+        style.paragraph_format.left_indent = Inches(0.375)
+        style.paragraph_format.first_line_indent = Inches(-0.194)
         style.paragraph_format.space_after = Pt(4)
         style.paragraph_format.line_spacing = 1.25
 
@@ -266,17 +277,23 @@ def _add_title_block(document: Document, title: str, subtitle: str, run_id: str)
     kicker = document.add_paragraph()
     kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
     kicker.paragraph_format.space_after = Pt(8)
-    run = kicker.add_run(subtitle)
+    run = kicker.add_run("格物 · 研究报告")
     _set_run_font(run, "微软雅黑", 11, BLUE, True)
 
     paragraph = document.add_paragraph(style="Title")
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.paragraph_format.space_after = Pt(10)
+    paragraph.paragraph_format.space_after = Pt(8)
     paragraph.add_run(title)
+
+    description = document.add_paragraph()
+    description.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    description.paragraph_format.space_after = Pt(8)
+    run = description.add_run(subtitle)
+    _set_run_font(run, "宋体", 11, DARK)
 
     metadata = document.add_paragraph()
     metadata.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    metadata.paragraph_format.space_after = Pt(20)
+    metadata.paragraph_format.space_after = Pt(16)
     run = metadata.add_run(f"运行编号：{run_id}")
     _set_run_font(run, "宋体", 9, MUTED)
 
@@ -332,41 +349,103 @@ def _add_narrative_sections(
 
         section_id = str(section.get("id") or "")
         if section_id == "design":
-            _add_design_support_table(document, report.get("Experiments"))
+            _add_design_support_table(document, report.get("Experiments"), table_number=1)
         elif section_id == "results":
-            _add_result_support_table(document, report.get("Results"))
+            _add_result_support_table(document, report.get("Results"), table_number=2)
         elif section_id == "conclusion":
-            _add_reproducibility_support_table(document, report.get("Reproducibility"))
+            _add_reproducibility_support_table(document, report.get("Reproducibility"), table_number=4)
+        _add_section_figures(document, report, section_id)
 
 
-def _add_design_support_table(document: Document, value: Any) -> None:
+def _add_design_support_table(document: Document, value: Any, *, table_number: int) -> None:
     if not isinstance(value, dict):
         return
     parameters = value.get("parameters") if isinstance(value.get("parameters"), dict) else {}
-    rows = [
-        (_human_label(key), _short_text(item, 240))
-        for key, item in parameters.items()
-        if item not in (None, "", [], {})
-    ]
+    rows = [(_human_label(key), _short_text(item, 240)) for key, item in _public_parameters(parameters)]
     seeds = value.get("seeds") or []
     if seeds:
         rows.append(("随机种子", "、".join(str(item) for item in seeds)))
     if rows:
-        document.add_heading("主要实验参数", level=2)
+        _add_table_caption(document, table_number, "主要实验参数与控制变量")
         _add_label_table(document, rows)
 
 
-def _add_result_support_table(document: Document, value: Any) -> None:
+def _add_result_support_table(document: Document, value: Any, *, table_number: int) -> None:
     if not isinstance(value, dict):
         return
-    metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else {}
-    if metrics:
-        document.add_heading("最终实验指标", level=2)
-        rows = [(_human_label(key), _format_number(item)) for key, item in metrics.items()]
-        _add_table(document, ("指标", "结果"), rows, (3.7, 2.7))
+    summary = value.get("metric_summary") if isinstance(value.get("metric_summary"), dict) else {}
+    pairs = _preferred_metric_pairs(_resolve_metric_pairs(summary, value_kind="summary"))
+    accuracy_pairs = [pair for pair in pairs if "accuracy" in _normalized_metric_name(pair[0])]
+    shown_pairs = accuracy_pairs or pairs[:3]
+    rows = []
+    for metric_name, baseline_key, experiment_key in shown_pairs:
+        baseline = summary[baseline_key]
+        experiment = summary[experiment_key]
+        baseline_mean = baseline.get("mean")
+        experiment_mean = experiment.get("mean")
+        if not isinstance(baseline_mean, (int, float)) or not isinstance(experiment_mean, (int, float)):
+            continue
+        rows.append(
+            (
+                _human_label(metric_name),
+                _format_mean_std(metric_name, baseline),
+                _format_mean_std(metric_name, experiment),
+                _format_metric_delta(metric_name, float(experiment_mean) - float(baseline_mean)),
+            )
+        )
+    if rows:
+        _add_table_caption(document, table_number, "基线模型与实验模型的主要结果")
+        _add_table(document, ("指标", "基线模型", "实验模型", "差值"), rows, (2.2, 1.5, 1.5, 1.3))
+    else:
+        metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else {}
+        if metrics:
+            _add_table_caption(document, table_number, "最终实验指标")
+            fallback_rows = [
+                (_human_label(key), _format_number(item))
+                for key, item in _deduplicated_metrics(metrics)
+            ]
+            _add_table(document, ("指标", "结果"), fallback_rows, (3.75, 2.75))
+
+    seeds = value.get("seed_results") if isinstance(value.get("seed_results"), list) else []
+    seed_rows = []
+    seed_metric_maps = [
+        item.get("metrics") if isinstance(item, dict) and isinstance(item.get("metrics"), dict) else {}
+        for item in seeds
+    ]
+    seed_pairs = (
+        _preferred_metric_pairs(_resolve_metric_pairs(seed_metric_maps[0], value_kind="number"))
+        if seed_metric_maps
+        else []
+    )
+    accuracy_seed_pairs = [pair for pair in seed_pairs if "accuracy" in _normalized_metric_name(pair[0])]
+    selected_seed_pair = (accuracy_seed_pairs or seed_pairs[:1])[:1]
+    if selected_seed_pair:
+        metric_name, baseline_key, experiment_key = selected_seed_pair[0]
+        for index, (item, metrics) in enumerate(zip(seeds, seed_metric_maps)):
+            baseline = metrics.get(baseline_key)
+            experiment = metrics.get(experiment_key)
+            if not isinstance(baseline, (int, float)) or not isinstance(experiment, (int, float)):
+                seed_rows = []
+                break
+            seed_rows.append(
+                (
+                    str(item.get("seed") or index + 1),
+                    f"{float(baseline) * 100:.2f}%",
+                    f"{float(experiment) * 100:.2f}%",
+                    f"{(float(experiment) - float(baseline)) * 100:+.2f} pp",
+                )
+            )
+    if seed_rows:
+        _add_table_caption(document, table_number + 1, f"逐随机种子的{_human_label(metric_name)}配对结果")
+        _add_table(
+            document,
+            ("种子", "基线方案", "实验方案", "差值"),
+            seed_rows,
+            (1.35, 1.7, 1.7, 1.75),
+        )
 
 
-def _add_reproducibility_support_table(document: Document, value: Any) -> None:
+def _add_reproducibility_support_table(document: Document, value: Any, *, table_number: int) -> None:
     if not isinstance(value, dict):
         return
     rows = []
@@ -375,7 +454,9 @@ def _add_reproducibility_support_table(document: Document, value: Any) -> None:
     if value.get("seeds"):
         rows.append(("随机种子", "、".join(str(item) for item in value["seeds"])))
     if isinstance(value.get("parameters"), dict) and value["parameters"]:
-        rows.append(("关键参数", _short_text(value["parameters"], 700)))
+        public_parameters = dict(_public_parameters(value["parameters"]))
+        if public_parameters:
+            rows.append(("关键参数", _short_text(public_parameters, 700)))
     environment = value.get("environment")
     if isinstance(environment, dict):
         public_environment = {
@@ -386,8 +467,34 @@ def _add_reproducibility_support_table(document: Document, value: Any) -> None:
         if public_environment:
             rows.append(("运行环境", _short_text(public_environment, 400)))
     if rows:
-        document.add_heading("复现要点", level=2)
+        _add_table_caption(document, table_number, "关键复现信息")
         _add_label_table(document, rows)
+
+
+def _add_table_caption(document: Document, number: int, title: str) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_before = Pt(8)
+    paragraph.paragraph_format.space_after = Pt(4)
+    paragraph.paragraph_format.keep_with_next = True
+    run = paragraph.add_run(f"表 {number}  {title}")
+    _set_run_font(run, "宋体", 9, DARK)
+
+
+def _format_mean_std(metric_name: str, value: dict[str, Any]) -> str:
+    mean = value.get("mean")
+    std = value.get("std")
+    if not isinstance(mean, (int, float)):
+        return "—"
+    if "Parameters" in metric_name:
+        return f"{float(mean):,.0f}" + (f" ± {float(std):,.0f}" if isinstance(std, (int, float)) else "")
+    return f"{float(mean) * 100:.2f}%" + (f" ± {float(std) * 100:.2f}%" if isinstance(std, (int, float)) else "")
+
+
+def _format_metric_delta(metric_name: str, value: float) -> str:
+    if "Parameters" in metric_name:
+        return f"{value:+,.0f}"
+    return f"{value * 100:+.2f} pp"
 
 
 def _add_prose(document: Document, value: Any) -> None:
@@ -454,7 +561,7 @@ def _add_experiment_design(document: Document, value: Any) -> None:
         document.add_heading("关键参数", level=2)
         _add_label_table(
             document,
-            [(_human_label(key), _short_text(item, 250)) for key, item in parameters.items()],
+            [(_human_label(key), _short_text(item, 250)) for key, item in _public_parameters(parameters)],
         )
     seeds = value.get("seeds") or value.get("随机种子")
     if seeds:
@@ -496,7 +603,7 @@ def _add_iteration_summary(document: Document, value: Any) -> None:
                 _short_text(item.get("required_revision") or item.get("required revision") or "", 320),
             )
         )
-    _add_table(document, ("轮次", "实验", "关键结果", "判断", "本轮处理"), rows, (0.55, 1.1, 2.15, 0.8, 2.1))
+    _add_table(document, ("轮次", "实验", "关键结果", "判断", "本轮处理"), rows, (0.5, 1.0, 2.05, 0.75, 2.2))
 
 
 def _add_results(document: Document, value: Any) -> None:
@@ -506,7 +613,7 @@ def _add_results(document: Document, value: Any) -> None:
     metrics = value.get("metrics") if isinstance(value.get("metrics"), dict) else {}
     if metrics:
         rows = [(_human_label(key), _format_number(item)) for key, item in metrics.items()]
-        _add_table(document, ("指标", "结果"), rows, (3.7, 2.7))
+        _add_table(document, ("指标", "结果"), rows, (3.75, 2.75))
     analysis = value.get("analysis")
     if isinstance(analysis, dict):
         for key in ("summary", "conclusion", "interpretation", "limitations"):
@@ -532,6 +639,8 @@ def _add_reproducibility(document: Document, value: Any) -> None:
             continue
         if key == "environment" and isinstance(item, dict):
             item = {k: item[k] for k in ("python", "torch", "cuda", "device") if k in item}
+        if key == "parameters" and isinstance(item, dict):
+            item = dict(_public_parameters(item))
         rows.append((_human_label(key), _short_text(item, 600)))
     _add_label_table(document, rows)
 
@@ -563,16 +672,18 @@ def _add_references(document: Document, value: Any) -> None:
 
 
 def _add_label_table(document: Document, rows: list[tuple[str, str]]) -> None:
-    _add_table(document, ("项目", "说明"), rows, (1.35, 5.05))
+    _add_table(document, ("项目", "说明"), rows, (1.5, 5.0))
 
 
 def _add_table(document: Document, headers: tuple[str, ...], rows: list[tuple], widths: tuple[float, ...]) -> None:
     if not rows:
         return
     table = document.add_table(rows=1, cols=len(headers))
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
     table.autofit = False
     table.style = "Table Grid"
+    widths_dxa = tuple(int(round(width * 1440)) for width in widths)
+    _set_table_geometry(table, widths_dxa)
     for index, (header, width) in enumerate(zip(headers, widths)):
         cell = table.rows[0].cells[index]
         cell.width = Inches(width)
@@ -593,8 +704,62 @@ def _add_table(document: Document, headers: tuple[str, ...], rows: list[tuple], 
     document.add_paragraph().paragraph_format.space_after = Pt(1)
 
 
+def _set_table_geometry(table, widths_dxa: tuple[int, ...]) -> None:
+    """Apply fixed geometry so Word and LibreOffice wrap tables identically."""
+    table_properties = table._tbl.tblPr
+    for tag in ("w:tblW", "w:tblInd", "w:tblLayout", "w:tblCellMar"):
+        existing = table_properties.find(qn(tag))
+        if existing is not None:
+            table_properties.remove(existing)
+
+    table_width = OxmlElement("w:tblW")
+    table_width.set(qn("w:w"), str(sum(widths_dxa)))
+    table_width.set(qn("w:type"), "dxa")
+    table_properties.append(table_width)
+
+    table_indent = OxmlElement("w:tblInd")
+    table_indent.set(qn("w:w"), str(TABLE_INDENT_DXA))
+    table_indent.set(qn("w:type"), "dxa")
+    table_properties.append(table_indent)
+
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    table_properties.append(layout)
+
+    margins = OxmlElement("w:tblCellMar")
+    for side, value in TABLE_CELL_MARGIN_DXA.items():
+        node = OxmlElement(f"w:{side}")
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+        margins.append(node)
+    table_properties.append(margins)
+
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for value in widths_dxa:
+        column = OxmlElement("w:gridCol")
+        column.set(qn("w:w"), str(value))
+        grid.append(column)
+
+    for row in table.rows:
+        for cell, value in zip(row.cells, widths_dxa):
+            properties = cell._tc.get_or_add_tcPr()
+            width = properties.find(qn("w:tcW"))
+            if width is None:
+                width = OxmlElement("w:tcW")
+                properties.append(width)
+            width.set(qn("w:w"), str(value))
+            width.set(qn("w:type"), "dxa")
+
+
 def _add_footer(document: Document, run_id: str) -> None:
     section = document.sections[0]
+    header = section.header
+    header_paragraph = header.paragraphs[0]
+    header_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    header_run = header_paragraph.add_run("格物 · 科学研究报告")
+    _set_run_font(header_run, "宋体", 8.5, MUTED)
     footer = section.footer
     paragraph = footer.paragraphs[0]
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -646,6 +811,105 @@ def _curated_items(value: dict) -> list[tuple[str, Any]]:
     return [(str(key), item) for key, item in value.items() if str(key) not in hidden]
 
 
+def _public_parameters(value: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Return reader-facing scalar controls and omit planning metadata containers."""
+    hidden = {"additional_sections", "training_budget_rationale"}
+    return [
+        (str(key), item)
+        for key, item in value.items()
+        if str(key) not in hidden
+        and item not in (None, "")
+        and isinstance(item, (str, int, float, bool))
+    ]
+
+
+def _resolve_metric_pairs(
+    metrics: dict[str, Any],
+    *,
+    value_kind: str,
+) -> list[tuple[str, str, str]]:
+    def valid(item: Any) -> bool:
+        if value_kind == "summary":
+            return isinstance(item, dict) and isinstance(item.get("mean"), (int, float))
+        return isinstance(item, (int, float)) and not isinstance(item, bool)
+
+    pairs: list[tuple[str, str, str]] = []
+    for key, baseline in metrics.items():
+        baseline_key = str(key)
+        if not baseline_key.lower().startswith("baseline_") or not valid(baseline):
+            continue
+        baseline_name = baseline_key[len("Baseline_") :]
+        target = _normalized_metric_name(baseline_name)
+        candidates = []
+        for candidate_key, candidate_value in metrics.items():
+            candidate_name = str(candidate_key)
+            if candidate_name == baseline_key or not valid(candidate_value):
+                continue
+            direct = _normalized_metric_name(candidate_name)
+            stripped = _normalized_metric_name(_strip_metric_group_prefix(candidate_name))
+            if direct == target or stripped == target:
+                candidates.append((0 if direct == target else 1, candidate_name))
+        if not candidates:
+            continue
+        experiment_key = min(candidates, key=lambda item: (item[0], item[1]))[1]
+        display_name = _strip_metric_group_prefix(experiment_key).replace("_", " ").strip()
+        pairs.append((display_name or baseline_name, baseline_key, experiment_key))
+    return pairs
+
+
+def _preferred_metric_pairs(
+    pairs: list[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    def priority(pair: tuple[str, str, str]) -> tuple[int, str]:
+        name = _normalized_metric_name(pair[0])
+        if "accuracy" in name:
+            return (0, name)
+        if any(token in name for token in ("error", "f1", "auc", "precision", "recall")):
+            return (1, name)
+        if "loss" in name:
+            return (3, name)
+        return (2, name)
+
+    return sorted(pairs, key=priority)
+
+
+def _deduplicated_metrics(metrics: dict[str, Any]) -> list[tuple[str, Any]]:
+    ordered = sorted(
+        metrics.items(),
+        key=lambda item: (
+            1 if _strip_metric_group_prefix(str(item[0])) != str(item[0]) else 0,
+            str(item[0]),
+        ),
+    )
+    seen = set()
+    kept = []
+    for key, value in ordered:
+        name = str(key)
+        role = "baseline" if name.lower().startswith("baseline_") else "experiment"
+        canonical = _normalized_metric_name(
+            name[len("Baseline_") :] if role == "baseline" else _strip_metric_group_prefix(name)
+        )
+        marker = (role, canonical)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        kept.append((name, value))
+    return kept
+
+
+def _strip_metric_group_prefix(value: str) -> str:
+    return re.sub(
+        r"^(?:ls|label[_\s-]*smoothing|variant|experiment|treatment)[_\s-]+",
+        "",
+        str(value),
+        flags=re.IGNORECASE,
+    )
+
+
+def _normalized_metric_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value).lower())
+
+
 def _pick(value: dict, *keys: str) -> Any:
     for key in keys:
         if key in value and value[key] not in (None, "", [], {}):
@@ -682,6 +946,8 @@ def _human_label(value: object) -> str:
         "learning_rate": "学习率",
         "batch_size": "批量大小",
         "epochs": "训练轮数",
+        "optimizer": "优化器",
+        "label_smoothing_epsilon": "标签平滑系数 ε",
         "patience": "早停耐心值",
         "experiment_id": "实验编号",
         "provider": "运行方式",
@@ -691,6 +957,11 @@ def _human_label(value: object) -> str:
         "summary": "结果概述",
         "conclusion": "实验结论",
         "interpretation": "结果分析",
+        "Overall Test Accuracy": "整体测试准确率",
+        "Test Accuracy": "测试准确率",
+        "Final Training Loss": "最终训练损失",
+        "Target Class Confusion Error Rate": "目标类别混淆错误率",
+        "Total Parameters": "参数量",
     }
     return labels.get(raw, raw.replace("_", " ").strip())
 

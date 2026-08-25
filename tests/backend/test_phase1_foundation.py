@@ -6,18 +6,29 @@ from backend.app.workflow.orchestrator import WorkflowOrchestrator
 
 
 class AdmissionLLM:
+    """Router-contract fake: exposes the configured role/provider pairs that
+    preflight checks, with no qwen/deepseek default fallback."""
+
     mode = "role_router"
     fallback = False
 
-    def __init__(self, failures=()):
+    def __init__(self, failures=(), pairs=None):
         self.failures = set(failures)
+        self.pairs = (
+            list(pairs)
+            if pairs is not None
+            else [("qwen", "qwen-model"), ("deepseek", "deepseek-model")]
+        )
         self.calls = []
 
-    def preflight(self, provider_id):
-        self.calls.append(provider_id)
+    def configured_provider_models(self):
+        return list(self.pairs)
+
+    def preflight_model(self, provider_id, model):
+        self.calls.append((provider_id, model))
         if provider_id in self.failures:
             raise RuntimeError(f"{provider_id.upper()}_PROVIDER_CONFIG_ERROR:http_status=400:invalid model")
-        return {"provider": provider_id, "model": f"{provider_id}-model", "structured": True}
+        return {"provider": provider_id, "model": model, "structured": True}
 
 
 def _engine(tmp_path, llm):
@@ -32,11 +43,24 @@ def test_provider_preflight_uses_minimal_checks_and_blocks_pipeline(tmp_path):
     run = engine.repository.create_run("question", "title")
     result = engine.preflight_run(run.id)
 
-    assert llm.calls == ["qwen", "deepseek"]
+    assert llm.calls == [("qwen", "qwen-model"), ("deepseek", "deepseek-model")]
     assert result["blocking"] is True
-    qwen = next(item for item in result["checks"] if item["name"] == "qwen")
+    qwen = next(item for item in result["checks"] if item["name"] == "qwen:qwen-model")
     assert qwen["code"] == "QWEN_PROVIDER_CONFIG_ERROR"
     assert "http_status=400" in qwen["detail"]
+
+
+def test_preflight_blocks_when_no_model_role_is_configured(tmp_path):
+    llm = AdmissionLLM(pairs=())
+    engine = _engine(tmp_path, llm)
+    run = engine.repository.create_run("question", "title")
+    result = engine.preflight_run(run.id)
+
+    assert llm.calls == []
+    assert result["blocking"] is True
+    roles = next(item for item in result["checks"] if item["name"] == "model_roles")
+    assert roles["code"] == "MODEL_ROLE_NOT_CONFIGURED"
+    assert "no qwen/deepseek default" in roles["detail"]
 
 
 def test_dataset_preflight_failure_does_not_start_pipeline(tmp_path, monkeypatch):

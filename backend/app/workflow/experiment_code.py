@@ -41,6 +41,11 @@ STANDARD_MODULES = {
     "typing",
 } | set(getattr(sys, "stdlib_module_names", ()))
 
+# System-owned modules that the runtime Harness provides next to train.py.
+# They are part of the deterministic protocol surface, never third-party pip
+# dependencies, so an ``import gewu_runtime`` must not trigger a requirement.
+SYSTEM_OWNED_MODULES = {"gewu_runtime"}
+
 REQUIREMENT_IMPORT_ALIASES = {
     "pillow": "PIL",
     "scikit-learn": "sklearn",
@@ -314,6 +319,17 @@ def experiment_validation_issues(exc: Exception) -> list[str]:
             "Return one complete JSON object matching the schema hint."
         ]
     message = str(exc)
+    if message.startswith("STRUCTURED_OUTPUT_NOT_OBJECT"):
+        # The provider returned a valid JSON value that is not an object (e.g. a
+        # bare files array or scalar).  This is a correctable generation problem:
+        # feed it back and let the repair/regenerate loop retry, so one malformed
+        # draw cannot hard-fail the whole step.
+        return [
+            "EXPERIMENT_CODE_GENERATION_INVALID: the provider returned a JSON value "
+            "that is not a single object (e.g. a bare array or scalar) instead of one "
+            "complete object matching the schema hint; return the full object with all "
+            "top-level keys."
+        ]
     if message.startswith("EXPERIMENT_"):
         return [message]
     return []
@@ -402,7 +418,9 @@ def validate_experiment_bundle_source(bundle: ExperimentBundle) -> None:
     missing = sorted(
         module
         for module in imported_modules
-        if module not in STANDARD_MODULES and module not in declared_modules
+        if module not in STANDARD_MODULES
+        and module not in SYSTEM_OWNED_MODULES
+        and module not in declared_modules
     )
     if missing:
         issues.extend(f"EXPERIMENT_REQUIREMENT_MISSING:{module}" for module in missing)
@@ -425,9 +443,13 @@ def validate_experiment_bundle_source(bundle: ExperimentBundle) -> None:
         issues.append("EXPERIMENT_BUNDLE_CUDA_USAGE_MISSING")
 
     if bundle.manifest.supports_smoke_test:
-        if "--smoke-test" not in source or not re.search(
+        hand_rolled_smoke = "--smoke-test" in source and re.search(
             r"\b[A-Za-z_][A-Za-z0-9_]*\.smoke_test\b", source
-        ):
+        )
+        # The scaffold owns the --smoke-test flag: gr.get_args() parses it and
+        # gr.is_smoke()/gr.epoch_budget() drive the smoke branch, so generated
+        # code needs no literal ``args.smoke_test`` reference.
+        if not (hand_rolled_smoke or _uses_gewu_scaffold(source)):
             issues.append(
                 "EXPERIMENT_SMOKE_TEST_PROTOCOL_INVALID:"
                 "train.py must accept --smoke-test and branch on args.smoke_test"
@@ -452,10 +474,27 @@ def smoke_data_reduction_issues(source: str) -> list[str]:
 
 
 def _has_metrics_result_mechanism(source: str) -> bool:
-    return bool(
+    hand_rolled = bool(
         re.search(r"\bmetrics\b", source)
         and re.search(r"json\.(?:dump|dumps)\s*\(", source)
         and re.search(r"\b(?:output|metrics_path)\b", source)
+    )
+    # The system scaffold owns serialization; generated code only needs to call
+    # gr.write_result(...).  Static source cannot see inside it, so its use
+    # satisfies the result-payload mechanism check.
+    scaffold = bool(re.search(r"\b(?:gewu_runtime|gr)\.\s*write_result\s*\(", source))
+    return hand_rolled or scaffold
+
+
+def _uses_gewu_scaffold(source: str) -> bool:
+    """True when generated code imports and drives the deterministic scaffold."""
+    if "gewu_runtime" not in source:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:gewu_runtime|gr)\.\s*(?:get_args|is_smoke|epoch_budget|write_result|data_root|expected_metrics|seeds)\s*\(",
+            source,
+        )
     )
 
 

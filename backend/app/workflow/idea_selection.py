@@ -32,6 +32,16 @@ def weighted_score(scores: dict) -> float:
     return sum(float(scores[key]) * weight for key, weight in WEIGHTS.items())
 
 
+# Composite score is the existing server-computed weighted score expressed on a
+# 0..1 scale.  A candidate clears automatic selection only when it strictly
+# exceeds this threshold; otherwise selection stays a human decision.
+AUTO_SELECT_THRESHOLD = 0.80
+
+
+def composite_score(scores: dict) -> float:
+    return weighted_score(scores) / 5.0
+
+
 def select_top_evaluation(evaluations: list[dict]) -> dict:
     viable = [
         evaluation

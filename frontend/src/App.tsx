@@ -6,12 +6,14 @@ import type { ExperimentProgress, ProviderStatus, RunRecord } from "./api/types"
 import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
 import { findLatestArtifact, latestExperimentResultFailure } from "./utils/presentation";
 import { WorkbenchPage } from "./pages/WorkbenchPage";
+import { LandingPage } from "./pages/LandingPage";
 
 const EMPTY_TOPIC = {
   domain: "",
   problem: "",
   constraints: "",
   githubRepositoryUrl: "",
+  knowledgeBaseId: "default",
 };
 
 function topicMatchesRun(run: RunRecord, draft: typeof EMPTY_TOPIC) {
@@ -20,6 +22,7 @@ function topicMatchesRun(run: RunRecord, draft: typeof EMPTY_TOPIC) {
     && (run.domain ?? "").trim() === draft.domain.trim()
     && (run.constraints ?? "").trim() === draft.constraints.trim()
     && (run.github_repository_url ?? "").trim() === draft.githubRepositoryUrl.trim()
+    && (run.knowledge_base_id ?? "default").trim() === draft.knowledgeBaseId.trim()
   );
 }
 
@@ -39,6 +42,7 @@ function userFacingError(error: unknown) {
 }
 
 export default function App() {
+  const [workbenchOpen, setWorkbenchOpen] = useState(() => window.location.hash.startsWith("#/workbench"));
   const [run, setRun] = useState<RunRecord | null>(null);
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
   const [status, setStatus] = useState<ProviderStatus | null>(null);
@@ -54,6 +58,23 @@ export default function App() {
   const mutationInFlightRef = useRef(false);
   const stopSequenceRef = useRef(0);
   const isBusy = researchRunning || activeStepId !== null;
+
+  useEffect(() => {
+    const syncRoute = () => setWorkbenchOpen(window.location.hash.startsWith("#/workbench"));
+    window.addEventListener("hashchange", syncRoute);
+    return () => window.removeEventListener("hashchange", syncRoute);
+  }, []);
+
+  function enterWorkbench() {
+    window.location.hash = "#/workbench/research";
+    setWorkbenchOpen(true);
+  }
+
+  function returnHome() {
+    window.location.hash = "#/";
+    setWorkbenchOpen(false);
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }
 
   function tryAcquireMutation() {
     if (mutationInFlightRef.current) return false;
@@ -92,7 +113,7 @@ export default function App() {
         const loaded = await api.getRun(latest.id);
         if (cancelled) return;
         setRun(loaded);
-        setTopicDraft({ domain: loaded.domain || "", problem: loaded.problem_input, constraints: loaded.constraints || "", githubRepositoryUrl: loaded.github_repository_url || "" });
+        setTopicDraft({ domain: loaded.domain || "", problem: loaded.problem_input, constraints: loaded.constraints || "", githubRepositoryUrl: loaded.github_repository_url || "", knowledgeBaseId: loaded.knowledge_base_id || "default" });
         const active = ACTIVE_RUN_STATUSES.has(loaded.status);
         setResearchRunning(active);
         setActiveStepId(active ? loaded.current_step : null);
@@ -210,7 +231,7 @@ export default function App() {
         let current = run;
         if (current === null || !topicMatchesRun(current, topicDraft)) {
           const title = topicDraft.problem.slice(0, 40) || "未命名研究";
-          current = await api.createRun(title, topicDraft.problem, topicDraft.domain, topicDraft.constraints, topicDraft.githubRepositoryUrl);
+          current = await api.createRun(title, topicDraft.problem, topicDraft.domain, topicDraft.constraints, topicDraft.githubRepositoryUrl, {}, topicDraft.knowledgeBaseId);
           setRun(current);
         }
         current = await api.startPipeline(current.id);
@@ -238,6 +259,7 @@ export default function App() {
         problem: loaded.problem_input,
         constraints: loaded.constraints || "",
         githubRepositoryUrl: loaded.github_repository_url || "",
+        knowledgeBaseId: loaded.knowledge_base_id || "default",
       });
       setReport(null);
       setErrorMessage("");
@@ -415,6 +437,38 @@ export default function App() {
     }
   }
 
+  async function regenerateHypothesis() {
+    if (!run || researchRunning || activeStepId !== null) return;
+    if (!tryAcquireMutation()) return;
+    setPipelineStopRequested(false);
+    let accepted = false;
+    try {
+      await runAction(async () => {
+        setActiveStepId("hypothesis_generation");
+        setFailedStepId(null);
+        try {
+          const updated = await api.regenerateHypothesis(run.id);
+          accepted = true;
+          setRun(updated);
+          setReport(null);
+          const active = ACTIVE_RUN_STATUSES.has(updated.status);
+          setResearchRunning(active);
+          setActiveStepId(active ? updated.current_step : null);
+        } catch (error) {
+          await refreshRunAfterFailure(run.id);
+          setFailedStepId("hypothesis_generation");
+          throw error;
+        } finally {
+          setActiveStepId(null);
+        }
+      });
+    } finally {
+      if (!accepted) setResearchRunning(false);
+      setPipelineStopRequested(false);
+      releaseMutation();
+    }
+  }
+
   async function executeStep(startRun: RunRecord, stepId: string) {
     setActiveStepId(stepId);
     setFailedStepId(null);
@@ -482,6 +536,10 @@ export default function App() {
     }
   }
 
+  if (!workbenchOpen) {
+    return <LandingPage onEnter={enterWorkbench}/>;
+  }
+
   return (
     <div className="app-frame">
       <header className="topbar legacy-header">
@@ -519,8 +577,10 @@ export default function App() {
         onOpenSettings={() => { if (!isBusy) setSettingsOpen(true); }}
         onAddUserHypothesis={addUserHypothesis}
         onSelectHypothesis={selectHypothesis}
+        onRegenerateHypothesis={regenerateHypothesis}
         onRunRefresh={refreshCurrentRun}
         experimentProgress={experimentProgress}
+        onHome={returnHome}
       />
       <ProjectSettingsModal
         open={settingsOpen}

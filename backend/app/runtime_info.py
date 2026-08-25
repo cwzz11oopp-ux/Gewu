@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-WORKFLOW_VERSION = "research-loop-v2"
+WORKFLOW_VERSION = "research-loop-v1"
 _STARTED_AT = datetime.now(timezone.utc).isoformat()
 _WORKFLOW_FILES = (
     "backend/app/workflow/engine.py",

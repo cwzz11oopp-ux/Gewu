@@ -11,23 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.agents.reviewer import ReviewerAgent
 from backend.app.agents.supervisor import SupervisorAgent
-from backend.app.bootstrap import GreenfieldBootstrapService
-from backend.app.api import literature, paper, providers, reports, runs, v2_research
+from backend.app.api import literature, paper, providers, reports, runs
 from backend.app.config import Settings
 from backend.app.providers.experiment import get_experiment_provider
 from backend.app.providers.literature import get_literature_provider
 from backend.app.providers.llm import get_llm_provider
-from backend.app.literature import SprintLiteratureService
-from backend.app.models.gateway import LegacyQwenAdapter
-from backend.app.research.ideator import BranchConstructor
-from backend.app.services.v2_sessions import ResearchSessionService
-from backend.app.services.v2_runner import V2ResearchRunner
-from backend.app.services.v2_critic import ScientificCritic
 from backend.app.storage.runtime_config import RuntimeConfigStore
 from backend.app.storage.repository import Repository
 from backend.app.storage.literature import LiteratureLibrary
 from backend.app.storage.research_wiki import ResearchWikiStore
-from backend.app.storage.v2 import V2Stores
 from backend.app.workflow.engine import WorkflowEngine
 from backend.app.workflow.knowledge import KnowledgeIntegrationService
 from backend.app.workflow.orchestrator import WorkflowOrchestrator
@@ -51,12 +43,23 @@ class Dependencies:
     literature_provider: object
     research_wiki: ResearchWikiStore
     knowledge_service: KnowledgeIntegrationService
-    v2_sessions: ResearchSessionService
-    v2_runner: V2ResearchRunner
-    greenfield_bootstrap: GreenfieldBootstrapService
     runtime: dict[str, object]
     orchestrator: WorkflowOrchestrator | None = None
     paper_writing: PaperWritingManager | None = None
+
+    def __post_init__(self) -> None:
+        # Fingerprint of the persisted model config this process applied at
+        # startup. sync_model_config() reloads when another process changes it.
+        self.model_config_fingerprint = self.runtime_config.model_config_fingerprint()
+
+    def sync_model_config(self) -> bool:
+        """Reload runtime settings iff the persisted model config changed since
+        this process last applied it. Returns True when a reload occurred."""
+        fingerprint = self.runtime_config.model_config_fingerprint()
+        if fingerprint == self.model_config_fingerprint:
+            return False
+        self.reload()
+        return True
 
     def reload(self) -> None:
         self.settings = self.runtime_config.apply(self.base_settings)
@@ -85,72 +88,13 @@ class Dependencies:
             max_feedback_iterations=self.settings.feedback_max_iterations,
             max_deepseek_plan_revision=self.settings.max_deepseek_plan_revision,
         )
-        self.v2_sessions = _build_v2_sessions(
-            self.data_dir,
-            self.settings,
-            llm_provider,
-            literature_provider,
-            self.literature_library,
-        )
-        self.greenfield_bootstrap = _build_greenfield_bootstrap(
-            self.data_dir,
-            self.v2_sessions,
-            llm_provider,
-            literature_provider,
-            self.literature_library,
-        )
-        self.v2_runner = V2ResearchRunner(
-            self.v2_sessions, LegacyQwenAdapter(llm_provider), self.data_dir
-        )
-
-
-def _build_v2_sessions(
-    data_dir: str,
-    settings: Settings,
-    llm_provider,
-    literature_provider,
-    literature_library: LiteratureLibrary,
-) -> ResearchSessionService:
-    gateway = LegacyQwenAdapter(llm_provider)
-    return ResearchSessionService(
-        V2Stores(data_dir),
-        BranchConstructor(gateway),
-        SprintLiteratureService(literature_provider, literature_library),
-        model_ready=(
-            settings.llm_provider == "qwen"
-            and bool(settings.qwen_api_key)
-            and not getattr(llm_provider, "fallback", False)
-        ),
-        critic=(
-            ScientificCritic(gateway)
-            if settings.llm_provider == "qwen"
-            and bool(settings.qwen_api_key)
-            and not getattr(llm_provider, "fallback", False)
-            else None
-        ),
-    )
-
-
-def _build_greenfield_bootstrap(
-    data_dir: str,
-    sessions: ResearchSessionService,
-    llm_provider,
-    literature_provider,
-    literature_library: LiteratureLibrary,
-) -> GreenfieldBootstrapService:
-    return GreenfieldBootstrapService(
-        data_dir,
-        sessions,
-        LegacyQwenAdapter(llm_provider),
-        SprintLiteratureService(literature_provider, literature_library),
-    )
+        self.model_config_fingerprint = self.runtime_config.model_config_fingerprint()
 
 
 def create_app(
     data_dir: str | None = None,
     env: Mapping[str, str] | None = None,
     literature_provider_override=None,
-    v2_session_service_override=None,
 ) -> FastAPI:
     base_settings = Settings.from_env(env)
     resolved_data_dir = data_dir or base_settings.data_dir
@@ -186,23 +130,6 @@ def create_app(
         max_feedback_iterations=settings.feedback_max_iterations,
         max_deepseek_plan_revision=settings.max_deepseek_plan_revision,
     )
-    v2_sessions = v2_session_service_override or _build_v2_sessions(
-        resolved_data_dir,
-        settings,
-        llm_provider,
-        literature_provider,
-        literature_library,
-    )
-    v2_runner = V2ResearchRunner(
-        v2_sessions, LegacyQwenAdapter(llm_provider), resolved_data_dir
-    )
-    greenfield_bootstrap = _build_greenfield_bootstrap(
-        resolved_data_dir,
-        v2_sessions,
-        llm_provider,
-        literature_provider,
-        literature_library,
-    )
     runtime = runtime_info(Path(__file__).resolve().parents[2], skill_loader.skills_root)
     deps = Dependencies(
         data_dir=resolved_data_dir,
@@ -218,12 +145,15 @@ def create_app(
         literature_provider=literature_provider,
         research_wiki=research_wiki,
         knowledge_service=knowledge_service,
-        v2_sessions=v2_sessions,
-        v2_runner=v2_runner,
-        greenfield_bootstrap=greenfield_bootstrap,
         runtime=runtime,
     )
-    deps.orchestrator = WorkflowOrchestrator(repository, lambda: deps.engine)
+    deps.orchestrator = WorkflowOrchestrator(
+        repository,
+        lambda: deps.engine,
+        config_sync=deps.sync_model_config,
+        provider_retry_limit=settings.workflow_provider_retry_limit,
+        provider_retry_backoff_seconds=settings.workflow_provider_retry_backoff_seconds,
+    )
     deps.paper_writing = PaperWritingManager(
         repository,
         lambda: deps.engine.llm_provider,
@@ -254,7 +184,6 @@ def create_app(
     app.include_router(providers.build_router(deps))
     app.include_router(reports.build_router(deps))
     app.include_router(paper.build_router(deps))
-    app.include_router(v2_research.build_router(deps))
 
     @app.get("/api/system/runtime-info")
     def get_runtime_info():

@@ -323,7 +323,17 @@ def test_local_runner_uses_isolated_directory_cuda_environment_and_result_file(
     )
 
     result = LocalGpuExperimentProvider(settings).run(
-        {"run_id": "run_1"}, _runtime_bundle(requirements=["numpy"])
+        {
+            "run_id": "run_1",
+            "plan": {
+                "dataset": {
+                    "canonical_name": "",
+                    "display_name": "IPIX17",
+                    "directory_name": "IPIX17",
+                }
+            },
+        },
+        _runtime_bundle(requirements=["numpy"]),
     )
 
     experiment_dir = root / "run_1" / "experiment_1"
@@ -332,6 +342,7 @@ def test_local_runner_uses_isolated_directory_cuda_environment_and_result_file(
     assert result["workdir"] == str(experiment_dir.resolve())
     assert result["metrics"] == {"accuracy": 0.93}
     assert result["environment"]["python_version"] == "3.11.9"
+    assert result["environment"]["dataset"] == "IPIX17"
     assert result["is_real_experiment"] is True
     attempt_dir = experiment_dir / "attempts" / result["attempt_id"]
     assert (attempt_dir / "manifest.json").is_file()

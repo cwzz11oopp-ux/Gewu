@@ -45,12 +45,13 @@ class Repository:
         self.store.write("runs.json", {run_id: run.model_dump() for run_id, run in runs.items()})
 
     @_locked
-    def create_run(self, problem_input: str, title: str, domain: str = "", constraints: str = "", github_repository_url: str | None = None, research_constraints: dict | None = None) -> RunRecord:
+    def create_run(self, problem_input: str, title: str, domain: str = "", constraints: str = "", github_repository_url: str | None = None, research_constraints: dict | None = None, knowledge_base_id: str = "default") -> RunRecord:
         runs = self._load_all()
         run = RunRecord(
             title=title,
             domain=domain or "code-centered deep learning",
             problem_input=problem_input,
+            knowledge_base_id=knowledge_base_id.strip() or "default",
             constraints=constraints,
             research_constraints=dict(research_constraints or {}),
             github_repository_url=github_repository_url.strip() if isinstance(github_repository_url, str) and github_repository_url.strip() else None,
@@ -133,6 +134,23 @@ class Repository:
         return self.save_run(run)
 
     @_locked
+    def update_provider_retry_state(
+        self,
+        run_id: str,
+        step_id: str,
+        state: dict | None,
+    ) -> RunRecord:
+        """Persist only operational recovery bookkeeping for one workflow step."""
+        run = self.get_run(run_id)
+        current = dict(run.provider_retry_state or {})
+        if state is None:
+            current.pop(step_id, None)
+        else:
+            current[step_id] = dict(state)
+        run.provider_retry_state = current
+        return self.save_run(run)
+
+    @_locked
     def update_paper_writing(self, run_id: str, values: dict) -> RunRecord:
         run = self.get_run(run_id)
         current = dict(run.paper_writing or {})
@@ -146,18 +164,23 @@ class Repository:
         resumable: list[str] = []
         changed = False
         for run in runs.values():
-            if run.status not in {"running", "queued", "interrupted"}:
+            if run.status not in {"running", "queued", "interrupted", "stopping"}:
                 continue
-            run.status = "interrupted"
+            stopped_by_user = run.status == "stopping" or run.stop_requested
+            run.status = "paused" if stopped_by_user else "interrupted"
             for step in run.steps:
                 if step.status == "running":
                     step.status = "interrupted"
                     step.completed_at = utc_now()
                     step.error = {
-                        "code": "PROCESS_INTERRUPTED",
-                        "message": "The backend stopped before the step completed; recovery is scheduled.",
+                        "code": "PIPELINE_STOPPED" if stopped_by_user else "PROCESS_INTERRUPTED",
+                        "message": (
+                            "The user stopped this run before the step completed."
+                            if stopped_by_user
+                            else "The backend stopped before the step completed; recovery is scheduled."
+                        ),
                     }
-            if run.automatic and not run.stop_requested:
+            if run.automatic and not stopped_by_user:
                 resumable.append(run.id)
             run.updated_at = utc_now()
             changed = True
@@ -296,7 +319,7 @@ class Repository:
             source=document.source,
             source_kind="local",
             local_document_id=document.id,
-            claim=document.abstract,
+            abstract=document.abstract,
             url=(
                 f"https://doi.org/{document.identifiers['doi']}"
                 if document.identifiers.get("doi")

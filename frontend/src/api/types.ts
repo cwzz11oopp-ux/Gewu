@@ -51,6 +51,7 @@ export type RunRecord = {
   title: string;
   domain: string;
   problem_input: string;
+  knowledge_base_id: string;
   constraints: string;
   research_constraints?: Record<string, unknown>;
   research_constraints_artifact_id?: string | null;
@@ -60,6 +61,12 @@ export type RunRecord = {
   automatic: boolean;
   stop_requested: boolean;
   feedback_iteration: number;
+  provider_retry_state?: Record<string, {
+    attempts?: number;
+    retry_limit?: number;
+    last_error?: string;
+    next_delay_seconds?: number;
+  }>;
   steps: Array<{
     id: string;
     name: string;
@@ -237,6 +244,7 @@ export type LocalLiteratureDocument = {
   year?: number | null;
   abstract: string;
   identifiers: Record<string, string>;
+  source: string;
   statuses: string[];
   verification: {
     verified: boolean;
@@ -244,5 +252,18 @@ export type LocalLiteratureDocument = {
     verified_at?: string | null;
   };
   wiki_node_id?: string | null;
+  wiki_knowledge_base_ids: string[];
   run_ids: string[];
+  knowledge_base_ids: string[];
 };
+
+export type ResearchWikiStats = {
+  knowledge_base_id: string;
+  papers: number;
+  gaps: number;
+  ideas: number;
+  experiments: number;
+  claims: number;
+};
+
+export type ResearchKnowledgeBase = ResearchWikiStats;

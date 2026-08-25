@@ -12,6 +12,8 @@ export type PaperItem = {
   relevance?: number;
   status: "included" | "review" | "excluded";
   url?: string;
+  sourceKind: "wiki" | "local" | "external";
+  localDocumentId?: string;
 };
 
 export type EvidenceItem = {
@@ -27,6 +29,7 @@ export type HypothesisItem = {
   claim: string;
   status: "candidate" | "selected" | "refuted" | "partial" | "evidence_insufficient" | "rejected" | "revision_required";
   scores: { falsifiability?: number; coverage?: number; novelty?: number };
+  compositeScore?: number;
   reason: string;
   evidenceSources: Array<{ title: string; url?: string; stance: "support" | "conflict" }>;
   sourceGapIds: string[];
@@ -58,6 +61,7 @@ export type ExperimentItem = {
   deployedFiles: string[];
   attempts: Array<{ id: string; status: string; startedAt: string; endedAt: string; error: string }>;
   primaryMetric?: { name: string; value: number; direction: "higher" | "lower" | "unknown" };
+  primaryMetricNames: string[];
   evolution?: { delta: number; status: "improved" | "declined" | "unchanged" | "not_comparable"; baselineId?: string };
   classification: "scientific" | "engineering";
   isRealExperiment: boolean;
@@ -69,6 +73,9 @@ export type ExperimentItem = {
   completedAt: string;
   metricDirections: Record<string, "higher" | "lower" | "unknown">;
   metricContracts: Record<string, string>;
+  declaredMetrics: string[];
+  epochSeries: EpochSeries[];
+  epochSeriesBySeed: EpochSeriesBySeed;
 };
 
 export type ScientificMetricSeries = {
@@ -76,6 +83,9 @@ export type ScientificMetricSeries = {
   direction: "higher" | "lower" | "unknown";
   rows: Array<{ experimentId: string; artifactId: string; value: number; previousValue?: number; delta?: number; trend: "improved" | "declined" | "unchanged" | "not_comparable" }>;
 };
+
+export type EpochSeries = { metric: string; rows: Array<{ epoch: number; value: number }> };
+export type EpochSeriesBySeed = Array<{ seed: number; series: EpochSeries[] }>;
 
 export type ScientificFindings = {
   hypothesisStatus: string;
@@ -90,12 +100,13 @@ export type ScientificFindings = {
 
 export type TreeNode = {
   id: string;
-  kind: "Q" | "L" | "T" | "G" | "H" | "V" | "X" | "R" | "C";
+  kind: "Q" | "L" | "T" | "G" | "H" | "V" | "X" | "R" | "C" | "S" | "P" | "F";
   title: string;
   status: ResearchStatus;
   x: number;
   y: number;
   detail?: string;
+  emphasis?: "selected" | "muted";
 };
 
 export type TreeEdge = { from: string; to: string; label: string; tone?: "support" | "conflict" | "neutral" };
@@ -127,6 +138,12 @@ export type ResearchViewModel = {
     themes: Array<{ id: string; title: string; paperIds: string[]; claimIds: string[] }>;
     gaps: Array<{ id: string; title: string; description: string; paperIds: string[]; claimIds: string[]; futureWorkIds: string[] }>;
     literatureCoverage?: { decision: string; hardCapReached: boolean; coverageScore?: number; saturationScore?: number };
+  };
+  hypothesisLiterature: {
+    retrievedCount: number;
+    inputCount: number;
+    irrelevantRemoved: number;
+    duplicateMerged: number;
   };
   githubSource: { url: string; status: "not_provided" | "parsed" | "unavailable"; warning: string };
   nodes: TreeNode[];
@@ -167,7 +184,7 @@ const statusForRun = (run: RunRecord | null, progress: ExperimentProgress | null
   if (run.status === "NEEDS_PLAN_REVISION") return "needs_plan_revision";
   if (run.status === "POLICY_INTEGRITY_REQUIRED") return "policy_integrity_required";
   if (run.status === "hypothesis_revision_required") return "revision_required";
-  if (progress?.state === "failed" || run.status === "failed") return "failed";
+  if (progress?.state === "failed" || ["failed", "FAILED_SYSTEM", "preflight_failed"].includes(run.status)) return "failed";
   if (progress?.process_alive || ["running", "queued", "stopping"].includes(run.status)) return "running";
   if (run.status === "completed") return "completed";
   return "ready";
@@ -193,6 +210,8 @@ function normalizePapers(artifacts: Artifact[]): PaperItem[] {
       relevance: number(item.relevance_score, item.score),
       status: item.excluded === true ? "excluded" : item.verified === false ? "review" : "included",
       url,
+      sourceKind: text(item.source_kind) === "wiki" ? "wiki" : text(item.source_kind) === "local" ? "local" : "external",
+      localDocumentId: text(item.local_document_id) || undefined,
     };
   });
 }
@@ -243,17 +262,25 @@ function normalizeHypotheses(artifacts: Artifact[]): HypothesisItem[] {
       : /refut/.test(verdict) ? "refuted"
       : /reject|not_supported/.test(verdict) ? "rejected"
       : /partial|部分/.test(verdict) ? "partial" : "candidate";
+    const scores = {
+      falsifiability: number(assessment.falsifiability_score, assessment.falsifiability, evaluationScores.testability) !== undefined ? number(assessment.falsifiability_score, assessment.falsifiability) ?? number(evaluationScores.testability)! / 5 : undefined,
+      coverage: number(assessment.evidence_coverage, assessment.coverage_score, evaluationScores.scientific_soundness) !== undefined ? number(assessment.evidence_coverage, assessment.coverage_score) ?? number(evaluationScores.scientific_soundness)! / 5 : undefined,
+      novelty: number(assessment.novelty_score, assessment.novelty, evaluationScores.novelty) !== undefined ? number(assessment.novelty_score, assessment.novelty) ?? number(evaluationScores.novelty)! / 5 : undefined,
+    };
+    // The composite score is the server-computed 0..1 weighted score persisted on
+    // the assessment.  For legacy runs it falls back to the average of the three
+    // normalized sub-scores so the card always shows a single 0..1 value.
+    const scoreValues = [scores.falsifiability, scores.coverage, scores.novelty].filter((item): item is number => typeof item === "number");
+    const compositeScore = number(assessment.composite_score)
+      ?? (scoreValues.length ? scoreValues.reduce((sum, item) => sum + item, 0) / scoreValues.length : undefined);
     return {
       id,
       claim: text(item.claim, item.hypothesis, item.objective) || "候选假设内容待生成",
       status,
-      scores: {
-        falsifiability: number(assessment.falsifiability_score, assessment.falsifiability, evaluationScores.testability) !== undefined ? number(assessment.falsifiability_score, assessment.falsifiability) ?? number(evaluationScores.testability)! / 5 : undefined,
-        coverage: number(assessment.evidence_coverage, assessment.coverage_score, evaluationScores.scientific_soundness) !== undefined ? number(assessment.evidence_coverage, assessment.coverage_score) ?? number(evaluationScores.scientific_soundness)! / 5 : undefined,
-        novelty: number(assessment.novelty_score, assessment.novelty, evaluationScores.novelty) !== undefined ? number(assessment.novelty_score, assessment.novelty) ?? number(evaluationScores.novelty)! / 5 : undefined,
-      },
-      reason: text(assessment.reasoning, assessment.reason, selection.selection_reason) === "Highest server-computed weighted score among valid selectable candidates."
-        ? "在满足有效性与可选择条件的候选中，该假设的服务端加权评分最高。"
+      scores,
+      compositeScore,
+      reason: /Highest server-computed weighted score/i.test(text(assessment.reasoning, assessment.reason, selection.selection_reason))
+        ? "在满足有效性与可选择条件的候选中，该假设的服务端加权评分最高且超过自动选择阈值。"
         : text(assessment.reasoning, assessment.reason, selection.selection_reason) || "等待证据推理与选择记录",
       evidenceSources: records(item.evidence_basis).map((source) => ({
         title: text(source.source_title, source.title) || "未命名来源",
@@ -367,6 +394,14 @@ function primaryMetric(metrics: Array<{ name: string; value: number }>, evaluati
   return metric ? { ...metric, direction: metricDirection(metric.name, evaluations) } : undefined;
 }
 
+function primaryMetricNames(phase2Protocol: Record<string, unknown>, fallback?: { name: string }) {
+  const declared = Array.isArray(phase2Protocol.primary_metrics)
+    ? phase2Protocol.primary_metrics.map(stringify).filter(Boolean)
+    : [];
+  const first = text(phase2Protocol.primary_metric, fallback?.name);
+  return [...new Set([...declared, first].filter(Boolean))].slice(0, 2);
+}
+
 // These are established, structured Result-analysis limitations. Translation is
 // presentation-only: persisted scientific conclusions remain verbatim artifacts.
 function presentScientificLimitation(value: string) {
@@ -389,10 +424,40 @@ function metricContracts(metrics: Array<{ name: string; value: number }>, evalua
   return { directions, contracts };
 }
 
-function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgress | null): ExperimentItem[] {
+function epochSeriesFrom(epochMetrics: unknown): EpochSeries[] {
+  const rows = Array.isArray(epochMetrics) ? epochMetrics.filter(isRecord) : [];
+  if (!rows.length) return [];
+  const metricNames = [...new Set(rows.flatMap((row) => Object.keys(row).filter((key) => key !== "epoch" && key !== "step")))]
+    .filter((metric) => rows.some((row) => typeof row[metric] === "number" && Number.isFinite(row[metric])));
+  return metricNames.map((metric) => ({
+    metric,
+    rows: rows
+      .map((row) => {
+        const epoch = typeof row.epoch === "number" ? row.epoch : typeof row.step === "number" ? row.step : undefined;
+        const value = row[metric];
+        if (epoch === undefined || typeof value !== "number" || !Number.isFinite(value)) return undefined;
+        return { epoch, value };
+      })
+      .filter((row): row is { epoch: number; value: number } => Boolean(row))
+      .sort((a, b) => a.epoch - b.epoch),
+  })).filter((series) => series.rows.length > 0);
+}
+
+function epochSeriesBySeedFrom(result: Record<string, unknown>): EpochSeriesBySeed {
+  const seedResults = Array.isArray(result.seed_results) ? result.seed_results.filter(isRecord) : [];
+  return seedResults.flatMap((item) => {
+    const seed = typeof item.seed === "number" ? item.seed : Number(item.seed);
+    if (!Number.isFinite(seed)) return [];
+    const series = epochSeriesFrom(item.epoch_metrics);
+    return series.length ? [{ seed, series }] : [];
+  });
+}
+
+function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgress | null, run: RunRecord | null): ExperimentItem[] {
   const tasks = artifacts.filter((item) => item.type === "experiment_task");
   const results = artifacts.filter((item) => item.type === "experiment_result");
   const failures = artifacts.filter((item) => ["experiment_failure", "experiment_diagnosis"].includes(item.type));
+  const candidateAttempts = artifacts.filter((item) => item.type === "experiment_candidate_attempt");
   const revisions = artifacts.filter((item) => item.type === "revision");
   const used = new Set<string>();
   const rows: ExperimentItem[] = [];
@@ -405,7 +470,7 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
     const analysis = isRecord(result.analysis) ? result.analysis : {};
     const audit = isRecord(result.audit) ? result.audit : {};
     const metrics = isRecord(result.metrics) ? result.metrics : {};
-    const metricRows = Object.entries(metrics).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).slice(0, 8).map(([name, value]) => ({ name, value: value as number }));
+    const metricRows = Object.entries(metrics).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).map(([name, value]) => ({ name, value: value as number }));
     const evaluations = records(isRecord(task.plan) ? task.plan.evaluations : task.evaluations);
     const attemptRows = records(result.attempts);
     const latestAttempt = attemptRows[attemptRows.length - 1] ?? {};
@@ -418,7 +483,17 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
     const revision = revisionArtifact?.content ?? {};
     const purpose = text(task.research_purpose, isRecord(task.hypothesis) ? task.hypothesis.objective : "", task.hypothesis) || "验证当前研究假设";
     const technicalName = text(task.name, (isRecord(task.plan) ? task.plan.name : ""));
-    const dataset = text(isRecord(task.dataset) ? task.dataset.name : "", isRecord(task.manifest) ? task.manifest.dataset : "", isRecord(result.environment) ? result.environment.dataset : "") || "未声明";
+    const taskPlan = isRecord(task.plan) ? task.plan : {};
+    const planDataset = isRecord(taskPlan.dataset) ? taskPlan.dataset : {};
+    const dataset = text(
+      isRecord(task.dataset) ? task.dataset.name : task.dataset,
+      isRecord(task.manifest) ? task.manifest.dataset : "",
+      isRecord(result.environment) ? result.environment.dataset : "",
+      planDataset.canonical_name,
+      planDataset.display_name,
+      planDataset.directory_name,
+      planDataset.name,
+    ) || "未声明";
     const datasetFingerprint = text(isRecord(result.environment) ? result.environment.dataset_fingerprint : "", isRecord(task.dataset) ? task.dataset.content_fingerprint : "", isRecord(task.manifest) ? task.manifest.dataset_contract_id : "");
     const metricMetadata = metricContracts(metricRows, evaluations, datasetFingerprint, dataset);
     rows.push({
@@ -448,6 +523,10 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
         error: text(attempt.error_code, attempt.error, attempt.message),
       })),
       primaryMetric: primaryMetric(metricRows, evaluations),
+      primaryMetricNames: primaryMetricNames(
+        isRecord(task.phase2_protocol) ? task.phase2_protocol : {},
+        primaryMetric(metricRows, evaluations),
+      ),
       classification: isRealExperiment ? "scientific" : "engineering",
       isRealExperiment,
       auditStatus: text(audit.integrity_status),
@@ -458,6 +537,9 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
       completedAt: text(result.end_time, resultArtifact?.created_at),
       metricDirections: metricMetadata.directions,
       metricContracts: metricMetadata.contracts,
+      declaredMetrics: evaluations.map((item) => text(item.metric, item.name)).filter(Boolean),
+      epochSeries: epochSeriesFrom(result.epoch_metrics ?? result.training_history),
+      epochSeriesBySeed: epochSeriesBySeedFrom(result),
     });
   }
   for (const resultArtifact of results.filter((item) => !used.has(item.id))) {
@@ -469,11 +551,21 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
     const audit = isRecord(result.audit) ? result.audit : {};
     const attemptRows = records(result.attempts);
     const task = isRecord(result.task) ? result.task : {};
-    const metricRows = Object.entries(metrics).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).slice(0, 8).map(([name, value]) => ({ name, value: value as number }));
+    const metricRows = Object.entries(metrics).filter(([, value]) => typeof value === "number" && Number.isFinite(value)).map(([name, value]) => ({ name, value: value as number }));
     const purpose = text(isRecord(result.task) ? result.task.hypothesis : "", analysis.objective) || "验证研究假设";
     const technicalName = text(result.name, isRecord(result.task) ? result.task.name : "");
     const evaluations = records(task.evaluations);
-    const dataset = text(isRecord(result.environment) ? result.environment.dataset : "") || "未声明";
+    const taskPlan = isRecord(task.plan) ? task.plan : {};
+    const planDataset = isRecord(taskPlan.dataset) ? taskPlan.dataset : {};
+    const dataset = text(
+      isRecord(result.environment) ? result.environment.dataset : "",
+      isRecord(task.dataset) ? task.dataset.name : task.dataset,
+      isRecord(task.manifest) ? task.manifest.dataset : "",
+      planDataset.canonical_name,
+      planDataset.display_name,
+      planDataset.directory_name,
+      planDataset.name,
+    ) || "未声明";
     const datasetFingerprint = text(isRecord(result.environment) ? result.environment.dataset_fingerprint : "", isRecord(task.dataset) ? task.dataset.content_fingerprint : "", isRecord(task.manifest) ? task.manifest.dataset_contract_id : "");
     const metricMetadata = metricContracts(metricRows, evaluations, datasetFingerprint, dataset);
     const isRealExperiment = result.is_real_experiment === true && text(audit.integrity_status).toLowerCase() === "passed";
@@ -505,6 +597,10 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
         error: text(attempt.error_code, attempt.error, attempt.message),
       })),
       primaryMetric: primaryMetric(metricRows, evaluations),
+      primaryMetricNames: primaryMetricNames(
+        isRecord(task.phase2_protocol) ? task.phase2_protocol : {},
+        primaryMetric(metricRows, evaluations),
+      ),
       classification: isRealExperiment ? "scientific" : "engineering",
       isRealExperiment,
       auditStatus: text(audit.integrity_status),
@@ -515,6 +611,61 @@ function normalizeExperiments(artifacts: Artifact[], progress: ExperimentProgres
       completedAt: text(result.end_time, resultArtifact.created_at),
       metricDirections: metricMetadata.directions,
       metricContracts: metricMetadata.contracts,
+      declaredMetrics: evaluations.map((item) => text(item.metric, item.name)).filter(Boolean),
+      epochSeries: epochSeriesFrom(result.epoch_metrics ?? result.training_history),
+      epochSeriesBySeed: epochSeriesBySeedFrom(result),
+    });
+  }
+  // Candidate artifacts are written during code-generation validation, before
+  // an executable task exists.  Surface a single engineering record so a
+  // rejected design is visible immediately instead of appearing as an empty
+  // experiment timeline.
+  const taskIds = new Set(tasks.map((item) => text(item.content.experiment_id)).filter(Boolean));
+  const pendingCandidates = new Map<string, Artifact[]>();
+  for (const candidate of candidateAttempts) {
+    const manifest = isRecord(candidate.content.manifest) ? candidate.content.manifest : {};
+    const id = text(manifest.experiment_id, candidate.content.experiment_id);
+    if (!id || taskIds.has(id)) continue;
+    pendingCandidates.set(id, [...(pendingCandidates.get(id) ?? []), candidate]);
+  }
+  for (const [id, candidates] of pendingCandidates) {
+    const latestCandidate = candidates[candidates.length - 1].content;
+    const manifest = isRecord(latestCandidate.manifest) ? latestCandidate.manifest : {};
+    const latestIssues = Array.isArray(latestCandidate.validation_issues) ? latestCandidate.validation_issues.map(stringify).filter(Boolean) : [];
+    const accepted = latestCandidate.accepted === true;
+    rows.push({
+      id,
+      title: "实验代码生成与校验",
+      technicalName: "experiment_bundle_preflight",
+      purpose: "正在生成可执行实验代码并校验数据集、指标和烟雾测试。",
+      status: accepted ? "queued" : "failed",
+      metrics: [], runtime: "—", provider: "本地代码生成", dataset: text(manifest.dataset) || "未声明",
+      failureReason: latestIssues.join("；"), parameters: isRecord(manifest.parameters) ? manifest.parameters : {},
+      seeds: Array.isArray(manifest.seeds) ? manifest.seeds.filter((item): item is string | number => typeof item === "string" || typeof item === "number") : [],
+      environment: {}, log: "", logPath: "", metricsPath: "", deployedFiles: [],
+      attempts: candidates.map((candidate, index) => ({
+        id: text(candidate.content.attempt_id) || `candidate-${index + 1}`,
+        status: candidate.content.accepted === true ? "accepted" : "rejected",
+        startedAt: candidate.created_at, endedAt: candidate.created_at,
+        error: Array.isArray(candidate.content.validation_issues) ? candidate.content.validation_issues.map(stringify).filter(Boolean).join("；") : "",
+      })),
+      classification: "engineering", isRealExperiment: false, auditStatus: "",
+      resultArtifactId: "", revisionArtifactId: "", revisionReason: "", scientificFeedback: "",
+      completedAt: candidates[candidates.length - 1].created_at,
+      primaryMetricNames: [], metricDirections: {}, metricContracts: {}, declaredMetrics: [], epochSeries: [], epochSeriesBySeed: [],
+    });
+  }
+  // Show the experiment as soon as its design step starts.  The durable task
+  // artifact is intentionally created only after validation, so relying on it
+  // alone made the bench look delayed for several minutes.
+  if (run?.current_step === "experiment_task" && !rows.some((item) => item.status === "running")) {
+    const id = progress?.experiment_id || `experiment_${tasks.length + pendingCandidates.size + 1}`;
+    if (!rows.some((item) => item.id === id)) rows.push({
+      id, title: "正在生成实验方案", technicalName: "experiment_design", purpose: "正在生成并校验可执行实验代码。",
+      status: "running", metrics: [], runtime: "—", provider: "代码生成", dataset: "未声明", failureReason: "",
+      parameters: {}, seeds: [], environment: {}, log: "", logPath: "", metricsPath: "", deployedFiles: [], attempts: [],
+      classification: "engineering", isRealExperiment: false, auditStatus: "", resultArtifactId: "", revisionArtifactId: "",
+      revisionReason: "", scientificFeedback: "", completedAt: "", primaryMetricNames: [], metricDirections: {}, metricContracts: {}, declaredMetrics: [], epochSeries: [], epochSeriesBySeed: [],
     });
   }
   return attachEvolution(rows);
@@ -556,66 +707,162 @@ function normalizeConclusion(artifacts: Artifact[], report: Record<string, unkno
   const artifact = findLatestArtifact(artifacts, "report")?.content ?? {};
   const revision = findLatestArtifactContent(artifacts, "revision") ?? {};
   const source = report ?? artifact;
-  const conclusion = text(source.final_conclusion, source.conclusion, source.executive_summary, revision.conclusion, revision.summary);
-  const boundaryValue = source.conclusion_boundary ?? source.limitations ?? revision.limitations;
-  const boundaries = Array.isArray(boundaryValue) ? boundaryValue.map(stringify).filter(Boolean) : text(boundaryValue) ? [text(boundaryValue)] : [];
-  const sections = Object.keys(source).filter((key) => !["final_conclusion", "conclusion", "conclusion_boundary", "limitations"].includes(key)).slice(0, 8);
+  const conclusion = text(
+    source["Research Conclusion"],
+    source.final_conclusion,
+    source.conclusion,
+    source.executive_summary,
+    source["Paper Abstract"],
+    revision.conclusion,
+    revision.summary,
+  );
+  const boundaryValue = source.Limitations ?? source.conclusion_boundary ?? source.limitations ?? revision.limitations;
+  const allBoundaries = Array.isArray(boundaryValue)
+    ? boundaryValue.map(stringify).filter(Boolean)
+    : text(boundaryValue) ? [text(boundaryValue)] : [];
+  const chineseBoundaries = allBoundaries.filter((item) => /[\u3400-\u9fff]/.test(item));
+  const boundaries = chineseBoundaries.length ? chineseBoundaries : allBoundaries;
+  const narrativeSections = records(source["Narrative Sections"]);
+  const sections = narrativeSections.length
+    ? narrativeSections.map((item) => text(item.title, item.id)).filter(Boolean).slice(0, 8)
+    : Object.keys(source).filter((key) => !["final_conclusion", "conclusion", "conclusion_boundary", "limitations"].includes(key)).slice(0, 8);
   return { conclusion, boundaries, sections };
 }
 
 function buildResearchMap(
   question: string,
   papers: PaperItem[],
-  evidence: EvidenceItem[],
   hypotheses: HypothesisItem[],
   experiments: ExperimentItem[],
   conclusion: string,
   synthesis: ResearchViewModel["researchSynthesis"],
+  reasoningAvailable: boolean,
+  selectedHypothesis: HypothesisItem | undefined,
+  plan: Record<string, unknown>,
 ) {
   const nodes: TreeNode[] = [];
   const edges: TreeEdge[] = [];
-  const layers: TreeNode[][] = [];
-  const addLayer = (items: Omit<TreeNode, "x" | "y">[]) => {
-    const layer = items.map((item) => ({ ...item, x: 0, y: 0 }));
-    layers.push(layer); nodes.push(...layer);
-  };
+
+  // Layout: a horizontal central axis carries the main flow, with the candidate
+  // fork and the experiment chain mirrored above/below it.  Candidates fan from
+  // 假设生成 in two symmetric rows (first half above, second half below) and
+  // rejoin at 推理; experiments form a rightward serpentine — odd rounds on the
+  // upper side, even rounds mirrored below — ending at the conclusion.
+  const nodeH = 108;
+  const originX = 28;
+  const originY = 34;
+  const stepX = 240;   // horizontal step between columns
+  const band = 142;    // vertical offset of candidate/experiment rows from the axis
   const literatureCount = synthesis.available ? synthesis.paperCount : papers.length;
-  addLayer([{ id: "Q1", kind: "Q", title: short(question || "尚未开始研究", 54), status: question ? "ready" : "empty" }]);
-  const coverageDetail = synthesis.literatureCoverage?.hardCapReached
-    ? "Hard cap reached · Coverage incomplete"
-    : synthesis.literatureCoverage?.decision === "saturated"
-      ? "Coverage sufficient"
-      : "Coverage evaluation continues";
-  addLayer([{ id: "LITERATURE", kind: "L", title: `Literature · ${literatureCount} papers`, status: literatureCount ? "completed" : "empty", detail: synthesis.available ? coverageDetail : "Provenance unavailable for this historical run." }]);
-  addLayer([{ id: "THEMES", kind: "T", title: `Themes · ${synthesis.themeCount} themes`, status: synthesis.available ? "completed" : "empty", detail: synthesis.available ? "Select Research Gaps to inspect traceable source relationships." : "Provenance unavailable." }]);
-  addLayer([{ id: "GAPS", kind: "G", title: `Research Gaps · ${synthesis.gapCount} gaps`, status: synthesis.available ? "completed" : "empty", detail: synthesis.available ? "Select this node to inspect each gap's papers, claims, future work and hypotheses." : "Provenance unavailable." }]);
-  const selectable = hypotheses.filter((item) => item.status === "selected").length;
-  const reviewRequired = hypotheses.length > 0 && selectable === 0 && hypotheses.every((item) => ["evidence_insufficient", "rejected", "revision_required"].includes(item.status));
-  addLayer([{ id: "HYPOTHESES", kind: "H", title: `Hypotheses · ${hypotheses.length} candidates`, status: reviewRequired ? "revision_required" : selectable ? "ready" : hypotheses.length ? "completed" : "empty", detail: reviewRequired ? `${hypotheses.length} candidates reviewed · 0 currently selectable.` : "Candidate provenance is shown only when source gap IDs are persisted." }]);
-  addLayer([{ id: "EVIDENCE_REVIEW", kind: "V", title: `Evidence Review · ${evidence.length} evidence`, status: evidence.length ? "completed" : "empty", detail: "Support, contradiction and missing evidence are validation states, not execution failures." }]);
-  edges.push(
-    { from: "Q1", to: "LITERATURE", label: "检索" },
-    { from: "LITERATURE", to: "THEMES", label: "综合" },
-    { from: "THEMES", to: "GAPS", label: "形成" },
-    { from: "GAPS", to: "HYPOTHESES", label: "启发" },
-    { from: "HYPOTHESES", to: "EVIDENCE_REVIEW", label: "验证" },
+  const scientificExperiments = experiments.filter((item) => item.classification === "scientific");
+
+  // The axis sits at the vertical middle so the candidate column and the
+  // serpentine stay symmetric above and below it, keeping the page height
+  // bounded for any candidate count.
+  const candidateGap = 140;
+  const halfExtent = Math.max(
+    hypotheses.length ? (hypotheses.length - 1) / 2 * candidateGap + nodeH / 2 : 0,
+    scientificExperiments.length ? band + nodeH / 2 : 0,
+    nodeH / 2,
   );
-  const visibleExperiments = experiments.slice(-6);
-  addLayer(visibleExperiments.map((item) => ({ id: item.id, kind: "X", title: short(`${item.title} · ${item.purpose}`, 56), status: item.status })));
-  visibleExperiments.forEach((item, index) => {
-    const from = index === 0 && selectable ? "HYPOTHESES" : index > 0 ? visibleExperiments[index - 1]?.id : undefined;
-    if (from) edges.push({ from, to: item.id, label: index ? "迭代" : "验证", tone: item.status === "failed" ? "conflict" : "support" });
+  const axisY = originY + 48 + halfExtent;
+
+  let colX = originX;
+  const placeAxis = (node: Omit<TreeNode, "x" | "y">): TreeNode => {
+    const placed: TreeNode = { ...node, x: colX, y: axisY - nodeH / 2 };
+    nodes.push(placed);
+    colX += stepX;
+    return placed;
+  };
+
+  // --- 1. Main flow along the horizontal axis ---
+  const questionNode = placeAxis({ id: "Q1", kind: "Q", title: short(question || "尚未开始研究", 54), status: question ? "ready" : "empty" });
+  const literatureNode = placeAxis({ id: "LITERATURE", kind: "L", title: `文献检索 · ${literatureCount} 篇`, status: literatureCount ? "completed" : "empty", detail: synthesis.available ? `共 ${synthesis.paperCount} 篇已验证文献` : "Provenance unavailable for this historical run." });
+  const hypothesisNode = placeAxis({ id: "HYPOTHESES", kind: "H", title: `假设生成 · ${hypotheses.length}`, status: hypotheses.length ? "completed" : "empty", detail: hypotheses.length ? `已生成 ${hypotheses.length} 个候选假设` : "等待生成候选假设" });
+  edges.push({ from: questionNode.id, to: literatureNode.id, label: "", tone: "neutral" });
+  edges.push({ from: literatureNode.id, to: hypothesisNode.id, label: "", tone: "neutral" });
+
+  const hypothesisNodeStatus = (item: HypothesisItem): ResearchStatus =>
+    item.status === "selected" ? "completed"
+      : item.status === "refuted" || item.status === "rejected" ? "refuted"
+      : item.status === "evidence_insufficient" ? "evidence_insufficient"
+      : item.status === "revision_required" ? "revision_required"
+      : "ready";
+
+  // --- 2. Candidate fork: a single vertical column centered on the axis — one
+  // node per candidate, symmetric for any count (odd: middle candidate sits on
+  // the axis; even: axis falls between the two middle candidates); no links
+  // between candidates ---
+  const hasSelection = hypotheses.some((item) => item.status === "selected");
+  const candidates: TreeNode[] = hypotheses.map((item, index) => {
+    const isSelected = item.status === "selected";
+    const score = typeof item.compositeScore === "number" ? ` · 评分 ${item.compositeScore.toFixed(2)}` : "";
+    return {
+      id: item.id,
+      kind: "H" as const,
+      title: short(item.claim || "候选假设内容待生成", 42),
+      status: hypothesisNodeStatus(item),
+      x: colX,
+      y: axisY + (index - (hypotheses.length - 1) / 2) * candidateGap - nodeH / 2,
+      detail: isSelected ? `已选择${score}` : `候选假设${score}`,
+      emphasis: isSelected ? "selected" : hasSelection ? "muted" : undefined,
+    };
   });
+  nodes.push(...candidates);
+  for (const candidate of candidates) edges.push({ from: hypothesisNode.id, to: candidate.id, label: "", tone: "neutral" });
+  colX += stepX;
+
+  // --- 3. Rejoin on the axis: 推理 → 选择 → 计划 ---
+  const reasoningNode = placeAxis({ id: "REASONING", kind: "V", title: "假设推理完成", status: reasoningAvailable ? "completed" : "empty", detail: reasoningAvailable ? "已对每个候选完成证据推理与评分" : "等待证据推理" });
+  for (const candidate of candidates) edges.push({ from: candidate.id, to: reasoningNode.id, label: "", tone: "neutral" });
+  const selectionNode = placeAxis({
+    id: "SELECTION", kind: "S",
+    title: selectedHypothesis ? `已选择 · ${selectedHypothesis.id} · 综合评分 ${selectedHypothesis.compositeScore?.toFixed(2) ?? "—"}` : "待选择假设",
+    status: selectedHypothesis ? "completed" : (hypotheses.length ? "ready" : "empty"),
+    detail: selectedHypothesis?.claim ?? "点击候选假设进行人工选择",
+  });
+  edges.push({ from: reasoningNode.id, to: selectionNode.id, label: "", tone: "neutral" });
+
+  const planDataset = text((plan.dataset as Record<string, unknown> | undefined)?.display_name, (plan.dataset as Record<string, unknown> | undefined)?.name, (plan.dataset as Record<string, unknown> | undefined)?.directory_name) || "未声明";
+  const planModel = short(text((plan.method as Record<string, unknown> | undefined)?.name) || "未设计", 40);
+  const planSeedCount = Array.isArray(plan.seeds) ? plan.seeds.length : 0;
+  const planNode = placeAxis({ id: "PLAN", kind: "P", title: `实验计划 · ${planDataset} · ${planModel}${planSeedCount ? ` · ${planSeedCount} seeds` : ""}`, status: Object.keys(plan).length ? "completed" : "empty", detail: "冻结数据集、方法、种子与评估协议" });
+  edges.push({ from: selectionNode.id, to: planNode.id, label: "", tone: "neutral" });
+
+  // --- 4. Experiment serpentine: odd rounds on the upper side, even rounds mirrored below ---
+  const engineeringCountFor = (id: string) => experiments.filter((item) => item.classification === "engineering" && (item.id === id || item.id.startsWith(`${id}·`))).length;
+  const experimentLabel = (item: ExperimentItem, index: number) => {
+    const match = /experiment[_\-]?(\d+)/i.exec(item.id);
+    return match ? `实验 ${match[1]}` : `实验 ${index + 1}`;
+  };
+  const expTopY = axisY - band - nodeH / 2;
+  const expBottomY = axisY + band - nodeH / 2;
+  let previous = planNode;
+  scientificExperiments.forEach((item, index) => {
+    const round = index + 1;
+    const onTop = round % 2 === 1;
+    const y = onTop ? expTopY : expBottomY;
+    const engineering = engineeringCountFor(item.id);
+    const experiment: TreeNode = { id: `EXP-${item.id}`, kind: "X", title: `${experimentLabel(item, index)}${engineering ? ` · 工程重试 ×${engineering}` : ""}`, status: item.status, x: colX, y, detail: `${item.title}${item.primaryMetric ? ` · ${item.primaryMetric.name} ${item.primaryMetric.value}` : ""}` };
+    nodes.push(experiment);
+    edges.push({ from: previous.id, to: experiment.id, label: "", tone: "neutral" });
+    previous = experiment;
+    if (index + 1 < scientificExperiments.length) {
+      const feedback: TreeNode = { id: `FEEDBACK-${round}`, kind: "F", title: "反馈 / 修订", status: "completed", x: colX + stepX, y, detail: item.revisionReason || item.scientificFeedback || "上一轮结果的科学反馈" };
+      nodes.push(feedback);
+      edges.push({ from: experiment.id, to: feedback.id, label: "", tone: "neutral" });
+      previous = feedback;
+      colX += stepX;
+    }
+  });
+
+  // --- 5. Conclusion on the axis after the last round ---
   if (conclusion) {
-    addLayer([{ id: "C1", kind: "C", title: short(conclusion, 58), status: "completed" }]);
-    visibleExperiments.filter((item) => item.status === "completed").slice(-1).forEach((item) => edges.push({ from: item.id, to: "C1", label: "形成", tone: "support" }));
+    const conclusionNode: TreeNode = { id: "CONCLUSION", kind: "C", title: short(conclusion, 58), status: "completed", x: previous.x + stepX, y: axisY - nodeH / 2 };
+    nodes.push(conclusionNode);
+    edges.push({ from: previous.id, to: conclusionNode.id, label: "", tone: "neutral" });
   }
-  const maxCount = Math.max(1, ...layers.map((layer) => layer.length));
-  const columnGap = 260, rowGap = 128, top = 34;
-  layers.forEach((layer, column) => {
-    const offset = (maxCount - layer.length) * rowGap / 2;
-    layer.forEach((node, row) => { node.x = 28 + column * columnGap; node.y = top + offset + row * rowGap; });
-  });
+
   return { nodes, edges };
 }
 
@@ -626,10 +873,20 @@ export function buildResearchViewModel(run: RunRecord | null, report: Record<str
   const hypotheses = normalizeHypotheses(artifacts);
   const hypothesisRounds = normalizeHypothesisRounds(artifacts);
   const researchSynthesis = normalizeResearchSynthesis(artifacts);
-  const experiments = normalizeExperiments(artifacts, progress);
+  const hypothesisEvent = [...(run?.events ?? [])].reverse().find((item) => (
+    item.step_id === "hypothesis_generation"
+    && typeof item.input_summary.valid_evidence_count === "number"
+  ));
+  const hypothesisPipeline = isRecord(hypothesisEvent?.input_summary.hypothesis_card_pipeline)
+    ? hypothesisEvent.input_summary.hypothesis_card_pipeline
+    : {};
+  const experiments = normalizeExperiments(artifacts, progress, run);
   const { conclusion, boundaries, sections } = normalizeConclusion(artifacts, report);
   const question = text(run?.problem_input, findLatestArtifactContent(artifacts, "problem")?.problem_statement);
-  const tree = buildResearchMap(question, papers, evidence, hypotheses, experiments, conclusion, researchSynthesis);
+  const selectedForMap = hypotheses.find((item) => item.status === "selected");
+  const reasoningAvailable = artifacts.some((item) => item.type === "reasoning");
+  const plan = findLatestArtifactContent(artifacts, "plan") ?? {};
+  const tree = buildResearchMap(question, papers, hypotheses, experiments, conclusion, researchSynthesis, reasoningAvailable, selectedForMap, plan);
   const currentExperiment = [...experiments].reverse().find((item) => item.classification === "scientific" && item.status === "completed")
     ?? experiments.find((item) => item.status === "running")
     ?? experiments[experiments.length - 1];
@@ -637,6 +894,8 @@ export function buildResearchViewModel(run: RunRecord | null, report: Record<str
   const environment = currentExperiment?.environment ?? {};
   const latestResult = artifacts.find((item) => item.id === currentExperiment?.resultArtifactId)?.content ?? {};
   const audit = isRecord(latestResult.audit) ? latestResult.audit : {};
+  const verifiedCodeFile = records(audit.verified_files)[0] ?? {};
+  const codeVersion = text(environment.git_commit, latestResult.git_commit, verifiedCodeFile.sha256);
   const manifest = isRecord(findLatestArtifactContent(artifacts, "experiment_task")?.manifest) ? findLatestArtifactContent(artifacts, "experiment_task")?.manifest as Record<string, unknown> : {};
   const githubArtifact = findLatestArtifactContent(artifacts, "github_source") ?? {};
   const githubStatus = text(githubArtifact.github_source_status) === "parsed" ? "parsed" as const : text(githubArtifact.github_source_status) === "unavailable" ? "unavailable" as const : "not_provided" as const;
@@ -658,6 +917,12 @@ export function buildResearchViewModel(run: RunRecord | null, report: Record<str
     boundaries,
     reportSections: sections,
     researchSynthesis,
+    hypothesisLiterature: {
+      retrievedCount: number(hypothesisEvent?.input_summary.synthesis_paper_count) ?? researchSynthesis.paperCount,
+      inputCount: number(hypothesisEvent?.input_summary.valid_evidence_count) ?? 0,
+      irrelevantRemoved: number(hypothesisPipeline.irrelevant_removed) ?? 0,
+      duplicateMerged: number(hypothesisPipeline.duplicate_merged) ?? 0,
+    },
     githubSource: {
       url: text(githubArtifact.repository_url, run?.github_repository_url),
       status: githubStatus,
@@ -669,11 +934,11 @@ export function buildResearchViewModel(run: RunRecord | null, report: Record<str
       { label: "数据集指纹", value: text(environment.dataset_fingerprint) || "未提供", ready: Boolean(text(environment.dataset_fingerprint)) },
       { label: "运行环境", value: [text(environment.python_version), text(environment.torch_version)].filter(Boolean).join(" · ") || "未记录", ready: Boolean(text(environment.python_version)) },
       { label: "随机种子", value: currentExperiment?.seeds.map(String).join(" / ") || stringify(manifest.seeds) || "未记录", ready: Boolean(currentExperiment?.seeds.length || manifest.seeds) },
-      { label: "代码提交", value: text(environment.git_commit, latestResult.git_commit) || "未记录", ready: Boolean(text(environment.git_commit, latestResult.git_commit)) },
+      { label: "代码版本", value: codeVersion || "未记录", ready: Boolean(codeVersion) },
       { label: "完整性审计", value: text(audit.integrity_status) || "未执行", ready: text(audit.integrity_status) === "passed" },
       { label: "实验产物", value: Array.isArray(latestResult.deployed_files) ? `${latestResult.deployed_files.length} 个文件` : "未记录", ready: Array.isArray(latestResult.deployed_files) && latestResult.deployed_files.length > 0 },
     ],
-    reportAvailable: artifacts.some((item) => item.type === "report"),
+    reportAvailable: Boolean(report) || artifacts.some((item) => item.type === "report"),
     codePackageAvailable: artifacts.some((item) => item.type === "experiment_bundle" && records(item.content.files).length > 0),
   };
 }
@@ -688,6 +953,14 @@ export function comparableMetricSeries(experiments: ExperimentItem[]) {
   return { name, direction, rows: successful.map((item) => ({ id: item.id, value: item.metrics.find((metric) => metric.name === name)!.value })) };
 }
 
+const COMMON_LOSS_METRICS = ["loss", "train_loss", "val_loss", "test_loss"];
+
+/** Core metrics are the declared plan evaluation metrics plus common loss terms. */
+export function coreMetricNames(experiments: ExperimentItem[]): Set<string> {
+  const declared = [...new Set(experiments.flatMap((item) => item.declaredMetrics))].filter(Boolean);
+  return new Set([...declared, ...COMMON_LOSS_METRICS]);
+}
+
 /**
  * Produces selector-ready, provenance-preserving series.  A series may only
  * connect points that share the persisted metric/evaluation and dataset contract.
@@ -697,7 +970,11 @@ export function scientificMetricSeries(experiments: ExperimentItem[]): Scientifi
     .filter((item) => item.classification === "scientific" && item.status === "completed" && item.isRealExperiment && item.auditStatus === "passed" && item.resultArtifactId)
     .slice()
     .sort((left, right) => left.completedAt.localeCompare(right.completedAt));
-  const names = [...new Set(valid.flatMap((item) => item.metrics.map((metric) => metric.name)))];
+  const core = coreMetricNames(valid);
+  // The main selector shows only declared evaluation metrics plus any common
+  // loss metrics that actually exist; component-level diagnostics (e.g. KL per
+  // latent dimension) remain available in the experiment detail drawer.
+  const names = [...new Set(valid.flatMap((item) => item.metrics.map((metric) => metric.name)))].filter((name) => core.has(name)).slice(0, 6);
   const output: ScientificMetricSeries[] = [];
   for (const name of names) {
     const first = valid.find((item) => item.metrics.some((metric) => metric.name === name));

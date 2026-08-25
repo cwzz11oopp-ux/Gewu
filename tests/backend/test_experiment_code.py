@@ -3,7 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from backend.app.agents.experiment import ExperimentAgent
+from backend.app.agents.experiment import (
+    ExperimentAgent,
+    _CLASSIFICATION_SMOKE_INSTRUCTIONS,
+)
 from backend.app.providers.experiment import MockExperimentProvider
 from backend.app.workflow.skills import SkillLoader
 from backend.app.workflow.experiment_code import (
@@ -83,6 +86,22 @@ if args.smoke_test:
     ]
 
 
+def test_smoke_prompt_keeps_shared_data_and_output_contract_without_dataset_specific_rules():
+    prompt = _CLASSIFICATION_SMOKE_INSTRUCTIONS
+
+    assert "complete verified dataset" in prompt
+    assert "same split, preprocessing, labels/targets, and validation code" in prompt
+    assert "X[:N]" in prompt and "y[:N]" in prompt and "Subset" in prompt
+    assert "GEWU_EXECUTION_STAGE" in prompt and "GEWU_EXECUTION_EPOCHS" in prompt
+    assert "training-progress and result-output protocol" in prompt
+    assert "exactly one train batch" not in prompt
+    assert "exactly one validation" not in prompt
+    assert "IPIX17" not in prompt
+    assert "clutter.mat" not in prompt
+    assert "mubiao.mat" not in prompt
+    assert "stratify=y" not in prompt
+
+
 def test_normalize_experiment_code_rejects_parent_directory_file_path():
     raw = {
         "entrypoint": "train.py",
@@ -159,7 +178,7 @@ def test_generate_bundle_contains_manifest_code_requirements_and_stable_ids():
     bundle = agent.generate_bundle(
         run_id="run_1",
         experiment_id="experiment_1",
-        plan={"objective": "test"},
+        plan={"objective": "test", "resources": {"gpu": "required"}},
         task={"seed": 42},
         instructions="Use experiment implementation.",
         python_command="python",
@@ -219,6 +238,10 @@ def test_bundle_generation_and_repair_receive_observed_local_structure():
     assert repaired_call[1]["observed_structure"] == observed
     assert "read-only inspection of the real local data files" in generated[3]
     assert "read-only inspection of the real local data files" in repaired_call[3]
+    for instructions in (generated[3], repaired_call[3]):
+        assert "--seed is the authoritative runtime seed" in instructions
+        assert "Use args.seed" in instructions
+        assert "result seed must equal args.seed" in instructions
     assert repaired.manifest.dataset_contract_id == "dataset_1"
 
 
@@ -260,7 +283,12 @@ def test_generate_bundle_rejects_gpu_bundle_without_visible_cuda_execution():
 
     with pytest.raises(ValueError, match="EXPERIMENT_BUNDLE_CUDA_USAGE_MISSING"):
         ExperimentAgent(MockExperimentProvider(), llm).generate_bundle(
-            "run_1", "experiment_1", {}, {}, "", "python"
+            "run_1",
+            "experiment_1",
+            {"resources": {"gpu": "required"}},
+            {},
+            "",
+            "python",
         )
 
 
@@ -435,7 +463,12 @@ def test_generate_bundle_accepts_declared_dataset_loaded_from_data_root():
     llm.generate_json = with_dataset
 
     bundle = ExperimentAgent(MockExperimentProvider(), llm).generate_bundle(
-        "run_1", "experiment_1", {}, {"seed": 42}, "", "python"
+        "run_1",
+        "experiment_1",
+        {"dataset": {"canonical_name": "cifar-10"}},
+        {"seed": 42},
+        "",
+        "python",
     )
 
     assert bundle.manifest.dataset == "cifar-10"
@@ -542,7 +575,7 @@ def test_generate_bundle_rejects_declared_dataset_without_data_root_usage():
         )
 
 
-def test_generate_bundle_rejects_unsupported_declared_dataset():
+def test_generate_bundle_ignores_model_declared_dataset_without_plan_authority():
     llm = BundleLLM()
     original = llm.generate_json
 
@@ -553,10 +586,11 @@ def test_generate_bundle_rejects_unsupported_declared_dataset():
 
     llm.generate_json = with_dataset
 
-    with pytest.raises(ValueError, match="EXPERIMENT_DATASET_UNSUPPORTED"):
-        ExperimentAgent(MockExperimentProvider(), llm).generate_bundle(
-            "run_1", "experiment_1", {}, {"seed": 42}, "", "python"
-        )
+    bundle = ExperimentAgent(MockExperimentProvider(), llm).generate_bundle(
+        "run_1", "experiment_1", {}, {"seed": 42}, "", "python"
+    )
+
+    assert bundle.manifest.dataset == ""
 
 
 def test_generate_bundle_inherits_dataset_from_plan_when_source_uses_torchvision():

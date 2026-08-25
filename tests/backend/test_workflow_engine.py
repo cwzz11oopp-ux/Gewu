@@ -71,7 +71,7 @@ class RecordingLLM:
                     self._idea_evaluation(
                         index,
                         candidate,
-                        4 if index == 1 else (3 if index == 2 else 2),
+                        4 if index == 1 else (5 if index == 2 else 2),
                         "EVIDENCE_INSUFFICIENT" if index == 1 else ("GO" if index == 2 else "REVISE"),
                     )
                     for index, candidate in enumerate(inputs["candidates"])
@@ -120,6 +120,7 @@ class RecordingLLM:
                 "dataset": "Fashion-MNIST",
                 "baselines": ["baseline_cnn"],
                 "metrics": ["accuracy"],
+                "parameters": {"epochs": 1},
                 "expected_result": "dropout improves or narrows claim",
             }
         if task == "planning.review_plan":
@@ -197,7 +198,11 @@ class RecordingLLM:
                 "is_real_experiment": inputs["result"].get("is_real_experiment", False),
             }
         if task == "critic.review_result":
-            return {"feedback": "Add ablation and narrow the claim.", "required_revision": "state seed and metric path"}
+            return {
+                "decision": "REVISE",
+                "feedback": "Add ablation and narrow the claim.",
+                "required_revision": "state seed and metric path",
+            }
         if task in {"scientific.primary_result_analysis", "scientific.independent_result_review"}:
             return {
                 "hypothesis_status": "INCONCLUSIVE",
@@ -231,6 +236,7 @@ class RecordingLLM:
                 "stop_rule": "完成验证后停止",
             }
             return {
+                "decision": "REVISE",
                 "evidence_sufficiency": "SUFFICIENT",
                 "evidence_assessment": [],
                 "optimization_candidates": [
@@ -517,15 +523,17 @@ def test_evidence_reasoning_resume_reuses_completed_candidate_checkpoints(tmp_pa
     orchestrator = WorkflowOrchestrator(engine.repository, lambda: engine)
     orchestrator._drive(run.id)
     interrupted = engine.repository.get_run(run.id)
-    assert interrupted.status == "RECOVERABLE_PROVIDER_ERROR"
+    # The transient provider timeout is retried in-process; the remaining
+    # pause is the normal hypothesis-selection checkpoint, not a failure.
+    assert interrupted.status == "paused"
     step = next(item for item in interrupted.steps if item.id == "evidence_reasoning")
-    assert step.status == "interrupted"
-    assert llm.critic_claims == ["candidate 0", "candidate 1", "candidate 2"]
+    assert step.status == "completed"
+    assert llm.critic_claims == ["candidate 0", "candidate 1", "candidate 2", "candidate 2"]
     checkpoints = [
         artifact for artifact in engine.repository.get_run(run.id).artifacts
         if artifact.type == "candidate_reasoning_checkpoint"
     ]
-    assert [item.content["candidate_index"] for item in checkpoints] == [0, 1]
+    assert [item.content["candidate_index"] for item in checkpoints] == [0, 1, 2]
     events = [item for item in interrupted.events if item.step_id == "evidence_reasoning"]
     interrupted_event = next(item for item in events if item.data.get("status") == "interrupted")
     assert interrupted_event.data == {
@@ -533,12 +541,10 @@ def test_evidence_reasoning_resume_reuses_completed_candidate_checkpoints(tmp_pa
         "completed_count": 2, "recoverable": True,
         "error_code": "MODEL_REQUEST_TIMEOUT",
     }
-
-    orchestrator._drive(run.id)
-
-    assert llm.critic_claims == [
-        "candidate 0", "candidate 1", "candidate 2", "candidate 2"
-    ]
+    assert any(
+        item.data.get("automatic_retry") is True
+        for item in events
+    )
 
 
 def test_automatic_selection_requires_all_candidates_and_uses_weighted_ranking(tmp_path):
@@ -557,7 +563,25 @@ def test_automatic_selection_requires_all_candidates_and_uses_weighted_ranking(t
     assert selection.content["selected_indexes"] == [2]
 
 
-def test_automatic_selection_falls_back_without_ranking_and_records_failure(tmp_path):
+def test_regenerate_hypotheses_creates_new_round_without_rerunning_literature(tmp_path):
+    engine, run = prepared_candidate_run(tmp_path)
+    run = engine.run_step(run.id, "evidence_reasoning")
+    assert len([a for a in run.artifacts if a.type == "hypothesis"]) == 1
+    assert len([a for a in run.artifacts if a.type == "reasoning"]) == 1
+
+    regenerated = engine.regenerate_hypotheses(run.id)
+
+    hypotheses = [a for a in regenerated.artifacts if a.type == "hypothesis"]
+    reasoning = [a for a in regenerated.artifacts if a.type == "reasoning"]
+    assert len(hypotheses) == 2
+    assert hypotheses[-1].content["hypothesis_round"]["round_index"] == 2
+    assert len(reasoning) == 2
+    # Literature search is not re-run: evidence and synthesis artifacts stay single.
+    assert len([a for a in regenerated.artifacts if a.type == "evidence"]) == 1
+    assert len([a for a in regenerated.artifacts if a.type == "research_synthesis"]) == 1
+
+
+def test_automatic_selection_pauses_without_score_exceeding_threshold(tmp_path):
     engine, run = prepared_candidate_run(tmp_path)
     run = engine.run_step(run.id, "evidence_reasoning")
     reasoning = next(a for a in run.artifacts if a.type == "reasoning")
@@ -565,9 +589,8 @@ def test_automatic_selection_falls_back_without_ranking_and_records_failure(tmp_
         assessment["evaluation"].pop("scores", None)
     engine.repository.save_run(run)
     selected = engine.auto_select_hypothesis(run.id)
-    selection = [a for a in selected.artifacts if a.type == "hypothesis_selection"][-1]
-    assert selection.content["selection_mode"] == "automatic_fallback"
-    assert selection.content["selected_indexes"] == [0]
+    assert selected.status == "paused"
+    assert not any(a.type == "hypothesis_selection" for a in selected.artifacts)
 
     run2_engine, run2 = prepared_candidate_run(tmp_path / "none")
     run2 = run2_engine.run_step(run2.id, "evidence_reasoning")
@@ -837,6 +860,8 @@ def test_auto_selection_continues_after_one_candidate_is_exhausted(tmp_path):
     assessments[0]["recommendation"] = "REJECTED_EVIDENCE_UNAVAILABLE"
     assessments[1]["status"] = "verified"
     assessments[1]["recommendation"] = "GO"
+    for key in list(assessments[1]["evaluation"]["scores"]):
+        assessments[1]["evaluation"]["scores"][key] = 5
     for assessment in assessments[2:]:
         assessment["status"] = "rejected"
         assessment["recommendation"] = "REJECT"
@@ -1578,6 +1603,60 @@ def test_experiment_task_second_repair_receives_previous_candidate_and_full_hist
     assert task.content["repair_history"] == second["repair_history"]
 
 
+def test_experiment_task_malformed_repair_keeps_last_complete_bundle_as_next_base(tmp_path):
+    class MalformedRepairThenValidLLM(RecordingLLM):
+        def __init__(self):
+            super().__init__()
+            self.repair_inputs = []
+
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            if task == "experiment.generate_bundle":
+                result = super().generate_json(task, inputs, schema_hint, instructions)
+                result["files"][0]["content"] += (
+                    "\ntorchvision.datasets.CIFAR10(root='data', download=True)\n"
+                )
+                return result
+            if task == "experiment.repair_bundle":
+                self.repair_inputs.append(inputs)
+                if len(self.repair_inputs) == 1:
+                    return {"files": [], "requirements": []}
+                result = super().generate_json(
+                    "experiment.generate_bundle", inputs, schema_hint, instructions
+                )
+                return {
+                    "files": [{
+                        "path": "train.py",
+                        "content_lines": result["files"][0]["content"].splitlines(),
+                    }],
+                    "requirements": [],
+                }
+            return super().generate_json(task, inputs, schema_hint, instructions)
+
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    llm = MalformedRepairThenValidLLM()
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+    )
+    run = _selected_hypothesis_run(engine, repository)
+    run = engine.run_step(run.id, "research_plan")
+    run = engine.run_step(run.id, "experiment_task")
+
+    assert len(llm.repair_inputs) == 2
+    assert "torchvision.datasets.CIFAR10" in llm.repair_inputs[1]["files"][0]["content"]
+    assert llm.repair_inputs[1]["previous_candidate"] == {}
+    attempts = [
+        artifact for artifact in run.artifacts
+        if artifact.type == "experiment_candidate_attempt"
+    ]
+    malformed_repair = attempts[1]
+    assert malformed_repair.content["accepted"] is False
+    assert malformed_repair.content["raw_model_output"]["files"] == []
+    assert malformed_repair.content["normalized_bundle"] is None
+
+
 def test_experiment_task_records_final_issue_before_revision_limit_error(tmp_path):
     class AlwaysInvalidBundleLLM(RecordingLLM):
         def generate_json(self, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
@@ -2093,16 +2172,15 @@ def test_generated_code_failure_repairs_source_preserves_contract_and_retries(tm
     assert accepted_repair.content["parent_attempt_id"] == rejected_repair.id
 
 
-def test_failed_experiment_result_reaches_feedback_and_enables_second_task(tmp_path):
+def test_failed_engineering_result_does_not_reach_scientific_feedback(tmp_path):
     class FailingExperimentProvider(MockExperimentProvider):
         def run(self, task, code=None):
             raise RuntimeError("LOCAL_EXPERIMENT_CUDA_UNAVAILABLE")
 
     repository = Repository(data_dir=str(tmp_path / "data"))
-    llm = RecordingLLM()
     engine = WorkflowEngine(
         repository,
-        llm,
+        RecordingLLM(),
         MockLiteratureProvider(),
         FailingExperimentProvider(),
     )
@@ -2111,25 +2189,13 @@ def test_failed_experiment_result_reaches_feedback_and_enables_second_task(tmp_p
     run = engine.run_step(run.id, "experiment_task")
     run = engine.run_step(run.id, "experiment_run_analysis")
 
+    failure = [artifact for artifact in run.artifacts if artifact.type == "experiment_result"][-1]
+    assert failure.content["status"] == "failed"
+
+    # An engineering failure must not be turned into a scientific revision or
+    # negative; feedback_revision skips it without producing a revision artifact.
     run = engine.run_step(run.id, "feedback_revision")
-    feedback_event = run.events[-1]
-    feedback = [artifact for artifact in run.artifacts if artifact.type == "revision"][-1]
-    route = [
-        call for call in feedback_event.tool_calls if call["provider"] == "skill_runtime"
-    ][-1]
-
-    assert feedback.content["verdict"] == "failed"
-    assert feedback.content["requires_follow_up"] is True
-    assert "ablation-planner" in route["skills"]
-    assert len([artifact for artifact in run.artifacts if artifact.type == "plan"]) == 1
-    assert len(
-        [artifact for artifact in run.artifacts if artifact.type == "plan_refinement_proposal"]
-    ) == 1
-
-    run = engine.run_step(run.id, "research_plan")
-    assert len([artifact for artifact in run.artifacts if artifact.type == "plan"]) == 2
-    run = engine.run_step(run.id, "experiment_task")
-    assert len([artifact for artifact in run.artifacts if artifact.type == "experiment_task"]) == 2
+    assert not any(artifact.type == "revision" for artifact in run.artifacts)
 
 
 def test_rerun_from_locked_experiment_task_preserves_its_bundle(tmp_path):
@@ -2319,9 +2385,10 @@ def test_mock_llm_has_deterministic_plan_refinement_fallback():
 
 
 class FeedbackIterationLLM(RecordingLLM):
-    def __init__(self, verdicts):
+    def __init__(self, verdicts, decisions=None):
         super().__init__()
         self.verdicts = list(verdicts)
+        self.decisions = list(decisions or [])
         self.review_count = 0
 
     def generate_json(self, task, inputs, schema_hint, instructions=""):
@@ -2329,9 +2396,20 @@ class FeedbackIterationLLM(RecordingLLM):
             self.tasks.append(task)
             self.inputs.append((task, inputs))
             verdict = self.verdicts[self.review_count]
+            decision = (
+                self.decisions[self.review_count]
+                if self.review_count < len(self.decisions)
+                else (
+                    "REPORT"
+                    if str(verdict).strip().lower()
+                    in {"passed", "pass", "success", "supported"}
+                    else "REVISE"
+                )
+            )
             self.review_count += 1
             return {
                 "verdict": verdict,
+                "decision": decision,
                 "feedback": f"feedback round {self.review_count}",
                 "required_revision": "add a fixed-seed ablation",
             }
@@ -2345,6 +2423,7 @@ class ResultDrivenIterationLLM(RecordingLLM):
             self.inputs.append((task, inputs))
             return {
                 "verdict": "partial",
+                "decision": "REVISE",
                 "feedback": "The accuracy target was not met.",
                 "required_revision": "Test one evidence-grounded change.",
                 "supported_claims": [],
@@ -2377,6 +2456,7 @@ class ResultDrivenIterationLLM(RecordingLLM):
             self.tasks.append(task)
             self.inputs.append((task, inputs))
             return {
+                "decision": "REVISE",
                 "evidence_sufficiency": "SUFFICIENT",
                 "evidence_assessment": [{
                     "statement": "Verified literature motivates a bounded dropout ablation.",
@@ -2435,6 +2515,65 @@ class ResultDrivenIterationLLM(RecordingLLM):
                 "next_action": "Run the lower-dropout ablation with frozen controls.",
             }
         return super().generate_json(task, inputs, schema_hint, instructions)
+
+
+class InsufficientDirectionIterationLLM(ResultDrivenIterationLLM):
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        if task == "critic.select_iteration_direction":
+            self.tasks.append(task)
+            self.inputs.append((task, inputs))
+            return {
+                "decision": "REPORT",
+                "evidence_sufficiency": "EVIDENCE_INSUFFICIENT",
+                "evidence_assessment": [],
+                "optimization_candidates": [],
+                "selected_direction": {},
+                "selection_reason": "No external direction is sufficiently supported.",
+                "next_action": "",
+            }
+        return super().generate_json(task, inputs, schema_hint, instructions)
+
+
+class PivotIterationLLM(ResultDrivenIterationLLM):
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        if task == "scientific.primary_result_analysis":
+            return {
+                "hypothesis_status": "CONTRADICTED",
+                "supported_findings": [],
+                "contradicting_findings": ["The registered criterion was not met."],
+                "alternative_explanations": ["The current protocol is saturated."],
+                "confounders": [],
+                "evidence_gaps": [],
+                "interpretation": "The current claim is contradicted.",
+                "recommended_action": "PIVOT",
+                "proposed_hypothesis": {
+                    "claim": "A bounded lower-dropout experiment may avoid saturation."
+                },
+                "confidence": 0.8,
+            }
+        value = super().generate_json(task, inputs, schema_hint, instructions)
+        if task == "critic.review_result":
+            return {**value, "verdict": "failed", "decision": "PIVOT"}
+        if task == "critic.select_iteration_direction":
+            return {**value, "decision": "PIVOT"}
+        return value
+
+
+class NoMaterialPivotIterationLLM(PivotIterationLLM):
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        if task == "planning.refine_plan":
+            self.tasks.append(task)
+            self.inputs.append((task, inputs))
+            return dict(inputs["current_plan"])
+        return super().generate_json(task, inputs, schema_hint, instructions)
+
+
+class MissingLineagePivotIterationLLM(ResultDrivenIterationLLM):
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        value = super().generate_json(task, inputs, schema_hint, instructions)
+        if task in {"critic.review_result", "critic.select_iteration_direction"}:
+            return {**value, "decision": "PIVOT"}
+        return value
 
 
 def _run_through_experiment(engine, run):
@@ -2502,7 +2641,9 @@ def test_first_partial_feedback_refines_plan_and_preserves_history(tmp_path):
     assert refine_inputs["feedback"]["iteration"] == 1
     claim_inputs = next(inputs for task, inputs in llm.inputs if task == "critic.review_result")
     assert claim_inputs["plan"] == original_plan.content
-    assert claim_inputs["analysis"] == result.content["analysis"]
+    for key, value in result.content["analysis"].items():
+        assert claim_inputs["analysis"][key] == value
+    assert claim_inputs["analysis"]["deterministic_metric_evidence"]
     assert claim_inputs["audit"] == result.content["audit"]
     route = [
         call for call in feedback_event.tool_calls if call["provider"] == "skill_runtime"
@@ -2560,6 +2701,185 @@ def test_feedback_iteration_retrieves_evidence_and_selects_a_direction(tmp_path)
     )
     assert refine_inputs["feedback"]["selected_direction"]["name"] == (
         "Lower dropout ablation"
+    )
+
+
+def test_failed_feedback_report_decision_skips_follow_up_and_routes_to_report(tmp_path):
+    from backend.app.workflow.orchestrator import WorkflowOrchestrator
+
+    llm = FeedbackIterationLLM(["failed"], ["REPORT"])
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+    )
+    run = _run_through_experiment(
+        engine, _selected_hypothesis_run(engine, repository)
+    )
+
+    run = engine.run_step(run.id, "feedback_revision")
+
+    revision = [
+        artifact for artifact in run.artifacts if artifact.type == "revision"
+    ][-1].content
+    assert revision["verdict"] == "failed"
+    assert revision["decision"] == "REPORT"
+    assert revision["requires_follow_up"] is False
+    assert "revised_plan" not in revision
+    assert "critic.select_iteration_direction" not in llm.tasks
+    assert "planning.refine_plan" not in llm.tasks
+    assert not any(
+        artifact.type in {"working_hypothesis", "idea_revision"}
+        for artifact in run.artifacts
+    )
+    assert not any(
+        artifact.type == "plan_refinement_proposal" for artifact in run.artifacts
+    )
+    assert WorkflowOrchestrator._next_step(run) == "report_export"
+
+
+def test_failed_feedback_pivot_decision_creates_one_bounded_proposal(tmp_path):
+    llm = PivotIterationLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+    )
+    run = _run_through_experiment(
+        engine, _selected_hypothesis_run(engine, repository)
+    )
+
+    run = engine.run_step(run.id, "feedback_revision")
+
+    revision = [
+        artifact for artifact in run.artifacts if artifact.type == "revision"
+    ][-1].content
+    proposals = [
+        artifact
+        for artifact in run.artifacts
+        if artifact.type == "plan_refinement_proposal"
+    ]
+    assert revision["verdict"] == "failed"
+    assert revision["decision"] == "PIVOT"
+    assert revision["requires_follow_up"] is True
+    assert revision["revised_plan"] == proposals[0].content["normalized_plan"]
+    assert len(proposals) == 1
+    assert llm.tasks.count("critic.select_iteration_direction") == 1
+    assert llm.tasks.count("planning.refine_plan") == 1
+    assert any(
+        artifact.type == "working_hypothesis" for artifact in run.artifacts
+    )
+    assert revision["revised_plan"]["iteration_contract"][
+        "hypothesis_lineage"
+    ]["kind"] == "PIVOT"
+
+
+def test_pivot_without_hypothesis_lineage_fails_closed_to_report(tmp_path):
+    llm = MissingLineagePivotIterationLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+    )
+    run = _run_through_experiment(
+        engine, _selected_hypothesis_run(engine, repository)
+    )
+
+    run = engine.run_step(run.id, "feedback_revision")
+
+    revision = [
+        artifact for artifact in run.artifacts if artifact.type == "revision"
+    ][-1].content
+    assert revision["decision"] == "REPORT"
+    assert revision["route_reason"] == "PIVOT_HYPOTHESIS_LINEAGE_MISSING"
+    assert revision["requires_follow_up"] is False
+    assert revision["required_revision"] == ""
+    assert revision["revisions"] == []
+    assert "report" in revision["next_action"].lower()
+    assert "planning.refine_plan" not in llm.tasks
+    assert not any(
+        artifact.type in {
+            "working_hypothesis",
+            "idea_revision",
+            "plan_refinement_proposal",
+        }
+        for artifact in run.artifacts
+    )
+
+
+def test_insufficient_direction_without_safe_experiment_routes_to_report(tmp_path):
+    llm = InsufficientDirectionIterationLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+        max_feedback_iterations=3,
+    )
+    run = _run_through_experiment(
+        engine, _selected_hypothesis_run(engine, repository)
+    )
+
+    run = engine.run_step(run.id, "feedback_revision")
+
+    revision = [
+        artifact for artifact in run.artifacts if artifact.type == "revision"
+    ][-1].content
+    assert revision["verdict"] == "partial"
+    assert revision["iteration"] == 1
+    assert revision["decision"] == "REPORT"
+    assert revision["route_reason"] == "DIRECTION_REPORT"
+    assert revision["requires_follow_up"] is False
+    assert "revised_plan" not in revision
+    assert "planning.refine_plan" not in llm.tasks
+    assert not any(
+        artifact.type in {"working_hypothesis", "idea_revision"}
+        for artifact in run.artifacts
+    )
+    assert not any(
+        artifact.type == "plan_refinement_proposal" for artifact in run.artifacts
+    )
+
+
+def test_no_material_pivot_revision_routes_to_report_without_proposal(tmp_path):
+    llm = NoMaterialPivotIterationLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(
+        repository,
+        llm,
+        MockLiteratureProvider(),
+        MockExperimentProvider(),
+    )
+    run = _run_through_experiment(
+        engine, _selected_hypothesis_run(engine, repository)
+    )
+
+    run = engine.run_step(run.id, "feedback_revision")
+
+    revision = [
+        artifact for artifact in run.artifacts if artifact.type == "revision"
+    ][-1].content
+    assert revision["decision"] == "REPORT"
+    assert revision["route_reason"] == "NO_MATERIAL_PLAN_CHANGE"
+    assert revision["requires_follow_up"] is False
+    assert revision["required_revision"] == ""
+    assert revision["revisions"] == []
+    assert "report" in revision["next_action"].lower()
+    assert "revised_plan" not in revision
+    assert llm.tasks.count("planning.refine_plan") == 1
+    assert not any(
+        artifact.type in {"working_hypothesis", "idea_revision"}
+        for artifact in run.artifacts
+    )
+    assert not any(
+        artifact.type == "plan_refinement_proposal" for artifact in run.artifacts
     )
 
 
@@ -2649,6 +2969,66 @@ def test_normalize_feedback_verdict(raw, expected):
     from backend.app.workflow.policies import normalize_feedback_verdict
 
     assert normalize_feedback_verdict(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("REPORT", "REPORT"),
+        ("stop", "REPORT"),
+        (" REVISE ", "REVISE"),
+        ("pivot", "PIVOT"),
+        (None, "REPORT"),
+        ("continue because the text says so", "REPORT"),
+    ],
+)
+def test_normalize_feedback_decision(raw, expected):
+    from backend.app.workflow.policies import normalize_feedback_decision
+
+    assert normalize_feedback_decision(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ({"decision": "REPORT", "requires_follow_up": True}, False),
+        ({"decision": "PIVOT", "requires_follow_up": False}, True),
+        ({"decision": "INVALID", "requires_follow_up": True}, False),
+        ({"requires_follow_up": True}, True),
+        ({"requires_follow_up": False}, False),
+    ],
+)
+def test_feedback_requires_follow_up_prefers_decision_and_supports_legacy(
+    content, expected
+):
+    from backend.app.workflow.policies import feedback_requires_follow_up
+
+    assert feedback_requires_follow_up(content) is expected
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "primary_experiment",
+        "baseline_and_controls",
+        "split_contract",
+        "staged_gates",
+        "progressive_experiment",
+    ],
+)
+def test_iteration_contract_treats_execution_contract_fields_as_material(field):
+    previous = {field: {"version": 1}}
+    revised = {field: {"version": 2}}
+
+    contract = WorkflowEngine._build_iteration_contract(
+        1,
+        previous,
+        revised,
+        {},
+    )
+
+    assert contract["changed_fields"] == [field]
+    assert contract["contract_status"] == "changed"
 
 
 def test_duplicate_feedback_for_same_result_is_idempotent(tmp_path):
@@ -3085,6 +3465,7 @@ def test_research_plan_normalizes_nested_legacy_plan_for_artifact_and_trace(tmp_
                         "methods": ["dropout cnn"],
                         "baselines": ["baseline cnn"],
                         "metrics": ["accuracy"],
+                        "parameters": {"epochs": 5},
                     }
                 }
             return super().generate_json(task, inputs, schema_hint, instructions)
@@ -3117,7 +3498,11 @@ def test_research_plan_uses_engine_provenance_over_raw_provider_values(tmp_path)
     class SpoofedPlanLLM(RecordingLLM):
         def generate_json(self, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
             if task == "planning.build_plan":
-                return {"provider_mode": "spoofed", "fallback_used": True}
+                return {
+                    "provider_mode": "spoofed",
+                    "fallback_used": True,
+                    "parameters": {"epochs": 5},
+                }
             return super().generate_json(task, inputs, schema_hint, instructions)
 
     repo = Repository(data_dir=str(tmp_path))

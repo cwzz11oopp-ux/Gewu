@@ -44,6 +44,14 @@ def test_contradicted_path_creates_refined_or_replacement_candidate():
     assert decision["create_working_hypothesis"] is True
 
 
+@pytest.mark.parametrize(
+    ("raw_status", "expected_status"),
+    [("FAILED", "CONTRADICTED"), ("UNSUPPORTED", "CONTRADICTED"), ("PARTIAL", "INCONCLUSIVE")],
+)
+def test_result_verdict_aliases_normalize_to_scientific_statuses(raw_status, expected_status):
+    assert analysis(raw_status)["hypothesis_status"] == expected_status
+
+
 def test_inconclusive_and_disagreement_require_more_evidence_not_model_vote():
     primary = analysis("SUPPORTED")
     secondary = normalize_scientific_analysis({**analysis("CONTRADICTED"), "contradicting_findings": ["capacity confound"]}, provider_id="deepseek")

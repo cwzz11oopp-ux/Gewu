@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import hashlib
 import json
+import secrets
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from backend.app.agents.planner import (
     build_plan_review_runtime_contract,
     build_plan_revision_runtime_contract,
     plan_review_schema_snapshot,
+    plan_revision_patch_schema,
     plan_revision_schema_snapshot,
 )
 from backend.app.agents.reviewer import ValidationDecision
@@ -45,7 +47,9 @@ from backend.app.workflow.hypothesis_contract import (
     normalize_hypothesis_content,
 )
 from backend.app.workflow.idea_selection import (
+    AUTO_SELECT_THRESHOLD,
     WEIGHTS,
+    composite_score,
     normalize_idea_review,
     weighted_score,
 )
@@ -66,6 +70,7 @@ from backend.app.workflow.phase2_evidence import (
     baseline_profile,
     dataset_profile as phase2_dataset_profile,
     fair_experiment_contract,
+    paired_seed_metrics,
     progressive_protocol,
     result_evidence,
     route_result,
@@ -84,6 +89,7 @@ from backend.app.workflow.experiment_code import (
     experiment_validation_issues,
     smoke_data_reduction_issues,
 )
+from backend.app.workflow.experiment_harness import compile_bundle_runtime_contract
 from backend.app.workflow.scientific_integrity import (
     compile_scientific_contract,
     scientific_feedback,
@@ -102,6 +108,9 @@ from backend.app.workflow.plan_contract import (
     CANONICAL_PLAN_CONTRACT_FIELDS,
     FIELD_ALIAS_TO_CANONICAL,
     authoritative_plan_contract,
+    canonical_training_epochs,
+    canonical_contract_field,
+    merge_plan_patch,
     normalize_plan,
 )
 from backend.app.workflow.plan_review_governance import (
@@ -121,7 +130,12 @@ from backend.app.workflow.plan_review_governance import (
     validate_plan_review_recovery,
     validate_plan_governance_migration,
 )
-from backend.app.workflow.policies import competition_export_allowed, normalize_feedback_verdict
+from backend.app.workflow.policies import (
+    competition_export_allowed,
+    feedback_requires_follow_up,
+    normalize_feedback_decision,
+    normalize_feedback_verdict,
+)
 from backend.app.workflow.research_state import build_research_state
 from backend.app.workflow.knowledge import (
     KnowledgeIntegrationService,
@@ -129,7 +143,9 @@ from backend.app.workflow.knowledge import (
 from backend.app.workflow.prompt_context import (
     PromptContextBudget,
     budget_instructions,
+    build_hypothesis_context,
     compact_problem,
+    filter_and_dedupe_hypothesis_cards,
     literature_card,
     select_units,
     select_units_bounded,
@@ -141,8 +157,6 @@ from backend.app.workflow.research_synthesis import (
     candidate_code_evidence_provenance_issues,
     normalize_candidate_code_evidence_provenance,
     normalize_candidate_synthesis_provenance,
-    representative_paper_ids,
-    stable_paper_id,
     synthesis_prompt_context,
 )
 from backend.app.workflow.github_source import GitHubSourceInspector
@@ -155,6 +169,7 @@ from backend.app.workflow.scientific_stability import (
     protocol_state,
     readiness_state,
     selected_hypothesis_digest,
+    EvidenceInsufficientGapsError,
     failure_state_for,
 )
 from backend.app.workflow.skill_runtime import RuntimePackage, SkillRuntime, ToolRegistry
@@ -251,7 +266,7 @@ class WorkflowEngine:
         with self._run_locks_guard:
             return self._run_locks.setdefault(run_id, RLock())
 
-    def run_step(self, run_id: str, step_id: str):
+    def run_step(self, run_id: str, step_id: str, *, force: bool = False):
         with self._run_lock(run_id):
             if step_id not in ORDER:
                 raise ValueError(f"UNKNOWN_WORKFLOW_STEP:{step_id}")
@@ -271,7 +286,7 @@ class WorkflowEngine:
                 try:
                     if self.repository.get_run(run_id).stop_requested:
                         raise LLMRequestCancelled()
-                    self._run_step(run_id, step_id)
+                    self._run_step(run_id, step_id, force=force)
                 except LLMRequestCancelled as exc:
                     self.repository.update_step_state(
                         run_id,
@@ -285,6 +300,7 @@ class WorkflowEngine:
                     recoverable = state in {
                         "RECOVERABLE_PROVIDER_ERROR",
                         "POLICY_INTEGRITY_REQUIRED",
+                        "EVIDENCE_RETRY_REQUIRED",
                     }
                     self.repository.update_step_state(
                         run_id,
@@ -327,21 +343,54 @@ class WorkflowEngine:
             checks.append({"name": name, "ok": bool(ok), "code": code, "detail": detail})
         settings = getattr(self.experiment_provider, "settings", None)
         mode = getattr(self.llm_provider, "mode", "")
-        def provider_check(provider_id: str):
+        def provider_check(provider_id: str, model: str | None = None):
+            name = provider_id if model is None else f"{provider_id}:{model}"
             if mode == "mock":
-                add(provider_id, True, "MOCK_MODE", "Development mock provider; no external request was made.")
+                add(name, True, "MOCK_MODE", "Development mock provider; no external request was made.")
                 return
             try:
-                result = self.llm_provider.preflight(provider_id)
-                add(provider_id, True, "AVAILABLE", f"model={result.get('model', 'configured')}; structured_request=passed")
+                if model is not None and callable(getattr(self.llm_provider, "preflight_model", None)):
+                    result = self.llm_provider.preflight_model(provider_id, model)
+                else:
+                    result = self.llm_provider.preflight(provider_id)
+                add(name, True, "AVAILABLE", f"model={result.get('model', 'configured')}; structured_request=passed")
             except Exception as exc:
                 detail = str(exc)
                 for secret in (getattr(settings, "qwen_api_key", ""), getattr(settings, "deepseek_api_key", "")):
                     if secret:
                         detail = detail.replace(str(secret), "[REDACTED]")
-                add(provider_id, False, detail.split(":", 1)[0], detail[:500])
-        provider_check("qwen")
-        provider_check("deepseek")
+                add(name, False, detail.split(":", 1)[0], detail[:500])
+        configured = getattr(self.llm_provider, "configured_provider_models", None)
+        pairs = configured() if callable(configured) else []
+        if pairs:
+            for provider_id, model in pairs:
+                provider_check(provider_id, model)
+        elif callable(configured):
+            # Role-routed provider with zero configured roles. Admission must
+            # fail explicitly; there is no default model to substitute.
+            add(
+                "model_roles",
+                False,
+                "MODEL_ROLE_NOT_CONFIGURED",
+                "No model role is configured. Automatic scientific execution requires "
+                "an explicit role -> {provider_id, model} assignment; no qwen/deepseek "
+                "default will be used.",
+            )
+        else:
+            # Non-role-routed provider (mock/dev). Never synthesize default
+            # qwen/deepseek pairs; use the provider's own admission check.
+            add(
+                "provider_roles",
+                True,
+                "ROLE_ROUTING_NA",
+                "Provider does not expose role pairs; no default model fallback applied.",
+            )
+            preflight_fn = getattr(self.llm_provider, "preflight", None)
+            if callable(preflight_fn):
+                try:
+                    preflight_fn("provider")
+                except Exception as exc:
+                    add("provider_roles", False, str(exc).split(":", 1)[0], str(exc)[:500])
         try:
             profile = self._inspect_configured_local_dataset(run)
             add("dataset", True, detail=(profile or {}).get("contract_id", "configured"))
@@ -384,7 +433,7 @@ class WorkflowEngine:
         self.repository.add_artifact(run_id, "scientific_world_state", "Scientific World State", world,
                                      "research_plan", "Scientific Stability Engine")
 
-    def _run_step(self, run_id: str, step_id: str):
+    def _run_step(self, run_id: str, step_id: str, *, force: bool = False):
         if step_id not in ORDER:
             raise ValueError(f"UNKNOWN_WORKFLOW_STEP:{step_id}")
         self.skill_registry.assignment_for(step_id)
@@ -407,7 +456,7 @@ class WorkflowEngine:
         ):
             return run
         if step_id == "report_export":
-            if latest.get("report") is not None:
+            if latest.get("report") is not None and not force:
                 return run
             self._require_report_readiness(run.artifacts, latest)
         self._require_step_inputs(step_id, latest)
@@ -555,7 +604,11 @@ class WorkflowEngine:
             result_box = {}
 
             def collect_evidence(_revision):
-                result_box["result"] = self.knowledge_service.collect(run_id, problem)
+                result_box["result"] = self.knowledge_service.collect(
+                    run_id,
+                    problem,
+                    knowledge_base_id=run.knowledge_base_id,
+                )
                 return result_box["result"].model_dump()
 
             output = self._produce_validated(run_id, step_id, collect_evidence)
@@ -594,6 +647,26 @@ class WorkflowEngine:
                 step_id,
                 self.research_agent.name,
             )
+            gap_count = len(synthesis.get("research_gaps") or [])
+            if gap_count == 0:
+                # Zero research gaps makes hypothesis grounding structurally
+                # impossible (every candidate must cite a real gap).  Stop here
+                # with a recoverable, diagnosed error instead of burning the
+                # supervisor revision loop downstream.  pipeline/start re-runs
+                # this step (fresh evidence draw, bounded external retry).
+                coverage = result.literature_coverage or {}
+                external_degraded = bool((result.sources or {}).get("external_degraded"))
+                diagnosis = (
+                    f"EVIDENCE_INSUFFICIENT_GAPS: research_gaps=0 "
+                    f"external_degraded={external_degraded} "
+                    f"limitations_coverage={coverage.get('limitations_coverage')} "
+                    f"future_work_coverage={coverage.get('future_work_coverage')} "
+                    f"sufficient={coverage.get('sufficient')}"
+                )
+                reasons = coverage.get("insufficient_reasons") or []
+                if reasons and not external_degraded:
+                    diagnosis += " reasons=" + ",".join(str(item) for item in reasons)
+                raise EvidenceInsufficientGapsError(diagnosis)
             if result.wiki_changes.papers or result.wiki_changes.gaps or result.wiki_changes.edges:
                 self.supervisor_agent.commit_wiki_changes(
                     result.wiki_changes, self.knowledge_service.wiki
@@ -640,23 +713,31 @@ class WorkflowEngine:
                 or evidence_content.get("core_references")
                 or []
             )
-            cards_by_id = {
-                stable_paper_id(card, index): card
-                for index, card in enumerate(source_cards)
-                if isinstance(card, dict)
-            }
-            representative_ids = representative_paper_ids(synthesis)
-            representative_cards = [cards_by_id[paper_id] for paper_id in representative_ids if paper_id in cards_by_id]
-            # Historical/mock artifacts can legitimately lack cards that the new
-            # synthesis schema can identify.  This fallback is collection-wide,
-            # never an index pairing and never used when synthesis is available.
-            if not representative_cards and not (synthesis.get("source_collection") or {}).get("paper_count"):
-                representative_cards = source_cards
-            context_budget = PromptContextBudget()
-            evidence = select_units(
-                [literature_card(card) for card in representative_cards],
-                context_budget.max_reference_chars,
+            # Every valid paper participates in hypothesis formation: only
+            # clearly-irrelevant and duplicate cards are removed, and each
+            # survivor is compacted into a fixed-size Compact Paper Card.  There
+            # is no representative sampling and no character-budget truncation.
+            # The relevance filter is question-driven: it derives English terms
+            # from the current research question + dataset name (no hardcoded
+            # domain vocabulary) and removes only cards that share none of them
+            # AND have low existing retrieval relevance.
+            question_text = str((problem or {}).get("problem_statement") or "")
+            if isinstance(dataset_profile, dict):
+                dataset_name = str(
+                    dataset_profile.get("canonical_name")
+                    or dataset_profile.get("name") or ""
+                ).strip()
+                if dataset_name.casefold() not in {"data", "dataset", "datasets"}:
+                    question_text = f"{question_text} {dataset_name}".strip()
+            hypothesis_card_pipeline = filter_and_dedupe_hypothesis_cards(
+                source_cards, research_question=question_text
             )
+            valid_cards = hypothesis_card_pipeline["cards"]
+            evidence = [
+                build_hypothesis_context(card, index)
+                for index, card in enumerate(valid_cards)
+            ]
+            context_budget = PromptContextBudget()
             synthesis_context = synthesis_prompt_context(synthesis)
             round_metadata = self._next_hypothesis_round(run, latest)
             revision_context = self._hypothesis_revision_context(run, round_metadata)
@@ -708,7 +789,11 @@ class WorkflowEngine:
                         step_id,
                         self.hypothesis_agent.name,
                         "Hypothesis generation returned no usable candidates.",
-                        data={"raw_output": raw_box["raw"], "representative_evidence_count": len(evidence)},
+                        data={
+                            "raw_output": raw_box["raw"],
+                            "valid_evidence_count": len(evidence),
+                            "hypothesis_card_pipeline": hypothesis_card_pipeline["counts"],
+                        },
                         output_summary={"accepted": False},
                         provider_mode=self.llm_provider.mode,
                         fallback_used=self.llm_provider.fallback,
@@ -743,7 +828,8 @@ class WorkflowEngine:
                     "synthesis_gap_count": len(synthesis.get("research_gaps") or []),
                     "gap_processing": synthesis_context.get("gap_processing") or {},
                     "round": hypothesis["hypothesis_round"],
-                    "representative_evidence_count": len(evidence),
+                    "valid_evidence_count": len(evidence),
+                    "hypothesis_card_pipeline": hypothesis_card_pipeline["counts"],
                 },
                 hypothesis,
                 skill_calls=skill_calls,
@@ -1106,7 +1192,25 @@ class WorkflowEngine:
             self.supervisor_agent.require_agent(delegation, "planning")
             existing_final_plan = latest.get("plan")
             selection = self._require_evidence_reasoned_hypothesis_selection(latest)
+            # A failed core claim starts a PIVOT branch.  The branch's working
+            # hypothesis becomes the only planning authority for its pending
+            # refinement; the original selection remains historical evidence.
+            pending_pivot = self._pending_pivot_lineage(latest)
+            if pending_pivot:
+                selection = deepcopy(selection)
+                pivot_hypothesis = deepcopy(pending_pivot["working_hypothesis"])
+                pivot_hypothesis.setdefault(
+                    "candidate_id",
+                    str(((selection.get("selected") or [{}])[0]).get("candidate_id") or ""),
+                )
+                selection["selected"] = [pivot_hypothesis]
+                selection["pivot_lineage"] = deepcopy(pending_pivot)
             constraints_artifact = self._ensure_research_constraints(run_id)
+            execution_seed_artifact = self._ensure_backend_execution_seed_contract(
+                run_id,
+                constraints=constraints_artifact.content,
+            )
+            execution_seeds = list(execution_seed_artifact.content["seeds"])
             run = self.repository.get_run(run_id)
             latest = self._latest_by_type(run.artifacts)
             reasoning_content = latest.get("reasoning").content if latest.get("reasoning") else {}
@@ -1201,6 +1305,9 @@ class WorkflowEngine:
                             ),
                             "dataset_profile": dataset_profile or {},
                             "run_constraints": run.constraints,
+                            "execution_seed_contract": deepcopy(
+                                execution_seed_artifact.content
+                            ),
                             "research_profile": profile,
                             "protocol_state": protocol,
                             "readiness_state": readiness,
@@ -1217,6 +1324,14 @@ class WorkflowEngine:
                     provider_mode=self.llm_provider.mode,
                     fallback_used=self.llm_provider.fallback,
                 )
+                if canonical_training_epochs(candidate) is None:
+                    candidate.setdefault("_validation_issues", []).append(
+                        "MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED"
+                    )
+                # Seed values are backend-owned preregistration state.  The model
+                # may describe their statistical role, but it cannot choose or
+                # change the concrete values reviewed by plan governance.
+                candidate["seeds"] = list(execution_seeds)
                 if dataset_profile:
                     candidate = self._bind_plan_to_dataset(
                         candidate, dataset_profile
@@ -1256,7 +1371,10 @@ class WorkflowEngine:
                     if existing_final_plan is not None and migration_id
                     else build_plan(None)
                 )
+                candidate["seeds"] = list(execution_seeds)
                 structural_issues = list(candidate.pop("_validation_issues", []) or [])
+                if canonical_training_epochs(candidate) is None:
+                    structural_issues.append("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
                 structural_decision = self.supervisor_agent.validate(step_id, candidate)
                 structural_issues.extend(structural_decision.issues)
                 if structural_issues:
@@ -1286,10 +1404,15 @@ class WorkflowEngine:
                 readiness=readiness,
                 dataset_state=dataset_state,
                 produce_initial_plan=produce_initial_plan,
+                execution_seeds=execution_seeds,
             )
             if governance_result is None:
                 return
             plan, plan_candidate, issue_ledger = governance_result
+            if plan.get("seeds") != execution_seeds:
+                raise PlanReviewPolicyIntegrityError(
+                    "PLAN_REVIEW_POLICY_INTEGRITY:execution_seed_contract"
+                )
             if (
                 existing_final_plan is not None
                 and existing_final_plan.parent_artifact_id == plan_candidate.id
@@ -1313,8 +1436,18 @@ class WorkflowEngine:
             plan["accepted_candidate_payload_sha256"] = canonical_sha256(
                 (plan_candidate.content or {}).get("normalized_plan") or {}
             )
-            self.repository.add_artifact(run_id, "plan", "Research Plan", plan, step_id, self.planning_agent.name,
-                                         parent_artifact_id=plan_candidate.id)
+            frozen_training_epochs = self._frozen_model_training_epochs(run_id)
+            if frozen_training_epochs is not None and canonical_training_epochs(plan) != frozen_training_epochs:
+                raise ValueError("MODEL_TRAINING_BUDGET_CHANGED_DURING_ITERATION")
+            plan_artifact = self.repository.add_artifact(
+                run_id, "plan", "Research Plan", plan, step_id,
+                self.planning_agent.name, parent_artifact_id=plan_candidate.id,
+            )
+            self._freeze_model_training_budget(
+                run_id,
+                plan,
+                plan_artifact_id=plan_artifact.id,
+            )
             self.repository.add_artifact(
                 run_id, "scientific_contract", "Scientific Coverage and Split Contract",
                 plan.get("scientific_contract") or {}, step_id, self.planning_agent.name,
@@ -1356,11 +1489,48 @@ class WorkflowEngine:
                 )
             self.supervisor_agent.require_agent(delegation, "experiment")
             self._require_tools(package, "build_experiment_bundle")
+            formal_validation = self._formal_validation_pending(run.artifacts)
+            reusable_bundle_artifact = next(
+                (
+                    artifact
+                    for artifact in reversed(run.artifacts)
+                    if artifact.type == "experiment_bundle"
+                    and (artifact.content or {}).get("runtime_contract", {}).get("stage")
+                    == "small_scale"
+                ),
+                None,
+            )
             experiment_id = self.repository.next_experiment_id(run_id)
             result_id = f"{experiment_id}_result"
             python_command = self.experiment_provider.python_command()
+            # A plan-review repair is allowed to correct ``evaluations``. Keep
+            # the feedback contract derived from those final metrics; otherwise
+            # generation and validation demand different metric names.
+            experiment_plan = self._synchronize_iteration_contract(
+                deepcopy(latest["plan"].content)
+            )
+            training_budget_contract = self._freeze_model_training_budget(
+                run_id,
+                experiment_plan,
+                plan_artifact_id=latest["plan"].id,
+            )
+            experiment_plan = self._with_frozen_training_epochs(
+                experiment_plan,
+                int(training_budget_contract.content["epochs"]),
+            )
+            # Reuse the preregistered backend seed contract that plan governance
+            # already reviewed.  Never resample seeds at execution time.
+            execution_seed_artifact = self._ensure_backend_execution_seed_contract(
+                run_id,
+                constraints=normalize_constraints(run.research_constraints, run.constraints),
+                plan=experiment_plan,
+            )
+            execution_seeds = list(execution_seed_artifact.content["seeds"])
+            if experiment_plan.get("seeds") not in ([], execution_seeds):
+                raise ValueError("EXECUTION_SEED_CONTRACT_MISMATCH")
+            experiment_plan["seeds"] = execution_seeds
             base_task = {
-                **self.experiment_agent.build_task(latest["plan"].content),
+                **self.experiment_agent.build_task(experiment_plan),
                 "run_id": run_id,
                 "experiment_id": experiment_id,
                 "result_id": result_id,
@@ -1371,14 +1541,13 @@ class WorkflowEngine:
             if fair_contract:
                 base_task["phase2_protocol"] = progressive_protocol(
                     fair_contract.content,
-                    "formal_validation"
-                    if self._formal_validation_pending(run.artifacts)
-                    else "small_scale",
+                    "formal_validation",
                 )
+                base_task["phase2_protocol"]["seeds"] = list(experiment_plan["seeds"])
             base_task["scientific_contract"] = compile_scientific_contract(
                 run.problem_input,
                 (latest.get("hypothesis_selection").content.get("selected") if latest.get("hypothesis_selection") else []),
-                latest["plan"].content,
+                experiment_plan,
                 base_task,
             )
             task_box = {}
@@ -1387,6 +1556,9 @@ class WorkflowEngine:
             previous_candidate: dict | None = None
             frozen_contract: dict | None = None
             repair_history: list[dict] = []
+            pivot_base = self._pivot_implementation_base(
+                run.artifacts, experiment_plan
+            )
 
             def build_experiment(revision):
                 nonlocal previous_bundle, previous_candidate, frozen_contract
@@ -1418,22 +1590,59 @@ class WorkflowEngine:
                         },
                     }
                 try:
-                    if previous_bundle is None and previous_candidate is None:
+                    if (
+                        previous_bundle is None
+                        and previous_candidate is None
+                        and formal_validation
+                        and reusable_bundle_artifact is not None
+                    ):
+                        reused = ExperimentBundle.model_validate(
+                            reusable_bundle_artifact.content
+                        )
+                        manifest = reused.manifest.model_copy(
+                            update={
+                                "run_id": run_id,
+                                "experiment_id": experiment_id,
+                                "result_id": result_id,
+                                "python_args": [
+                                    "--run-id",
+                                    run_id,
+                                    "--experiment-id",
+                                    experiment_id,
+                                    "--result-id",
+                                    result_id,
+                                    "--output",
+                                    f"results/{result_id}.json",
+                                ],
+                            }
+                        )
+                        bundle = compile_bundle_runtime_contract(
+                            experiment_plan,
+                            task,
+                            reused.model_copy(
+                                update={"manifest": manifest, "runtime_contract": None}
+                            ),
+                        )
+                        task["implementation_reused_from"] = reusable_bundle_artifact.id
+                        capture["raw_model_output"] = bundle.model_dump()
+                        capture["normalized_bundle"] = bundle.model_dump()
+                    elif previous_bundle is None and previous_candidate is None:
                         bundle = self.experiment_agent.generate_bundle(
                             run_id,
                             experiment_id,
-                            latest["plan"].content,
+                            experiment_plan,
                             task,
                             instructions,
                             python_command,
                             require_smoke_test=True,
                             validate=False,
                             capture=capture,
+                            implementation_base=pivot_base,
                         )
                     else:
                         feedback = list((revision or {}).get("issues") or [])
                         bundle = self.experiment_agent.repair_bundle(
-                            latest["plan"].content,
+                            experiment_plan,
                             task,
                             previous_bundle,
                             {
@@ -1454,20 +1663,24 @@ class WorkflowEngine:
                         frozen_contract = bundle.manifest.model_dump()
                     if not self.llm_provider.fallback:
                         self.experiment_agent.validate_bundle(
-                            latest["plan"].content,
+                            experiment_plan,
                             bundle,
                             require_smoke_test=True,
                             task=task,
                         )
                 except ExperimentBundleCandidateError as exc:
-                    previous_bundle = None
-                    previous_candidate = dict(exc.candidate)
-                    if frozen_contract is None:
-                        frozen_contract = self.experiment_agent.frozen_contract_from_candidate(
-                            latest["plan"].content,
-                            task,
-                            previous_candidate,
-                        )
+                    failed_candidate = dict(exc.candidate)
+                    # A malformed repair is audit evidence, not a replacement
+                    # for the last complete Bundle.  Only an initial malformed
+                    # generation needs its raw candidate as the next repair base.
+                    if previous_bundle is None:
+                        previous_candidate = failed_candidate
+                        if frozen_contract is None:
+                            frozen_contract = self.experiment_agent.frozen_contract_from_candidate(
+                                experiment_plan,
+                                task,
+                                previous_candidate,
+                            )
                     issues = experiment_validation_issues(exc)
                     if issues:
                         repair_history.append(
@@ -1534,7 +1747,7 @@ class WorkflowEngine:
                 step_id,
                 self.experiment_agent.name,
                 "Built executable experiment task.",
-                {"plan": latest["plan"].content},
+                {"plan": experiment_plan},
                 {
                     "task": task,
                     "bundle": {
@@ -1587,6 +1800,9 @@ class WorkflowEngine:
                 previous_attempts = list(previous_result.content.get("attempts") or [])
             current_attempts = []
             active_task = dict(latest["experiment_task"].content)
+            active_plan = self._synchronize_iteration_contract(
+                deepcopy(active_task.get("plan") or latest["plan"].content)
+            )
             runtime_candidate: dict | None = None
             analysis_instructions = self.skill_runtime.instructions_for(
                 package, "analyze-results"
@@ -1636,7 +1852,7 @@ class WorkflowEngine:
                     }
                 candidate = deepcopy(runtime_candidate)
                 analysis = self.experiment_agent.analyze_result(
-                    latest["plan"].content,
+                    active_plan,
                     active_task,
                     candidate,
                     instructions=analysis_instructions,
@@ -1850,7 +2066,7 @@ class WorkflowEngine:
                                     capture: dict = {}
                                     try:
                                         regenerated_bundle = self.experiment_agent.repair_bundle(
-                                            latest["plan"].content,
+                                            active_plan,
                                             active_task,
                                             bundle,
                                             diagnosis,
@@ -1912,7 +2128,7 @@ class WorkflowEngine:
                                 regenerated_bundle = self.experiment_agent.generate_bundle(
                                     run_id,
                                     experiment_id,
-                                    latest["plan"].content,
+                                    active_plan,
                                     active_task,
                                     "\n\n".join(
                                         (repair_instructions, repair_request)
@@ -2082,14 +2298,26 @@ class WorkflowEngine:
             # remain explicit rather than being interpreted by an LLM.
             fair_contract = latest.get("fair_experiment_contract")
             primary = str((fair_contract.content if fair_contract else {}).get("primary_metric") or "accuracy")
-            baseline_rows = result.get("baseline_seed_metrics") or {}
-            idea_rows = result.get("idea_seed_metrics") or {}
-            try:
-                baseline_by_seed = {int(key): float(value) for key, value in baseline_rows.items()}
-                idea_by_seed = {int(key): float(value) for key, value in idea_rows.items()}
-            except (AttributeError, TypeError, ValueError):
-                baseline_by_seed, idea_by_seed = {}, {}
-            evidence = result_evidence(baseline_by_seed, idea_by_seed, primary)
+            result_bundle = latest.get("experiment_bundle")
+            expected_metrics = (
+                ((result_bundle.content or {}).get("manifest") or {}).get("expected_metrics")
+                if result_bundle else None
+            )
+            baseline_by_seed, idea_by_seed = paired_seed_metrics(
+                result,
+                primary,
+                expected_metrics,
+                comparisons=list(
+                    ((active_task.get("plan") or {}).get("comparisons") or [])
+                ),
+            )
+            direction = str(
+                (fair_contract.content if fair_contract else {}).get("primary_metric_direction")
+                or ""
+            )
+            evidence = result_evidence(
+                baseline_by_seed, idea_by_seed, primary, direction=direction,
+            )
             evidence["stage"] = str(
                 (result.get("runtime") or {}).get("stage")
                 or (active_task.get("phase2_protocol") or {}).get("stage")
@@ -2132,7 +2360,7 @@ class WorkflowEngine:
             self.supervisor_agent.require_agent(delegation, "critic")
             result_artifact = latest["experiment_result"]
             result = result_artifact.content
-            if self._is_smoke_preflight_failure(result):
+            if self._is_engineering_failure(result):
                 return self.repository.get_run(run_id)
             historical_iteration = max(
                 [
@@ -2145,7 +2373,31 @@ class WorkflowEngine:
             iteration = max(run.feedback_iteration, historical_iteration) + 1
             active_hypothesis = self._feedback_hypothesis(latest)
             current_plan = latest["plan"].content
+            deterministic_evidence = (
+                deepcopy(latest["result_evidence"].content)
+                if latest.get("result_evidence") else {}
+            )
+            result_analysis = {
+                **(result.get("analysis") or {}),
+                "deterministic_metric_evidence": deterministic_evidence,
+            }
+            result_for_feedback = {**result, "analysis": result_analysis}
             output_language = self._output_language(run)
+
+            def route_to_report(candidate: dict, reason: str) -> None:
+                """Make terminal routing and user-facing actions agree."""
+                candidate["decision"] = "REPORT"
+                candidate["route_reason"] = reason
+                candidate["requires_follow_up"] = False
+                candidate["required_revision"] = ""
+                candidate["revisions"] = []
+                candidate["next_action"] = (
+                    "保留当前实验结论并生成报告。"
+                    if output_language == "zh-CN"
+                    else "Preserve the current result and generate the report."
+                )
+                candidate.pop("revised_plan", None)
+
             claim_instructions = self.skill_runtime.instructions_for(
                 package, "experiment-iteration", "result-to-claim"
             )
@@ -2156,9 +2408,9 @@ class WorkflowEngine:
             def review_result(revision):
                 candidate = self.critic_agent.review_result(
                     active_hypothesis,
-                    result,
+                    result_for_feedback,
                     plan=current_plan,
-                    analysis=result.get("analysis") or {},
+                    analysis=result_analysis,
                     audit=result.get("audit") or {},
                     instructions=self._with_revision(claim_instructions, revision),
                 )
@@ -2169,10 +2421,6 @@ class WorkflowEngine:
                 verdict = normalize_feedback_verdict(candidate.get("verdict"))
                 candidate["verdict"] = verdict
                 candidate["iteration"] = iteration
-                candidate["requires_follow_up"] = (
-                    verdict in {"failed", "partial"}
-                    and iteration < self.max_feedback_iterations
-                )
                 candidate.setdefault("feedback", "")
                 candidate.setdefault("required_revision", "")
                 candidate.setdefault("supported_claims", [])
@@ -2184,6 +2432,31 @@ class WorkflowEngine:
                 )
                 candidate.setdefault("evidence_links", [])
                 candidate.setdefault("overclaim_risks", [])
+                raw_decision = str(candidate.get("decision") or "").strip().upper()
+                decision = normalize_feedback_decision(raw_decision)
+                route_reason = (
+                    "MODEL_DECISION"
+                    if raw_decision
+                    in {"REPORT", "STOP", "TERMINATE", "FINALIZE", "REVISE", "PIVOT"}
+                    else "MISSING_OR_INVALID_DECISION"
+                )
+                if verdict == "supported":
+                    decision = "REPORT"
+                    route_reason = "VERDICT_SUPPORTED"
+                elif iteration >= self.max_feedback_iterations:
+                    decision = "REPORT"
+                    route_reason = "ITERATION_LIMIT_REACHED"
+                elif decision in {"REVISE", "PIVOT"} and not str(
+                    candidate.get("required_revision") or ""
+                ).strip():
+                    decision = "REPORT"
+                    route_reason = "MISSING_EXECUTABLE_REVISION"
+                if decision == "REPORT":
+                    route_to_report(candidate, route_reason)
+                else:
+                    candidate["decision"] = decision
+                    candidate["route_reason"] = route_reason
+                    candidate["requires_follow_up"] = True
                 candidate["result_analysis"] = self._normalize_iteration_analysis(
                     candidate.get("result_analysis"),
                     result,
@@ -2204,8 +2477,8 @@ class WorkflowEngine:
             review_context = {
                 "hypothesis": active_hypothesis,
                 "plan": current_plan,
-                "experiment_result": result,
-                "analysis": result.get("analysis") or {},
+                "experiment_result": result_for_feedback,
+                "analysis": result_analysis,
                 "audit": result.get("audit") or {},
                 "output_language": output_language,
                 "research_constraints_reference": {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1},
@@ -2220,14 +2493,38 @@ class WorkflowEngine:
             # calls.  The secondary receives only shared evidence/result inputs,
             # never Qwen reasoning.  All reconciliation below is deterministic.
             literature_evidence = list((latest.get("evidence").content.get("core_references") or latest.get("evidence").content.get("references") or [])) if latest.get("evidence") else []
-            qwen_analysis = normalize_scientific_analysis(
-                self.critic_agent.scientific_result_analysis(
-                    active_hypothesis, result, plan=current_plan,
-                    evidence=literature_evidence, provider_id="qwen",
-                    instructions=claim_instructions,
-                ),
-                provider_id="qwen",
-            )
+            try:
+                qwen_analysis = normalize_scientific_analysis(
+                    self.critic_agent.scientific_result_analysis(
+                        active_hypothesis, result_for_feedback, plan=current_plan,
+                        evidence=literature_evidence, provider_id="qwen",
+                        instructions=claim_instructions,
+                    ),
+                    provider_id="qwen",
+                )
+            except ValueError as exc:
+                if str(exc) != "SCIENTIFIC_ANALYSIS_STATUS_INVALID:EMPTY":
+                    raise
+                fallback_status = {
+                    "supported": "SUPPORTED",
+                    "failed": "CONTRADICTED",
+                    "partial": "INCONCLUSIVE",
+                }.get(str(feedback.get("verdict") or "").lower(), "INCONCLUSIVE")
+                qwen_analysis = normalize_scientific_analysis(
+                    {
+                        "hypothesis_status": fallback_status,
+                        "supported_findings": list(feedback.get("supported_claims") or []),
+                        "contradicting_findings": list(feedback.get("unsupported_claims") or []),
+                        "alternative_explanations": [],
+                        "confounders": list((feedback.get("result_analysis") or {}).get("methodological_issues") or []),
+                        "evidence_gaps": list((feedback.get("result_analysis") or {}).get("knowledge_gaps") or []),
+                        "interpretation": str(feedback.get("feedback") or feedback.get("next_action") or "Primary scientific analysis returned an empty status."),
+                        "recommended_action": str(feedback.get("next_action") or ""),
+                        "proposed_hypothesis": None,
+                        "confidence": 0.0,
+                    },
+                    provider_id="qwen_fallback",
+                )
             qwen_analysis_artifact = self.repository.add_artifact(
                 run_id, "qwen_scientific_analysis", f"Qwen Scientific Analysis {iteration}",
                 qwen_analysis, step_id, "Qwen Primary Scientific Analyst",
@@ -2236,7 +2533,7 @@ class WorkflowEngine:
             try:
                 deepseek_analysis = normalize_scientific_analysis(
                     self.critic_agent.scientific_result_analysis(
-                        active_hypothesis, result, plan=current_plan,
+                        active_hypothesis, result_for_feedback, plan=current_plan,
                         evidence=literature_evidence, provider_id="deepseek",
                         instructions=claim_instructions,
                     ),
@@ -2246,6 +2543,7 @@ class WorkflowEngine:
                 if not any(token in str(exc) for token in (
                     "DEEPSEEK", "SECONDARY_REVIEW_UNAVAILABLE", "MODEL_REQUEST_",
                     "MODEL_PROVIDER_CONFIG_ERROR", "JSONDecodeError",
+                    "SCIENTIFIC_ANALYSIS_",
                 )):
                     raise
                 deepseek_analysis = unavailable_secondary_review(str(exc))
@@ -2295,22 +2593,12 @@ class WorkflowEngine:
             )
             feedback["scientific_conclusion_id"] = conclusion_artifact.id
             feedback["hypothesis_evolution_decision_id"] = evolution_artifact.id
-            if evolution["create_working_hypothesis"]:
-                working = build_working_hypothesis(
+            working_hypothesis = None
+            if feedback["requires_follow_up"] and evolution["create_working_hypothesis"]:
+                working_hypothesis = build_working_hypothesis(
                     parent_hypothesis_id=conclusion["hypothesis_id"],
                     parent_claim=conclusion["claim"], proposal=synthesis["proposed_hypothesis"],
                     derived_from=conclusion["derived_from"], reason=evolution["reason"], revision=iteration,
-                )
-                working_artifact = self.repository.add_artifact(
-                    run_id, "working_hypothesis", f"Working Hypothesis v{iteration + 1}", working,
-                    step_id, "Workflow Engine", parent_artifact_id=conclusion_artifact.id,
-                )
-                feedback["working_hypothesis_id"] = working_artifact.id
-                self.repository.add_artifact(
-                    run_id, "idea_revision", f"Idea Revision v{iteration + 1}",
-                    {**working, "scientific_diagnosis_id": scientific_diagnosis_artifact.id,
-                     "research_constraints_artifact_id": run.research_constraints_artifact_id or ""},
-                    step_id, "Phase 3 Idea Evolution", parent_artifact_id=working_artifact.id,
                 )
             iteration_analysis_artifact = self.repository.add_artifact(
                 run_id,
@@ -2396,10 +2684,15 @@ class WorkflowEngine:
                         + "\n".join(f"- {issue}" for issue in direction_issues)
                     )
                 else:
-                    raise ValueError(
-                        "ITERATION_DIRECTION_OUTPUT_INVALID:"
-                        + ",".join(direction_issues)
-                    )
+                    direction = {
+                        "decision": "REPORT",
+                        "evidence_sufficiency": "EVIDENCE_INSUFFICIENT",
+                        "evidence_assessment": [],
+                        "optimization_candidates": [],
+                        "selected_direction": {},
+                        "selection_reason": "方向输出未通过格式校验，停止自动追加实验。",
+                        "next_action": "保留当前实验结论并生成报告。",
+                    }
                 self.repository.add_artifact(
                     run_id,
                     "iteration_decision",
@@ -2422,30 +2715,73 @@ class WorkflowEngine:
                     "selected_direction"
                 ]
                 feedback["selection_reason"] = direction["selection_reason"]
-                if direction["next_action"] and (
+                direction_decision = normalize_feedback_decision(
+                    direction.get("decision")
+                )
+                if direction_decision == "REPORT" or not direction["selected_direction"]:
+                    route_to_report(
+                        feedback,
+                        "DIRECTION_REPORT"
+                        if direction_decision == "REPORT"
+                        else "NO_EXECUTABLE_ITERATION_DIRECTION",
+                    )
+                else:
+                    feedback["decision"] = direction_decision
+                    feedback["route_reason"] = "EVIDENCE_GROUNDED_DIRECTION"
+                    feedback["requires_follow_up"] = True
+                if feedback["requires_follow_up"] and direction["next_action"] and (
                     query_specs or not feedback.get("next_action")
                 ):
                     feedback["next_action"] = direction["next_action"]
                 if (
-                    direction["evidence_sufficiency"]
+                    feedback["requires_follow_up"]
+                    and direction["evidence_sufficiency"]
                     == "EVIDENCE_INSUFFICIENT"
                     and not direction["selected_direction"]
                 ):
-                    feedback["requires_follow_up"] = False
                     feedback["next_action"] = (
-                        "当前实验结果与定向检索均不足以支持安全的下一轮修改；"
-                        "停止自动迭代并保留当前结论。"
+                        "当前实验未能支持实验前的 idea；基于失败标准、未支持主张"
+                        "和已冻结的研究问题生成下一轮修订实验。"
                         if output_language == "zh-CN"
                         else (
-                            "The experiment and targeted retrieval do not support "
-                            "a safe next revision; stop and preserve the result."
+                            "The experiment did not support the pre-experiment idea; "
+                            "revise the idea and experiment within the frozen research question."
                         )
                     )
+                pivot_lineage = {}
+                if feedback["requires_follow_up"] and feedback["decision"] == "PIVOT":
+                    pivot_lineage = self._pivot_lineage_payload(
+                        working_hypothesis=working_hypothesis,
+                        working_hypothesis_id=str(
+                            feedback.get("working_hypothesis_id") or ""
+                        ),
+                        parent_claim=str(active_hypothesis.get("claim") or ""),
+                        derived_from=list(
+                            (working_hypothesis or {}).get("derived_from") or []
+                        ),
+                        base_plan_artifact_id=latest["plan"].id,
+                        base_experiment_task_id=(
+                            latest.get("experiment_task").id
+                            if latest.get("experiment_task")
+                            else ""
+                        ),
+                        base_bundle_id=(
+                            latest.get("experiment_bundle").id
+                            if latest.get("experiment_bundle")
+                            else ""
+                        ),
+                    )
+                    if not pivot_lineage:
+                        route_to_report(feedback, "PIVOT_HYPOTHESIS_LINEAGE_MISSING")
                 if feedback["requires_follow_up"]:
+                    if feedback["decision"] != "PIVOT":
+                        working_hypothesis = None
                     selection = deepcopy(
                         self._require_evidence_reasoned_hypothesis_selection(latest)
                     )
-                    selection["selected"] = [deepcopy(active_hypothesis)]
+                    selection["selected"] = [
+                        deepcopy(working_hypothesis or active_hypothesis)
+                    ]
                     dataset_profile = (
                         latest["dataset_profile"].content
                         if latest.get("dataset_profile")
@@ -2485,9 +2821,29 @@ class WorkflowEngine:
                         provider_mode=self.llm_provider.mode,
                         fallback_used=self.llm_provider.fallback,
                     )
+                    frozen_training_epochs = self._frozen_model_training_epochs(run_id)
+                    if frozen_training_epochs is None:
+                        raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_MISSING")
+                    revised_plan = self._with_frozen_training_epochs(
+                        revised_plan,
+                        frozen_training_epochs,
+                    )
+                    revised_plan["seeds"] = list(
+                        self._ensure_backend_execution_seed_contract(
+                            run_id,
+                            constraints=normalize_constraints(
+                                run.research_constraints, run.constraints
+                            ),
+                            plan=current_plan,
+                        ).content["seeds"]
+                    )
                     if dataset_profile:
                         revised_plan = self._bind_plan_to_dataset(
                             revised_plan, dataset_profile
+                        )
+                    if pivot_lineage:
+                        revised_plan = self._apply_pivot_claim_contract(
+                            revised_plan, pivot_lineage
                         )
                     revised_plan["iteration_contract"] = self._build_iteration_contract(
                         iteration,
@@ -2495,9 +2851,54 @@ class WorkflowEngine:
                         revised_plan,
                         feedback,
                     )
-                    feedback["revised_plan"] = self._attach_dataset_card(
+                    if pivot_lineage:
+                        revised_plan["iteration_contract"]["hypothesis_lineage"] = pivot_lineage
+                    revised_plan = self._attach_dataset_card(
                         revised_plan, dataset_options
                     )
+                    material_changes = set(
+                        revised_plan["iteration_contract"].get("changed_fields")
+                        or []
+                    )
+                    if material_changes:
+                        if working_hypothesis:
+                            working_artifact = self.repository.add_artifact(
+                                run_id,
+                                "working_hypothesis",
+                                f"Working Hypothesis v{iteration + 1}",
+                                working_hypothesis,
+                                step_id,
+                                "Workflow Engine",
+                                parent_artifact_id=conclusion_artifact.id,
+                            )
+                            feedback["working_hypothesis_id"] = working_artifact.id
+                            self.repository.add_artifact(
+                                run_id,
+                                "idea_revision",
+                                f"Idea Revision v{iteration + 1}",
+                                {
+                                    **working_hypothesis,
+                                    "scientific_diagnosis_id": (
+                                        scientific_diagnosis_artifact.id
+                                    ),
+                                    "research_constraints_artifact_id": (
+                                        run.research_constraints_artifact_id or ""
+                                    ),
+                                },
+                                step_id,
+                                "Phase 3 Idea Evolution",
+                                parent_artifact_id=working_artifact.id,
+                            )
+                            if pivot_lineage:
+                                pivot_lineage["working_hypothesis_id"] = (
+                                    working_artifact.id
+                                )
+                                revised_plan["iteration_contract"][
+                                    "hypothesis_lineage"
+                                ] = pivot_lineage
+                        feedback["revised_plan"] = revised_plan
+                    else:
+                        route_to_report(feedback, "NO_MATERIAL_PLAN_CHANGE")
             revision_artifact = self.repository.add_artifact(
                 run_id,
                 "revision",
@@ -2813,7 +3214,7 @@ class WorkflowEngine:
                 "Superseded artifacts retained for append-only rerun.",
                 data={"superseded_artifact_ids": sorted(removed_ids), "mode": "append_only"},
             )
-        return self.run_step(run_id, step_id)
+        return self.run_step(run_id, step_id, force=step_id == "report_export")
 
     def _append_hypothesis_revision_round(self, run_id: str):
         """Run the next hypothesis/evidence pair without removing prior rounds."""
@@ -2865,6 +3266,40 @@ class WorkflowEngine:
             if self.repository.get_run(run_id).stop_requested:
                 self.repository.update_workflow_state(run_id, stop_requested=False)
             return self._add_user_hypothesis(run_id, claim, replacement_index)
+
+    def regenerate_hypotheses(self, run_id: str):
+        """Re-read the existing literature and synthesis for a new hypothesis round.
+
+        This does not re-run literature search.  It reuses the already retrieved
+        Evidence and Research Synthesis, re-runs Hypothesis Generation (creating an
+        append-only new round), then re-runs Evidence Reasoning to recompute scores.
+        Selection is left to the orchestrator's deterministic auto-select rule.
+        """
+        with self._run_lock(run_id):
+            run = self.repository.get_run(run_id)
+            latest = self._latest_by_type(run.artifacts)
+            if "evidence" not in latest or "research_synthesis" not in latest:
+                raise ValueError("HYPOTHESIS_REGENERATION_REQUIRES_LITERATURE")
+            if run.stop_requested:
+                self.repository.update_workflow_state(run_id, stop_requested=False)
+            # A new hypothesis round supersedes the prior selection and any
+            # downstream plan/experiment lineage, mirroring a manual re-selection.
+            downstream_steps = set(ORDER[ORDER.index("research_plan"):])
+            run.artifacts = [
+                artifact
+                for artifact in run.artifacts
+                if (
+                    artifact.locked
+                    or (
+                        artifact.type != "hypothesis_selection"
+                        and artifact.source_step not in downstream_steps
+                    )
+                )
+            ]
+            self.repository.save_run(run)
+            self.run_step(run_id, "hypothesis_generation")
+            self.run_step(run_id, "evidence_reasoning")
+            return self.repository.get_run(run_id)
 
     def select_hypothesis(self, run_id: str, candidate_index: int):
         with self._run_lock(run_id):
@@ -2930,6 +3365,12 @@ class WorkflowEngine:
                 "assessment_status": assessment.get("status") or "",
                 "evaluation": deepcopy(assessment.get("evaluation") or {}),
             }
+            if "composite_score" in assessment:
+                selection_content["composite_score"] = assessment["composite_score"]
+            else:
+                assessment_scores = (assessment.get("evaluation") or {}).get("scores")
+                if isinstance(assessment_scores, dict) and set(assessment_scores) == set(WEIGHTS):
+                    selection_content["composite_score"] = composite_score(assessment_scores)
             self.repository.add_artifact(
                 run_id,
                 "hypothesis_selection",
@@ -3032,6 +3473,8 @@ class WorkflowEngine:
                 if isinstance((item.get("evaluation") or {}).get("scores"), dict)
                 and set((item.get("evaluation") or {})["scores"]) == set(WEIGHTS)
             ]
+            winner = None
+            winner_score = 0.0
             if ranked:
                 winner = min(
                     ranked,
@@ -3040,12 +3483,35 @@ class WorkflowEngine:
                         int(item["candidate_index"]),
                     ),
                 )
-                mode = "automatic"
-                reason = "Highest server-computed weighted score among valid selectable candidates."
-            else:
-                winner = min(viable, key=lambda item: int(item["candidate_index"]))
-                mode = "automatic_fallback"
-                reason = "No reliable ranking was available; selected the first valid selectable candidate."
+                winner_score = composite_score(winner["evaluation"]["scores"])
+            if winner is None or winner_score <= AUTO_SELECT_THRESHOLD:
+                # No candidate strictly exceeds the composite threshold: keep the
+                # decision human.  The run pauses at hypothesis selection; the
+                # user clicks a candidate or regenerates hypotheses.
+                self.repository.update_workflow_state(
+                    run_id,
+                    status="paused",
+                    current_step="evidence_reasoning",
+                    automatic=False,
+                    stop_requested=False,
+                )
+                self.repository.append_event(
+                    run_id, "evidence_reasoning", "Workflow Engine",
+                    "No candidate exceeded the auto-select threshold; manual selection is required.",
+                    data={
+                        "status": "awaiting_user_selection",
+                        "auto_select_threshold": AUTO_SELECT_THRESHOLD,
+                        "best_composite_score": winner_score if winner is not None else None,
+                    },
+                    output_summary={"recoverable": True, "user_action_required": True},
+                    provider_mode=self.llm_provider.mode,
+                )
+                return self.repository.get_run(run_id)
+            mode = "automatic"
+            reason = (
+                "Highest server-computed weighted score among valid selectable "
+                "candidates and above the auto-select threshold."
+            )
             selected = winner.get("revised_hypothesis") or winner.get("original_hypothesis")
             candidates = normalize_candidates(latest["hypothesis"].content.get("candidates") or [])
             candidate_index = int(winner["candidate_index"])
@@ -3067,6 +3533,8 @@ class WorkflowEngine:
                 "available_hypothesis_ids": available_ids,
                 "assessment_status": winner.get("status") or "",
                 "evaluation": deepcopy(winner.get("evaluation") or {}),
+                "composite_score": winner_score,
+                "auto_select_threshold": AUTO_SELECT_THRESHOLD,
             }
             self.repository.add_artifact(
                 run_id, "hypothesis_selection", "Automatically Selected Hypothesis",
@@ -3081,6 +3549,7 @@ class WorkflowEngine:
                     "selection_reason": reason,
                     "selected_hypothesis_id": selected_id,
                     "available_hypothesis_ids": available_ids,
+                    "composite_score": winner_score,
                 },
                 output_summary={"selected_index": winner["candidate_index"]},
                 provider_mode=self.llm_provider.mode,
@@ -3538,7 +4007,11 @@ class WorkflowEngine:
             queries = list(dict.fromkeys(all_queries))[-12:]
             if not queries:
                 break
-            collected = self.knowledge_service.collect_queries(run_id, queries)
+            collected = self.knowledge_service.collect_queries(
+                run_id,
+                queries,
+                knowledge_base_id=self.repository.get_run(run_id).knowledge_base_id,
+            )
             additions = [card.model_dump() for card in collected.references]
             prior_keys = {
                 self._stable_hash({
@@ -3754,7 +4227,8 @@ class WorkflowEngine:
         if was_revised and not revision_reason:
             revision_reason = "Critic evidence reasoning revised the candidate claim."
 
-        return {
+        scores = evaluation.get("scores") if isinstance(evaluation, dict) else None
+        assessment = {
             "candidate_index": candidate_index,
             "status": status,
             "original_hypothesis": original,
@@ -3766,6 +4240,9 @@ class WorkflowEngine:
             "evidence_audit": deepcopy(evidence_audit or {}),
             "claim_evidence_issues": claim_evidence_issues,
         }
+        if isinstance(scores, dict) and set(scores) == set(WEIGHTS):
+            assessment["composite_score"] = composite_score(scores)
+        return assessment
 
     @staticmethod
     def _require_evidence_reasoned_hypothesis_selection(latest: dict) -> dict:
@@ -3816,6 +4293,130 @@ class WorkflowEngine:
         return hypothesis
 
     @staticmethod
+    def _pivot_lineage_payload(
+        *,
+        working_hypothesis: dict | None,
+        working_hypothesis_id: str,
+        parent_claim: str,
+        derived_from: list[str],
+        base_plan_artifact_id: str,
+        base_experiment_task_id: str,
+        base_bundle_id: str,
+    ) -> dict:
+        """Build the immutable hand-off from a contradicted claim to a PIVOT."""
+        working = deepcopy(working_hypothesis or {})
+        claim = str(working.get("claim") or "").strip()
+        if not claim or claim == parent_claim.strip():
+            return {}
+        return {
+            "kind": "PIVOT",
+            "working_hypothesis_id": working_hypothesis_id,
+            "working_hypothesis": working,
+            "parent_hypothesis_id": str(working.get("parent_hypothesis_id") or ""),
+            "parent_claim": parent_claim,
+            "claim": claim,
+            "derived_from": list(dict.fromkeys(str(item) for item in derived_from if item)),
+            "base_plan_artifact_id": base_plan_artifact_id,
+            "base_experiment_task_id": base_experiment_task_id,
+            "base_bundle_id": base_bundle_id,
+            "change_set": {
+                "allowed_files": ["train.py"],
+                "required": ["Implement only the intervention required by the PIVOT claim."],
+                "preserve": [
+                    "verified dataset loader and split",
+                    "baseline architecture and fixed controls",
+                    "metric calculation and result serialization",
+                    "runtime scaffold and backend-owned seeds",
+                ],
+            },
+        }
+
+    @staticmethod
+    def _apply_pivot_claim_contract(plan: dict, lineage: dict) -> dict:
+        """Keep all claim-bearing Plan fields on the new branch in lockstep."""
+        value = deepcopy(plan)
+        claim = str(lineage.get("claim") or "").strip()
+        if not claim:
+            return value
+        value["objective"] = claim
+        value["hypotheses"] = [claim]
+        value["primary_claim"] = claim
+        value["original_question_link"] = claim
+        revised = dict(value.get("revised_hypothesis") or {})
+        value["revised_hypothesis"] = {
+            **revised,
+            "claim": claim,
+            "preserves_user_claim": True,
+        }
+        for row in value.get("traceability") or []:
+            if isinstance(row, dict) and str(row.get("claim") or "") == str(lineage.get("parent_claim") or ""):
+                row["claim"] = claim
+        return value
+
+    @staticmethod
+    def _single_claim_alignment_blocker(
+        open_blockers: list[dict], current_plan: dict, revised_plan: dict
+    ) -> str:
+        """Return the one safe stale-hypothesis repair, otherwise do nothing."""
+        blockers = [
+            item
+            for item in open_blockers
+            if str(item.get("blocker_class") or "") == "CLAIM_PLAN_MISMATCH"
+            and "hypotheses" in set(item.get("contract_fields") or [])
+        ]
+        primary = str(current_plan.get("primary_claim") or "").strip()
+        old_hypothesis = str(((current_plan.get("hypotheses") or [""])[0]) or "").strip()
+        candidate_hypothesis = str(
+            ((revised_plan.get("hypotheses") or [""])[0]) or ""
+        ).strip()
+        if (
+            len(blockers) == 1
+            and primary
+            and old_hypothesis
+            and old_hypothesis != primary
+            and candidate_hypothesis != primary
+            and str(revised_plan.get("primary_claim") or "").strip() == primary
+            and str(revised_plan.get("objective") or "").strip() == str(current_plan.get("objective") or "").strip()
+        ):
+            return str(blockers[0].get("issue_id") or "")
+        return ""
+
+    @staticmethod
+    def _pending_pivot_lineage(latest: dict) -> dict:
+        proposal = latest.get("plan_refinement_proposal")
+        working_artifact = latest.get("working_hypothesis")
+        if proposal is None or working_artifact is None:
+            return {}
+        contract = (proposal.content or {}).get("normalized_plan", {}).get("iteration_contract") or {}
+        lineage = contract.get("hypothesis_lineage")
+        if not isinstance(lineage, dict):
+            return {}
+        if str(lineage.get("working_hypothesis_id") or "") != working_artifact.id:
+            return {}
+        return deepcopy(lineage)
+
+    @staticmethod
+    def _pivot_implementation_base(artifacts, plan: dict) -> dict | None:
+        contract = plan.get("iteration_contract") or {}
+        lineage = contract.get("hypothesis_lineage") if isinstance(contract, dict) else None
+        if not isinstance(lineage, dict) or lineage.get("kind") != "PIVOT":
+            return None
+        bundle_id = str(lineage.get("base_bundle_id") or "")
+        bundle_artifact = next(
+            (item for item in artifacts if item.id == bundle_id and item.type == "experiment_bundle"),
+            None,
+        )
+        if bundle_artifact is None:
+            return None
+        content = bundle_artifact.content or {}
+        return {
+            "bundle_artifact_id": bundle_artifact.id,
+            "files": deepcopy(content.get("files") or []),
+            "requirements": deepcopy(content.get("requirements") or []),
+            "change_set": deepcopy(lineage.get("change_set") or {}),
+        }
+
+    @staticmethod
     def _result_already_reviewed(artifacts, result_artifact) -> bool:
         if result_artifact is None:
             return False
@@ -3830,7 +4431,7 @@ class WorkflowEngine:
         )
         if revision is None:
             return False
-        if revision.content.get("requires_follow_up") is not True:
+        if not feedback_requires_follow_up(revision.content):
             return True
         return any(
             artifact.type in {"plan", "plan_refinement_proposal"}
@@ -3861,7 +4462,9 @@ class WorkflowEngine:
         tracked_fields = (
             "method", "dataset", "comparisons", "evaluations", "procedure",
             "parameters", "seeds", "success_criteria", "failure_criteria",
-            "stop_conditions", "optional_ablations",
+            "stop_conditions", "optional_ablations", "primary_experiment",
+            "baseline_and_controls", "split_contract", "staged_gates",
+            "progressive_experiment",
         )
         changed_fields = [
             field for field in tracked_fields
@@ -3901,6 +4504,203 @@ class WorkflowEngine:
             "changed_fields": changed_fields,
             "contract_status": "changed" if changed_fields else "needs_attention",
         }
+
+    @staticmethod
+    def _synchronize_iteration_contract(plan: dict) -> dict:
+        """Make feedback metric validation follow the final plan evaluations."""
+        contract = plan.get("iteration_contract")
+        if not isinstance(contract, dict):
+            return plan
+        metrics = [
+            str(item.get("metric") or "").strip()
+            for item in plan.get("evaluations") or []
+            if isinstance(item, dict) and str(item.get("metric") or "").strip()
+        ]
+        if metrics:
+            plan["iteration_contract"] = {
+                **contract,
+                "required_metrics": list(dict.fromkeys(metrics)),
+            }
+        return plan
+
+    @staticmethod
+    def _with_frozen_training_epochs(plan: dict, epochs: int) -> dict:
+        """Keep the first accepted model budget stable across follow-up plans."""
+        frozen = deepcopy(plan)
+        parameters = dict(frozen.get("parameters") or {})
+        parameters["epochs"] = int(epochs)
+        parameters.pop("max_epochs", None)
+        parameters.pop("epochs_limit", None)
+        frozen["parameters"] = parameters
+        return frozen
+
+    def _frozen_model_training_epochs(self, run_id: str) -> int | None:
+        contracts = [
+            artifact
+            for artifact in self.repository.get_run(run_id).artifacts
+            if artifact.type == "model_training_budget_contract"
+        ]
+        if len(contracts) > 1:
+            raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_DUPLICATE")
+        if not contracts:
+            return None
+        raw = (contracts[0].content or {}).get("epochs")
+        epochs = canonical_training_epochs({"parameters": {"epochs": raw}})
+        if epochs is None:
+            raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_INVALID")
+        return epochs
+
+    def _freeze_model_training_budget(
+        self,
+        run_id: str,
+        plan: dict,
+        *,
+        plan_artifact_id: str,
+    ):
+        """Persist the accepted model choice once; later plans may only inherit it."""
+        chosen = canonical_training_epochs(plan)
+        if chosen is None:
+            raise ValueError("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
+        existing = self._frozen_model_training_epochs(run_id)
+        if existing is not None:
+            if chosen != existing:
+                raise ValueError("MODEL_TRAINING_BUDGET_CHANGED_DURING_ITERATION")
+            return next(
+                artifact
+                for artifact in self.repository.get_run(run_id).artifacts
+                if artifact.type == "model_training_budget_contract"
+            )
+        return self.repository.add_artifact(
+            run_id,
+            "model_training_budget_contract",
+            "Model-Planned Training Budget",
+            {
+                "schema_version": 1,
+                "epochs": chosen,
+                "source": "accepted_model_plan",
+                "source_plan_artifact_id": plan_artifact_id,
+                "frozen_for_follow_up_experiments": True,
+            },
+            "research_plan",
+            self.planning_agent.name,
+            parent_artifact_id=plan_artifact_id,
+        )
+
+    @staticmethod
+    def _valid_execution_seeds(value: object) -> list[int]:
+        if not isinstance(value, (list, tuple)):
+            return []
+        seeds: list[int] = []
+        for item in value:
+            if isinstance(item, bool):
+                return []
+            try:
+                seed = int(item)
+            except (TypeError, ValueError):
+                return []
+            if seed < 1 or seed >= 2**31 or seed in seeds:
+                return []
+            seeds.append(seed)
+        return seeds[:5]
+
+    @classmethod
+    def _requested_execution_seed_count(
+        cls,
+        constraints: dict | None,
+        plan: dict | None,
+    ) -> int:
+        policy = (
+            (constraints or {}).get("seed_policy")
+            if isinstance((constraints or {}).get("seed_policy"), dict)
+            else {}
+        )
+        raw_count = policy.get("count")
+        if raw_count in (None, ""):
+            description = str(policy.get("description") or "")
+            digits = "".join(
+                char if char.isdigit() else " " for char in description
+            ).split()
+            raw_count = digits[0] if digits else None
+        if raw_count in (None, ""):
+            procedure = (plan or {}).get("procedure") or {}
+            raw_count = procedure.get("repetitions") or 3
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = 3
+        return max(1, min(count, 5))
+
+    def _ensure_backend_execution_seed_contract(
+        self,
+        run_id: str,
+        *,
+        constraints: dict | None = None,
+        plan: dict | None = None,
+    ):
+        """Create one durable backend-owned seed set before plan review.
+
+        Models may explain how seeds index paired comparisons, but concrete seed
+        values are generated once by the backend, persisted append-only, and
+        reused by every plan revision, experiment task, and feedback iteration.
+        """
+        run = self.repository.get_run(run_id)
+        existing = next(
+            (
+                artifact
+                for artifact in run.artifacts
+                if artifact.type == "execution_seed_contract"
+            ),
+            None,
+        )
+        if existing is not None:
+            seeds = self._valid_execution_seeds(
+                (existing.content or {}).get("seeds")
+            )
+            if not seeds or seeds != list((existing.content or {}).get("seeds") or []):
+                raise ValueError("EXECUTION_SEED_CONTRACT_INVALID")
+            return existing
+
+        policy = (
+            (constraints or {}).get("seed_policy")
+            if isinstance((constraints or {}).get("seed_policy"), dict)
+            else {}
+        )
+        requested = self._valid_execution_seeds(
+            policy.get("seeds") or policy.get("values")
+        )
+        accepted_plan_seeds = self._valid_execution_seeds(
+            (plan or {}).get("seeds")
+        )
+        if requested:
+            seeds = requested
+            allocation = "user_preregistered"
+        elif accepted_plan_seeds:
+            # Backward-compatible migration for Runs accepted before the durable
+            # seed contract existed.  Preserve their already reviewed values.
+            seeds = accepted_plan_seeds
+            allocation = "accepted_plan_migration"
+        else:
+            count = self._requested_execution_seed_count(constraints, plan)
+            seeds = secrets.SystemRandom().sample(range(1, 2**31 - 1), count)
+            allocation = "backend_preregistered"
+        payload = {
+            "schema_version": 1,
+            "seeds": list(seeds),
+            "count": len(seeds),
+            "allocation": allocation,
+            "frozen": True,
+        }
+        return self.repository.add_artifact(
+            run_id,
+            "execution_seed_contract",
+            "Frozen Backend Execution Seeds",
+            payload,
+            "research_plan",
+            "Backend Seed Allocator",
+            parent_artifact_id=(
+                run.research_constraints_artifact_id or None
+            ),
+        )
 
     @staticmethod
     def _output_language(run) -> str:
@@ -3988,7 +4788,11 @@ class WorkflowEngine:
                 "warnings": ["未生成需要外部资料回答的科学知识缺口。"],
                 "sources": {"calls": [], "wiki": 0, "local": 0, "external": 0},
             }
-        collected = self.knowledge_service.collect_queries(run_id, queries)
+        collected = self.knowledge_service.collect_queries(
+            run_id,
+            queries,
+            knowledge_base_id=self.repository.get_run(run_id).knowledge_base_id,
+        )
         references = []
         for index, card in enumerate(collected.references[:12], start=1):
             references.append(
@@ -4020,6 +4824,7 @@ class WorkflowEngine:
         candidates = direction.get("optimization_candidates")
         selected = direction.get("selected_direction")
         return {
+            "decision": normalize_feedback_decision(direction.get("decision")),
             "evidence_sufficiency": (
                 direction.get("evidence_sufficiency")
                 if direction.get("evidence_sufficiency")
@@ -4046,13 +4851,16 @@ class WorkflowEngine:
         direction: dict, output_language: str
     ) -> list[str]:
         issues = []
+        decision = normalize_feedback_decision(direction.get("decision"))
         candidates = direction.get("optimization_candidates") or []
         if direction.get("evidence_sufficiency") == "SUFFICIENT" and not (
             2 <= len(candidates) <= 4
         ):
             issues.append("需要返回 2 至 4 个可比较的候选优化方向")
         selected = direction.get("selected_direction") or {}
-        if candidates and not selected:
+        if decision in {"REVISE", "PIVOT"} and not selected:
+            issues.append("继续实验必须提供一个可执行的选择方向")
+        elif candidates and not selected and decision != "REPORT":
             issues.append("必须从候选方向中明确选择一个方向")
         if output_language == "zh-CN":
             narrative_values = [
@@ -4100,7 +4908,7 @@ class WorkflowEngine:
             raise ValueError("REPORT_EXPORT_NOT_READY:feedback_revision")
         revision_iteration = int(revision.content.get("iteration") or 0)
         if (
-            revision.content.get("requires_follow_up") is True
+            feedback_requires_follow_up(revision.content)
             and revision_iteration < self.max_feedback_iterations
         ):
             raise ValueError("REPORT_EXPORT_NOT_READY:feedback_follow_up")
@@ -4150,8 +4958,21 @@ class WorkflowEngine:
             step_id, diagnosis=diagnosis
         )
         previous_attempt_artifact_id: str | None = None
+        previous_candidate: dict | None = None
+        previous_issues: tuple[str, ...] = ()
         for revision_number in range(revision_limit + 1):
-            candidate = producer(revision)
+            if (
+                step_id == "report_export"
+                and revision_number > 0
+                and previous_candidate is not None
+            ):
+                candidate = self.writer_agent.repair_report(
+                    previous_candidate,
+                    self.repository.get_run(run_id).artifacts,
+                    list(previous_issues),
+                )
+            else:
+                candidate = producer(revision)
             if not isinstance(candidate, dict):
                 candidate = {"value": candidate}
             attempt_evidence = candidate.pop("_candidate_attempt", None)
@@ -4197,6 +5018,8 @@ class WorkflowEngine:
                 previous_attempt_artifact_id = attempt_artifact.id
             if decision.accepted:
                 return candidate
+            previous_candidate = deepcopy(candidate)
+            previous_issues = decision.issues
             if revision_number >= revision_limit:
                 final_rejection = {
                     "step_id": step_id,
@@ -4525,9 +5348,16 @@ class WorkflowEngine:
         readiness: dict,
         dataset_state: dict,
         produce_initial_plan,
+        execution_seeds: list[int],
     ):
         """Execute the sole scientific plan gate from durable append-only state."""
-        revision_limit = int(frozen_policy["max_content_revisions"])
+        # Preserve a historical policy's strictness, but allow an operator to
+        # grant one extra bounded retry to a recoverable plan that was already
+        # stopped for a known field-alignment omission.
+        revision_limit = max(
+            int(frozen_policy["max_content_revisions"]),
+            self.max_deepseek_plan_revision,
+        )
         current_run = self.repository.get_run(run_id)
         self._validate_plan_governance_history(
             current_run.artifacts,
@@ -4665,10 +5495,11 @@ class WorkflowEngine:
                 if parent_review is not None
                 else None
             )
-            if parent_ledger is None or (
-                (parent_ledger.content or {}).get("validated_open_blocker_ids")
-                != []
-            ):
+            # Acceptance was already proven against the complete history prefix
+            # above.  Keep the raw ledger as immutable lineage, but do not make
+            # it the sole authority: an append-only recovery adjudication may be
+            # the canonical ACCEPT proof for a historical ledger.
+            if parent_ledger is None:
                 raise PlanReviewPolicyIntegrityError(
                     "PLAN_REVIEW_POLICY_INTEGRITY:proposal_base_acceptance"
                 )
@@ -4703,6 +5534,17 @@ class WorkflowEngine:
                     parent_artifact_id=proposal.id,
                 )
             next_round = parent_round + 1
+            proposal_plan = deepcopy(
+                (proposal.content or {}).get("normalized_plan") or {}
+            )
+            frozen_training_epochs = self._frozen_model_training_epochs(run_id)
+            if frozen_training_epochs is None:
+                raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_MISSING")
+            proposal_plan = self._with_frozen_training_epochs(
+                proposal_plan,
+                frozen_training_epochs,
+            )
+            proposal_plan["seeds"] = list(execution_seeds)
             plan_candidate = self.repository.add_artifact(
                 run_id,
                 "research_plan_candidate",
@@ -4719,9 +5561,7 @@ class WorkflowEngine:
                     "revision_request_id": change_request.id,
                     "source_proposal_id": proposal.id,
                     "research_stage": stage,
-                    "normalized_plan": deepcopy(
-                        (proposal.content or {}).get("normalized_plan") or {}
-                    ),
+                    "normalized_plan": proposal_plan,
                     "research_constraints_reference": constraints_reference,
                     "policy_artifact_id": policy_artifact.id,
                     "policy_payload_sha256": frozen_policy["policy_payload_sha256"],
@@ -5129,16 +5969,18 @@ class WorkflowEngine:
                 closed_ledger = [
                     deepcopy(item) for item in issue_ledger if item.get("status") == "CLOSED"
                 ]
+                # Minimal revision input (deduplicated): each fact appears exactly once.
+                #   current_candidate   = the full plan being patched (hypotheses/claims inside).
+                #   open_validated_blockers + required_changes = the ONLY required patches.
+                #   dataset_options     = the profile repackaged as an option card (supersedes dataset_profile).
+                #   authoritative plan contract + schema live in the frozen runtime instructions, not here.
                 revision_context = {
-                    "selected_hypothesis": selection,
                     "current_candidate": plan,
-                    "current_plan": plan,
                     "current_candidate_plan_id": plan_candidate.id,
                     "revision_request_id": revision_request.id,
                     "open_validated_blockers": open_blockers,
                     "closed_issue_ledger": closed_ledger,
                     "frozen_problem_anchor": deepcopy(frozen_policy["problem_anchor"]),
-                    "issues": open_blockers,
                     "required_changes": [item.get("required_fix") for item in open_blockers],
                     "suggested_fixes": [],
                     "revised_plan_guidance": [
@@ -5146,27 +5988,79 @@ class WorkflowEngine:
                     ],
                     "experiment_feasibility": (review_artifact.content or {}).get("experiment_feasibility"),
                     "dataset_options": dataset_options,
-                    "authoritative_plan_contract": deepcopy(
-                        frozen_policy["authoritative_plan_contract_snapshot"]
-                    ),
-                    "dataset_profile": dataset_profile or {},
                     "run_constraints": run.constraints,
                     "research_constraints_reference": constraints_reference,
                 }
-                revised_plan = normalize_plan(
-                    self.planning_agent.revise_from_review(
-                        revision_context,
-                        runtime_contract_snapshot=frozen_policy[
-                            "revision_runtime_contract_snapshot"
-                        ],
+                # Patch-only revision: the schema is narrowed to exactly the fields
+                # the OPEN blockers named, so the model cannot regenerate the whole
+                # contract.  Its patch is then merged onto the current candidate;
+                # every field it omitted is carried forward unchanged.
+                revision_patch = self.planning_agent.revise_from_review(
+                    revision_context,
+                    runtime_contract_snapshot=frozen_policy[
+                        "revision_runtime_contract_snapshot"
+                    ],
+                    schema_snapshot=plan_revision_patch_schema(
+                        open_blockers,
                         schema_snapshot=frozen_policy[
                             "revision_prompt_schema_snapshot"
                         ],
+                        field_registry=frozen_policy[
+                            "canonical_contract_field_registry"
+                        ],
+                        field_aliases=frozen_policy["contract_field_aliases"],
                     ),
+                )
+                revised_plan = normalize_plan(
+                    merge_plan_patch(plan, revision_patch),
                     selection,
                     provider_mode=self.llm_provider.mode,
                     fallback_used=self.llm_provider.fallback,
                 )
+                frozen_training_epochs = self._frozen_model_training_epochs(run_id)
+                if frozen_training_epochs is not None:
+                    revised_plan = self._with_frozen_training_epochs(
+                        revised_plan,
+                        frozen_training_epochs,
+                    )
+                backend_seed_changed = revised_plan.get("seeds") != execution_seeds
+                revised_plan["seeds"] = list(execution_seeds)
+                if backend_seed_changed:
+                    seed_fix_map = dict(revised_plan.get("fix_map") or {})
+                    for blocker in open_blockers:
+                        blocker_fields = {
+                            canonical_contract_field(field)
+                            for field in blocker.get("contract_fields") or []
+                        }
+                        if "seeds" not in blocker_fields:
+                            continue
+                        blocker_id = str(blocker.get("issue_id") or "").strip()
+                        if blocker_id:
+                            seed_fix_map[blocker_id] = list(
+                                dict.fromkeys(
+                                    [*seed_fix_map.get(blocker_id, []), "seeds"]
+                                )
+                            )
+                    revised_plan["fix_map"] = seed_fix_map
+                claim_alignment_blocker = self._single_claim_alignment_blocker(
+                    open_blockers, plan, revised_plan
+                )
+                if claim_alignment_blocker:
+                    # This is a deterministic data-integrity repair, not a new
+                    # scientific decision: the accepted candidate already names
+                    # the PIVOT claim, while one duplicate claim field is stale.
+                    revised_plan = self._apply_pivot_claim_contract(
+                        revised_plan,
+                        {
+                            "claim": str(plan.get("primary_claim") or ""),
+                            "parent_claim": str(
+                                ((plan.get("hypotheses") or [""])[0]) or ""
+                            ),
+                        },
+                    )
+                    revised_plan["fix_map"] = {
+                        str(claim_alignment_blocker): ["hypotheses"]
+                    }
                 revised_plan["fix_map"] = canonicalize_fix_map(
                     revised_plan.get("fix_map"),
                     field_registry=frozen_policy[
@@ -5183,6 +6077,28 @@ class WorkflowEngine:
                     ],
                     field_aliases=frozen_policy["contract_field_aliases"],
                 )
+                # Bound the model's per-blocker fix_map declaration to the fields
+                # that ACTUALLY changed.  Attribution (which blocker each real
+                # change serves) is still the model's; only impossible claims —
+                # fields it declared but never touched — are stripped
+                # deterministically, so an over-claim can never fail governance
+                # with PLAN_REVIEW_FIX_MAP_UNCHANGED.
+                revision_material_changes = {
+                    str(item)
+                    for item in revision_changed_fields
+                    if str(item)
+                    not in {"fix_map", "provider_mode", "fallback_used", "normalization"}
+                }
+                revised_plan["fix_map"] = {
+                    str(blocker_id): sorted(
+                        {
+                            str(field)
+                            for field in fields
+                            if str(field) in revision_material_changes
+                        }
+                    )
+                    for blocker_id, fields in revised_plan.get("fix_map", {}).items()
+                }
                 revision_fix_map_issues = fix_map_issues(
                     revised_plan.get("fix_map"),
                     open_blockers=open_blockers,
@@ -5249,6 +6165,18 @@ class WorkflowEngine:
                         ],
                         field_aliases=frozen_policy["contract_field_aliases"],
                     )
+                    # Same truthfulness bound as the first pass: the repair's
+                    # fix_map must not claim fields that did not change.
+                    revised_plan["fix_map"] = {
+                        str(blocker_id): sorted(
+                            {
+                                str(field)
+                                for field in fields
+                                if str(field) in revision_material_changes
+                            }
+                        )
+                        for blocker_id, fields in revised_plan.get("fix_map", {}).items()
+                    }
                     revision_fix_map_issues = fix_map_issues(
                         revised_plan.get("fix_map"),
                         open_blockers=open_blockers,
@@ -5274,6 +6202,7 @@ class WorkflowEngine:
                     research_constraints_artifact_id=constraints_reference["artifact_id"],
                     research_constraints_reference=constraints_reference,
                 )
+                revised_plan = self._synchronize_iteration_contract(revised_plan)
                 next_candidate = self.repository.add_artifact(
                     run_id,
                     "research_plan_candidate",
@@ -5438,8 +6367,9 @@ class WorkflowEngine:
                 or (ledger.content or {}).get("plan_id") != parent_candidate.id
                 or content.get("review_id")
                 != (ledger.content or {}).get("review_id")
-                or (ledger.content or {}).get("validated_open_blocker_ids") != []
-                or (ledger.content or {}).get("verdict") != "ACCEPT"
+                or not is_plan_governance_accepted(
+                    artifacts[: positions[proposal.id]]
+                )
                 or int(content.get("round_index") or 0)
                 != int((parent_candidate.content or {}).get("round_index") or 0)
                 or int(content.get("next_round_index") or 0)
@@ -5789,6 +6719,7 @@ class WorkflowEngine:
                 }
                 and (proof.content or {}).get("plan_id") == candidate.id
                 and not (proof.content or {}).get("validated_open_blocker_ids")
+                and (proof.content or {}).get("verdict") == "ACCEPT"
             )
         if outcome == "REVISE":
             return (
@@ -6199,6 +7130,26 @@ class WorkflowEngine:
             raise PlanReviewPolicyIntegrityError(
                 "PLAN_REVIEW_POLICY_INTEGRITY:previous_ledger"
             )
+        recoveries = [
+            item
+            for item in artifacts
+            if item.type == "plan_review_recovery_adjudication"
+            and item.parent_artifact_id == ledger.id
+        ]
+        if len(recoveries) > 1:
+            raise PlanReviewPolicyIntegrityError(
+                "PLAN_REVIEW_POLICY_INTEGRITY:multiple_recovery"
+            )
+        if recoveries:
+            validate_plan_review_recovery(
+                recoveries[0].content or {},
+                policy_artifact_id=policy_id,
+                policy_payload_sha256=policy_hash,
+                candidate_plan_id=candidate.id,
+                review_id=review.id,
+                ledger_id=ledger.id,
+            )
+            return recoveries[0]
         return ledger
 
     @staticmethod
@@ -6727,13 +7678,8 @@ class WorkflowEngine:
         )
 
     @staticmethod
-    def _is_smoke_preflight_failure(result: dict) -> bool:
-        return (
-            str(result.get("status") or "").lower() == "failed"
-            and str(result.get("error") or "").startswith(
-                "EXPERIMENT_BUNDLE_SMOKE_TEST_FAILED:"
-            )
-        )
+    def _is_engineering_failure(result: dict) -> bool:
+        return str((result or {}).get("status") or "").lower() == "failed"
 
     @staticmethod
     def _formal_validation_pending(artifacts) -> bool:
@@ -6744,13 +7690,16 @@ class WorkflowEngine:
         if not latest_evidence:
             return False
         content = latest_evidence.content or {}
-        if (
-            content.get("stage") != "small_scale"
-            or content.get("route") != "expand_validation"
-        ):
+        if content.get("stage") != "small_scale" or content.get("status") not in {
+            "positive_stable", "inconclusive", "negative"
+        }:
             return False
+        latest_plan = next(
+            (item for item in reversed(artifacts) if item.type == "plan"), None
+        )
         return not any(
             item.type == "experiment_task"
+            and (latest_plan is None or item.parent_artifact_id == latest_plan.id)
             and (item.content or {}).get("phase2_protocol", {}).get("stage")
             == "formal_validation"
             for item in artifacts

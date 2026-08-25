@@ -74,7 +74,28 @@ class ReviewerAgent:
                         "selection belongs to the user after this review, so do not require an "
                         "active_hypothesis or reject merely because no candidate received GO."
                         if step_id == "evidence_reasoning"
-                        else ""
+                        else (
+                            "For report_export, the later feedback_revision/final_revision is the "
+                            "authoritative claim-level verdict when it conflicts with an earlier "
+                            "experiment analysis label. Measured metrics remain authoritative. "
+                            "Accept an honest negative or inconclusive conclusion when it reports "
+                            "the observed direction but clearly preserves statistical uncertainty, "
+                            "failed criteria, and scope limits. A non-significant p-value or a "
+                            "confidence interval containing zero establishes only insufficient "
+                            "evidence for a difference; it does not establish equivalence, no "
+                            "effect, or an impossible improvement unless a prespecified equivalence "
+                            "margin and equivalence test are present in the supplied evidence. "
+                            "In particular, failure to reject a null hypothesis is not positive "
+                            "evidence for that null or for a claim that improvement is impossible. "
+                            "When the interval crosses zero, a point estimate in the opposite "
+                            "direction cannot by itself falsify or deny the original directional "
+                            "prediction. "
+                            "Also treat a plan's budget rationale and expected artifacts as design "
+                            "intentions, not proof that a convergence pilot or epoch-level curve "
+                            "was actually produced; require matching result fields."
+                            if step_id == "report_export"
+                            else ""
+                        )
                     )
                 )
             ),

@@ -1,3 +1,5 @@
 -r ../requirements/base.txt
 -r ../requirements/literature.txt
 -r ../requirements/dev.txt
+# Phase-2 deterministic paired tests and small-sample confidence intervals.
+scipy==1.18.0

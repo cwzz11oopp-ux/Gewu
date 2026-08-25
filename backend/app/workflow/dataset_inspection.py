@@ -40,6 +40,19 @@ def contract_canonical_name(profile: dict[str, Any] | None) -> str:
     return normalize_dataset_name(legacy)
 
 
+def contract_dataset_name(profile: dict[str, Any] | None) -> str:
+    """Return a stable runtime label for catalog and custom datasets."""
+    dataset = profile or {}
+    canonical = contract_canonical_name(dataset)
+    if canonical:
+        return canonical
+    for key in ("display_name", "directory_name", "name"):
+        value = str(dataset.get(key) or "").strip()
+        if value and value.casefold() not in {"data", "dataset", "datasets"}:
+            return value
+    return ""
+
+
 def resolve_dataset_directory(value: str) -> Path:
     path = Path(value).expanduser().resolve()
     if not path.is_dir():

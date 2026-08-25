@@ -66,7 +66,7 @@ class RevisingLLM(MockLLMProvider):
         if task == "planning.revise_from_review":
             self.revision_calls += 1
             return dict(
-                inputs["current_plan"],
+                inputs["current_candidate"],
                 additional_sections={"revision": f"applied-{self.revision_calls}"},
                 fix_map={"PRI-control": ["additional_sections"]},
             )

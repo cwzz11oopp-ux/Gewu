@@ -770,6 +770,11 @@ def _transition_existing(
     if requested == "CLOSED" and old_status in {"OPEN", "REOPENED"}:
         valid, reason = _valid_closure(old, proposal, round_index=round_index, changed_fields=changed_fields, candidate_plan_id=candidate_plan_id)
         if valid:
+            # The fields named when a blocker was opened define its immutable
+            # scope.  A reviewer may cite different, genuinely changed fields
+            # as the evidence of a repair; do not turn that evidence into a new
+            # blocker scope.
+            proposal["contract_fields"] = list(old.get("contract_fields") or [])
             proposal.update(status="CLOSED", validated_blocker=False, introduced_round=old.get("introduced_round", round_index))
             return proposal
         current.update(adjudication_reason=reason, status=old_status, validated_blocker=True)
@@ -800,9 +805,8 @@ def _valid_closure(old: Mapping[str, Any], proposal: Mapping[str, Any], *, round
         return False, "closure_review_identity_invalid"
     if not proposal.get("evidence") or not _has_content(proposal.get("resolution")):
         return False, "closure_evidence_and_resolution_required"
-    old_fields = set(_unique_strings(old.get("contract_fields")))
     proposed_fields = set(_unique_strings(proposal.get("contract_fields")))
-    if not proposed_fields or (old_fields and not proposed_fields.issubset(old_fields)):
+    if not proposed_fields:
         return False, "closure_contract_fields_invalid"
     if not (proposed_fields & changed_fields) and not _evidence_points_to(proposal, candidate_plan_id):
         return False, "closure_not_supported_by_diff_or_candidate_evidence"

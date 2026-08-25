@@ -6,6 +6,7 @@ type Props = {
   activeView: ResearchView;
   onNavigate: (view: ResearchView) => void;
   onSettings: () => void;
+  onHome?: () => void;
   run?: unknown;
   running?: boolean;
 };
@@ -17,12 +18,13 @@ const items: Array<{ id: ResearchView; label: string; icon: typeof Search }> = [
   { id: "results", label: "结果展示", icon: BarChart3 },
 ];
 
-export function ResearchSidebar({ activeView, onNavigate, onSettings }: Props) {
+export function ResearchSidebar({ activeView, onNavigate, onSettings, onHome }: Props) {
   return <aside className="gew-sidebar" aria-label="研究导航">
-    <div className="gew-logo" aria-label="格物 Gewu">
+    <button className="gew-logo" aria-label="返回格物首页" onClick={() => onHome?.()} title="返回格物首页" disabled={!onHome}>
+      <img src="/gewu-logo-transparent.png" alt=""/>
       <span>格物</span>
       <small>GEWU</small>
-    </div>
+    </button>
     <nav>
       {items.map(({ id, label, icon: Icon }) => <button
         key={id}

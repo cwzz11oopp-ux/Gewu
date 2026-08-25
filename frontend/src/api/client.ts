@@ -1,4 +1,4 @@
-import type { Artifact, ExperimentProgress, ExperimentSettings, ExperimentTestResult, LocalLiteratureDocument, PaperWritingState, ProviderStatus, RunRecord } from "./types";
+import type { Artifact, ExperimentProgress, ExperimentSettings, ExperimentTestResult, LocalLiteratureDocument, PaperWritingState, ProviderStatus, ResearchKnowledgeBase, ResearchWikiStats, RunRecord } from "./types";
 
 const API_BASE = (
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000"
@@ -21,6 +21,10 @@ export function experimentPackageUrl(runId: string) {
 
 export function paperDownloadUrl(runId: string, format: "docx" | "latex") {
   return `${API_BASE}/api/runs/${encodeURIComponent(runId)}/paper-writing/download?format=${format}`;
+}
+
+export function literatureFileUrl(documentId: string) {
+  return `${API_BASE}/api/literature/documents/${encodeURIComponent(documentId)}/file`;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -60,10 +64,10 @@ async function requestText(path: string): Promise<string> {
 }
 
 export const api = {
-  createRun(title: string, problem_input: string, domain = "", constraints = "", github_repository_url = "", research_constraints: Record<string, unknown> = {}) {
+  createRun(title: string, problem_input: string, domain = "", constraints = "", github_repository_url = "", research_constraints: Record<string, unknown> = {}, knowledge_base_id = "default") {
     return request<RunRecord>("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ title, problem_input, domain, constraints, github_repository_url: github_repository_url || null, research_constraints }),
+      body: JSON.stringify({ title, problem_input, domain, constraints, github_repository_url: github_repository_url || null, research_constraints, knowledge_base_id }),
     });
   },
   listRuns() {
@@ -110,6 +114,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ candidate_index }),
     });
+  },
+  regenerateHypothesis(runId: string) {
+    return request<RunRecord>(`/api/runs/${runId}/hypotheses/regenerate`, { method: "POST" });
   },
   rerunFrom(runId: string, stepId: string) {
     return request<RunRecord>(`/api/runs/${runId}/steps/${stepId}/rerun-from`, { method: "POST" });
@@ -170,8 +177,9 @@ export const api = {
       body: JSON.stringify(settings),
     });
   },
-  listLiterature() {
-    return request<LocalLiteratureDocument[]>("/api/literature/documents");
+  listLiterature(knowledgeBaseId?: string) {
+    const query = knowledgeBaseId ? `?knowledge_base_id=${encodeURIComponent(knowledgeBaseId)}` : "";
+    return request<LocalLiteratureDocument[]>(`/api/literature/documents${query}`);
   },
   uploadLiterature(
     file: File,
@@ -183,6 +191,7 @@ export const api = {
       doi: string;
       arxiv: string;
     },
+    knowledgeBaseId = "default",
   ) {
     const body = new FormData();
     body.append("file", file);
@@ -192,6 +201,7 @@ export const api = {
     body.append("abstract", metadata.abstract);
     body.append("doi", metadata.doi);
     body.append("arxiv", metadata.arxiv);
+    body.append("knowledge_base_id", knowledgeBaseId);
     return request<LocalLiteratureDocument>("/api/literature/documents", {
       method: "POST",
       body,
@@ -207,10 +217,16 @@ export const api = {
       method: "POST",
     });
   },
-  addLiteratureToWiki(documentId: string) {
-    return request<{ node_ids: string[] }>(`/api/literature/documents/${documentId}/wiki`, {
+  addLiteratureToWiki(documentId: string, knowledgeBaseId = "default") {
+    return request<{ node_ids: string[] }>(`/api/literature/documents/${documentId}/wiki?knowledge_base_id=${encodeURIComponent(knowledgeBaseId)}`, {
       method: "POST",
     });
+  },
+  getResearchWikiStats(knowledgeBaseId = "default") {
+    return request<ResearchWikiStats>(`/api/research-wiki/stats?knowledge_base_id=${encodeURIComponent(knowledgeBaseId)}`);
+  },
+  listResearchKnowledgeBases() {
+    return request<ResearchKnowledgeBase[]>("/api/research-wiki/knowledge-bases");
   },
   deleteLiterature(documentId: string) {
     return request<{ deleted: boolean; document_id: string }>(`/api/literature/documents/${documentId}`, {

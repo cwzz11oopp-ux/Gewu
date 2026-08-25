@@ -11,6 +11,7 @@ _PLANNING_FIELDS = (
     "success_criteria",
 )
 _NOT_PROVIDED = "未提供"
+TRAINING_EPOCH_ALIASES = ("epochs", "max_epochs", "epochs_limit")
 
 # This is the single authoring/reviewing/diff vocabulary for Research Plans.
 # Every key is an actual normalized-plan field.  Historical semantic labels are
@@ -101,6 +102,30 @@ def canonical_contract_fields(values: object) -> list[str]:
     )
 
 
+def merge_plan_patch(base, patch_payload):
+    """Overlay a patch-only revision output onto the full normalized candidate.
+
+    The provider may wrap the patch in a top-level ``plan`` object; unwrap it, then
+    overlay only canonical Plan Contract fields plus ``fix_map`` so no unrelated or
+    provider-metadata key leaks into the merge.  Every untouched field keeps the
+    candidate's exact value, so ``changed_contract_fields`` sees only the true patch.
+    """
+    payload = dict(patch_payload) if isinstance(patch_payload, dict) else {}
+    inner = (
+        payload["plan"]
+        if isinstance(payload.get("plan"), dict)
+        and not any(field in payload for field in _PLANNING_FIELDS)
+        else payload
+    )
+    # fix_map may sit beside the "plan" wrapper; take it from either level.
+    combined = dict(inner)
+    if "fix_map" in payload:
+        combined["fix_map"] = payload["fix_map"]
+    allowed = set(CANONICAL_PLAN_CONTRACT_FIELDS) | {"fix_map"}
+    overlay = {key: value for key, value in combined.items() if key in allowed}
+    return {**dict(base or {}), **overlay}
+
+
 def normalize_plan(
     raw_plan: object,
     selected_hypotheses: object,
@@ -126,6 +151,13 @@ def normalize_plan(
     if not evaluations:
         evaluations = _legacy_evaluations(plan.get("metrics"))
 
+    parameters = _as_dict(plan.get("parameters"))
+    planned_epochs = canonical_training_epochs({"epochs": plan.get("epochs"), "parameters": parameters})
+    if planned_epochs is not None:
+        parameters["epochs"] = planned_epochs
+        for alias in TRAINING_EPOCH_ALIASES[1:]:
+            parameters.pop(alias, None)
+
     return {
         "objective": objective,
         "hypotheses": hypotheses,
@@ -137,7 +169,7 @@ def normalize_plan(
         "comparisons": comparisons,
         "evaluations": evaluations,
         "procedure": _as_dict(plan.get("procedure")),
-        "parameters": _as_dict(plan.get("parameters")),
+        "parameters": parameters,
         "seeds": _integer_list(plan.get("seeds")),
         "statistical_summary": _as_dict(plan.get("statistical_summary")),
         "success_criteria": _string_list(plan.get("success_criteria")),
@@ -179,6 +211,35 @@ def normalize_plan(
 
 def _as_dict(value: object) -> dict:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def canonical_training_epochs(plan: object) -> int | None:
+    """Return the model-authored formal epoch budget in canonical form.
+
+    Historical providers used ``max_epochs`` or ``epochs_limit``.  Accept those
+    spellings at the normalization boundary, but keep only ``parameters.epochs``
+    in the durable Plan Contract so execution has one unambiguous source.
+    """
+    candidate = _as_dict(plan)
+    parameters = _as_dict(candidate.get("parameters"))
+    raw = candidate.get("epochs")
+    if raw in (None, ""):
+        raw = next(
+            (parameters.get(name) for name in TRAINING_EPOCH_ALIASES if parameters.get(name) not in (None, "")),
+            None,
+        )
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, bool):
+        raise ValueError("PLAN_TRAINING_EPOCHS_INVALID")
+    try:
+        numeric = float(raw)
+        epochs = int(numeric)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("PLAN_TRAINING_EPOCHS_INVALID") from exc
+    if numeric != epochs or epochs < 1 or epochs > 100_000:
+        raise ValueError("PLAN_TRAINING_EPOCHS_INVALID")
+    return epochs
 
 
 def _as_list(value: object) -> list:

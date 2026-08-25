@@ -81,6 +81,25 @@ def test_reasoning_agents_call_llm_provider():
     assert llm.tasks[-2:] == ["writer.report_abstract", "writer.audit_report"]
 
 
+def test_feedback_schemas_separate_scientific_verdict_from_workflow_decision():
+    llm = TaskRecorder()
+    critic = CriticAgent(llm)
+
+    critic.review_result({"claim": "c"}, {"metrics": {"accuracy": 0.9}})
+    critic.select_iteration_direction(
+        {"claim": "c"},
+        {"objective": "o"},
+        {"metrics": {"accuracy": 0.9}},
+        {"verdict": "failed"},
+        {"references": []},
+    )
+
+    review_schema, direction_schema = llm.schema_hints
+    assert review_schema["verdict"] == "supported|partial|failed"
+    assert "REPORT|REVISE|PIVOT" in review_schema["decision"]
+    assert "REPORT|REVISE|PIVOT" in direction_schema["decision"]
+
+
 def test_planning_agent_receives_real_observed_structure_separately_from_semantics():
     class CaptureLLM(TaskRecorder):
         def generate_json(self, task, inputs, schema_hint, instructions=""):

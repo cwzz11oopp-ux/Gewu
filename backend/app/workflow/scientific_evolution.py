@@ -13,8 +13,13 @@ def normalize_scientific_analysis(value: dict[str, Any], *, provider_id: str, mo
     if not isinstance(value, dict):
         raise ValueError("SCIENTIFIC_ANALYSIS_INVALID")
     status = str(value.get("hypothesis_status") or "").upper()
+    status = {
+        "FAILED": "CONTRADICTED",
+        "UNSUPPORTED": "CONTRADICTED",
+        "PARTIAL": "INCONCLUSIVE",
+    }.get(status, status)
     if status not in HYPOTHESIS_STATUSES:
-        raise ValueError("SCIENTIFIC_ANALYSIS_STATUS_INVALID")
+        raise ValueError(f"SCIENTIFIC_ANALYSIS_STATUS_INVALID:{status or 'EMPTY'}")
     confidence = value.get("confidence", 0.0)
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not isfinite(confidence) or not 0 <= confidence <= 1:
         raise ValueError("SCIENTIFIC_ANALYSIS_CONFIDENCE_INVALID")

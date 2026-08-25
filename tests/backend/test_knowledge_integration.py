@@ -1,7 +1,7 @@
 from backend.app.models.literature import DocumentVerification, LocalDocument
 from backend.app.models.provider import EvidenceCard
 from backend.app.storage.literature import LiteratureLibrary
-from backend.app.storage.research_wiki import ResearchWikiStore, WikiQueryResult
+from backend.app.storage.research_wiki import ResearchWikiStore, WikiChangeSet, WikiQueryResult
 from backend.app.workflow.knowledge import (
     KnowledgeIntegrationService,
     merge_verified_evidence,
@@ -92,6 +92,33 @@ def test_collect_continues_external_search_when_wiki_is_empty(tmp_path):
     ]
     assert "WIKI_EMPTY" in result.warnings
     assert len(result.references) == 1
+
+
+def test_collect_reads_wiki_abstract_into_the_canonical_evidence_field(tmp_path):
+    wiki = ResearchWikiStore(tmp_path / "wiki")
+    wiki.commit_changes(
+        WikiChangeSet(
+            origin_run_id="run_0",
+            papers=[{
+                "title": "Dropout robustness study",
+                "abstract": "A limitation is that future work must evaluate robustness.",
+                "identifiers": {"doi": "10.1/dropout"},
+                "verified": True,
+            }],
+        ),
+        actor="supervisor",
+    )
+    service = KnowledgeIntegrationService(
+        wiki,
+        RecordingLibrary(tmp_path / "library", []),
+        RecordingExternal([]),
+    )
+
+    result = service.collect("run_1", {"literature_queries": ["dropout"]})
+
+    card = next(card for card in result.references if card.source_kind == "wiki")
+    assert card.abstract.startswith("A limitation")
+    assert "claim" not in card.model_dump()
 
 
 def test_collect_uses_every_problem_query_in_source_order(tmp_path):

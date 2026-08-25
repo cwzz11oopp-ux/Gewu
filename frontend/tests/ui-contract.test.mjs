@@ -251,7 +251,8 @@ test("backend automatic research performs a bounded feedback loop before export"
   const rerunBody = extractFunction(app, "rerunFrom");
 
   assert.match(orchestrator, /MAX_FEEDBACK_ITERATIONS = 4/);
-  assert.match(orchestrator, /requires_follow_up.*is True/);
+  assert.match(orchestrator, /import feedback_requires_follow_up/);
+  assert.match(orchestrator, /if feedback_requires_follow_up\(revision\.content\)/);
   assert.match(orchestrator, /iteration >= max_feedback_iterations/);
   assert.match(orchestrator, /return "experiment_task"/);
   assert.match(orchestrator, /return "experiment_run_analysis"/);

@@ -24,7 +24,9 @@ class LocalDocument(BaseModel):
     statuses: list[str] = Field(default_factory=lambda: ["uploaded"])
     verification: DocumentVerification = Field(default_factory=DocumentVerification)
     wiki_node_id: str | None = None
+    wiki_knowledge_base_ids: list[str] = Field(default_factory=list)
     run_ids: list[str] = Field(default_factory=list)
+    knowledge_base_ids: list[str] = Field(default_factory=lambda: ["default"])
 
 
 class LiteratureQueryResult(BaseModel):

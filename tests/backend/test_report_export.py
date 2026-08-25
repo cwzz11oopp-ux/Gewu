@@ -152,7 +152,7 @@ def test_report_has_all_competition_fields():
     assert report["Report Status"]["verified_reference_count"] == 1
     assert report["Reproducibility"]["provider"] == "remote_gpu"
     assert report["Iteration Summary"]["round_count"] == 1
-    assert report["Report Spec"]["schema_version"] == "round6.visual-report.v1"
+    assert report["Report Spec"]["schema_version"] == "round6.visual-report.v2"
 
 
 def test_report_uses_only_verified_references_and_grounded_iteration_metrics():
@@ -287,6 +287,474 @@ def test_only_evidence_complete_failure_remaining_after_repair_blocks_export():
 
     with pytest.raises(ValueError, match="REPORT_FACT_AUDIT_FAILED:numeric_mismatch"):
         WriterAgent(llm).build_report([])
+
+
+def test_numeric_audit_accepts_display_precision_rounding_and_requires_derived_path():
+    rounded_claim = (
+        "CCFE模型在测试集上的平均ROC-AUC稳定在0.9102（标准差0.0015），"
+        "而基线模型达到了0.9428（标准差0.0031）。"
+    )
+    difference_claim = "两者之间的平均差值为负0.0325。"
+    sections = [
+        {
+            "id": "results",
+            "paragraphs": [rounded_claim, difference_claim],
+        }
+    ]
+    facts = {
+        "final_result": {
+            "metric_summary": {
+                "CCFE_ROC-AUC": {"std": 0.0014661747071507423},
+                "Baseline_ROC-AUC": {"mean": 0.9427692376648594},
+            }
+        }
+    }
+    failures = [
+        {
+            "code": "numeric_mismatch",
+            "section_id": "results",
+            "paragraph_index": 0,
+            "claim": rounded_claim,
+            "source_path": "final_result.metric_summary.CCFE_ROC-AUC.std",
+            "source_fact": "0.0014661747071507423",
+            "required_correction": "修正标准差。",
+        },
+        {
+            "code": "numeric_mismatch",
+            "section_id": "results",
+            "paragraph_index": 1,
+            "claim": difference_claim,
+            "source_path": "final_result.metric_summary.Baseline_ROC-AUC.mean",
+            "source_fact": "0.9427692376648594",
+            "required_correction": "修正差值。",
+        },
+    ]
+
+    assert WriterAgent._validated_hard_failures(
+        failures,
+        facts=facts,
+        sections=sections,
+    ) == []
+
+
+def test_numeric_audit_keeps_true_scalar_mismatch():
+    claim = "CCFE模型的ROC-AUC为0.9000。"
+    failure = {
+        "code": "numeric_mismatch",
+        "section_id": "results",
+        "paragraph_index": 0,
+        "claim": claim,
+        "source_path": "final_result.metrics.CCFE_ROC-AUC",
+        "source_fact": "0.8",
+        "required_correction": "将ROC-AUC改为0.8000。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [failure],
+        facts={"final_result": {"metrics": {"CCFE_ROC-AUC": 0.8}}},
+        sections=[{"id": "results", "paragraphs": [claim]}],
+    ) == [failure]
+
+
+@pytest.mark.parametrize(
+    ("claim", "source_path", "fact"),
+    [
+        (
+            "基线准确率的跨种子标准差为0.07个百分点。",
+            "final_result.metric_summary.Baseline_Test_Accuracy.std",
+            0.0006928203230275387,
+        ),
+        (
+            "基线准确率的跨种子标准差为0.07 个百分点。",
+            "final_result.metric_summary.Baseline_Test_Accuracy.std",
+            0.0006928203230275387,
+        ),
+        (
+            "基线准确率的跨种子标准差为0.07%。",
+            "final_result.metric_summary.Baseline_Test_Accuracy.std",
+            0.0006928203230275387,
+        ),
+        (
+            "平滑组准确率的跨种子标准差为0.28pp。",
+            "final_result.metric_summary.LS_Test_Accuracy.std",
+            0.002843120351538689,
+        ),
+    ],
+)
+def test_numeric_audit_accepts_equivalent_ratio_displays(claim, source_path, fact):
+    failure = {
+        "code": "numeric_mismatch",
+        "section_id": "results",
+        "paragraph_index": 0,
+        "claim": claim,
+        "source_path": source_path,
+        "source_fact": str(fact),
+        "required_correction": "修改数值。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [failure],
+        facts={
+            "final_result": {
+                "metric_summary": {
+                    "Baseline_Test_Accuracy": {"std": 0.0006928203230275387},
+                    "LS_Test_Accuracy": {"std": 0.002843120351538689},
+                }
+            }
+        },
+        sections=[{"id": "results", "paragraphs": [claim]}],
+    ) == []
+
+
+def test_numeric_audit_keeps_true_percentage_point_mismatch():
+    claim = "基线准确率的跨种子标准差为0.08个百分点。"
+    failure = {
+        "code": "numeric_mismatch",
+        "section_id": "results",
+        "paragraph_index": 0,
+        "claim": claim,
+        "source_path": "final_result.metric_summary.Baseline_Test_Accuracy.std",
+        "source_fact": "0.0006928203230275387",
+        "required_correction": "修改数值。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [failure],
+        facts={"final_result": {"metric_summary": {"Baseline_Test_Accuracy": {"std": 0.0006928203230275387}}}},
+        sections=[{"id": "results", "paragraphs": [claim]}],
+    ) == [failure]
+
+
+def test_unit_audit_accepts_percentage_points_for_spread_but_not_metric_level():
+    spread_claim = "基线准确率的跨种子标准差为0.07个百分点。"
+    level_claim = "基线准确率为88.3个百分点。"
+    facts = {
+        "final_result": {
+            "metric_summary": {
+                "Baseline_Test_Accuracy": {"mean": 0.883, "std": 0.0006928203230275387}
+            }
+        }
+    }
+    failures = [
+        {
+            "code": "unit_mismatch",
+            "section_id": "results",
+            "paragraph_index": 0,
+            "claim": spread_claim,
+            "source_path": "final_result.metric_summary.Baseline_Test_Accuracy.std",
+            "source_fact": "0.0006928203230275387",
+            "required_correction": "修改单位。",
+        },
+        {
+            "code": "unit_mismatch",
+            "section_id": "results",
+            "paragraph_index": 2,
+            "claim": level_claim,
+            "source_path": "final_result.metric_summary.Baseline_Test_Accuracy.mean",
+            "source_fact": "0.883",
+            "required_correction": "将水平值单位改为百分比。",
+        },
+    ]
+
+    assert WriterAgent._validated_hard_failures(
+        failures,
+        facts=facts,
+        sections=[{"id": "results", "paragraphs": [spread_claim, level_claim]}],
+    ) == [failures[1]]
+
+
+def test_report_fact_sheet_exposes_deterministic_statistical_evidence():
+    evidence = {
+        "metric": "Test Accuracy",
+        "paired_t_test": {
+            "method": "paired_t_test",
+            "statistic": 1.7214586864,
+            "degrees_of_freedom": 2,
+            "p_value": 0.2273085782,
+            "status": "computed",
+        },
+    }
+
+    facts = WriterAgent._fact_sheet(
+        {}, {}, {}, {}, {}, {}, [], {}, evidence
+    )
+
+    assert facts["deterministic_result_evidence"]["paired_t_test"]["p_value"] == pytest.approx(
+        0.2273085782
+    )
+
+
+def test_scientific_boundary_guard_rejects_null_proof_and_unobserved_convergence_claims():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+    issues = WriterAgent._scientific_boundary_issues(
+        "结果呈现统计中性状态，且未进行具有足够统计功效的显著性检验。",
+        [
+            {
+                "id": "design",
+                "paragraphs": ["5个Epoch足以使基线进入收敛阶段，并为观察欠训练留出窗口。"],
+            },
+            {
+                "id": "results",
+                "paragraphs": ["实验结果支持了标签平滑无法带来统计显著提升的判断。"],
+            },
+            {
+                "id": "conclusion",
+                "paragraphs": [
+                    "该结果直接否定了准确率略微降低的预测方向。",
+                    "无法显著提升准确率的部分得到了数据支持，因为统计检验未能拒绝零假设。",
+                    "统计检验未能拒绝零假设，因此支持标签平滑无法显著提升准确率。",
+                    "实验部分证伪了准确率显著降低的预测。",
+                ],
+            },
+        ],
+        facts,
+    )
+
+    assert {(item["section_id"], item["paragraph_index"]) for item in issues} == {
+        ("abstract", 0),
+        ("design", 0),
+        ("results", 0),
+        ("conclusion", 0),
+        ("conclusion", 1),
+        ("conclusion", 2),
+        ("conclusion", 3),
+    }
+
+
+def test_scientific_boundary_guard_accepts_restrained_inconclusive_language():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+
+    assert WriterAgent._scientific_boundary_issues(
+        "配对t检验已经完成，但三个种子的结果未建立显著提升或下降证据。",
+        [
+            {
+                "id": "design",
+                "paragraphs": ["5 epoch来自冻结实验计划；本次没有独立收敛预实验或完整逐epoch曲线。"],
+            },
+            {
+                "id": "conclusion",
+                "paragraphs": ["点估计为正，但置信区间跨零，不能据此判定方向或等效性。"],
+            },
+        ],
+        facts,
+    ) == []
+
+
+def test_scientific_boundary_issue_identifies_reverse_null_inference_rule():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+    issues = WriterAgent._scientific_boundary_issues(
+        "",
+        [{
+            "id": "results",
+            "paragraphs": [
+                "无法显著提升准确率的部分得到了数据支持，因为统计检验未能拒绝零假设。"
+            ],
+        }],
+        facts,
+    )
+
+    assert len(issues) == 1
+    assert "nonrejection_supports_no_improvement" in issues[0]["rule_id"]
+
+
+def test_scientific_boundary_guard_rejects_report_wording_seen_in_export():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+    sections = [{
+        "id": "results",
+        "paragraphs": [
+            "无法显著提升准确率的判断，实验结果提供了支持：统计检验未能拒绝零假设。",
+            "实验揭示了标签平滑在严格计算约束下的中性效应。",
+            "该方法并未造成系统性的性能下降。",
+        ],
+    }]
+
+    issues = WriterAgent._scientific_boundary_issues("", sections, facts)
+
+    assert {(item["section_id"], item["paragraph_index"]) for item in issues} == {
+        ("results", 0),
+        ("results", 1),
+        ("results", 2),
+    }
+    assert "support_for_no_improvement_claim_broad" in issues[0]["rule_id"]
+    assert issues[1]["rule_id"] == "neutral_or_balanced_effect_claim"
+    assert issues[2]["rule_id"] == "unqualified_no_decline_claim"
+
+
+def test_scientific_boundary_fallback_removes_only_invalid_sentences():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+    sections = [
+        {
+            "id": "results",
+            "paragraphs": [
+                "配对t检验得到p=0.227，95%置信区间跨零。"
+                "实验结果支持了标签平滑无法带来统计显著提升的判断。"
+                "这一判断必须保留适用边界。"
+            ],
+        }
+    ]
+    issues = WriterAgent._scientific_boundary_issues("", sections, facts)
+
+    _, repaired = WriterAgent._apply_scientific_boundary_fallback(
+        "", sections, issues
+    )
+
+    paragraph = repaired[0]["paragraphs"][0]
+    assert "p=0.227" in paragraph
+    assert "这一判断必须保留适用边界" in paragraph
+    assert "支持了标签平滑无法" not in paragraph
+    assert "尚未建立总体方向性差异证据" in paragraph
+    assert WriterAgent._scientific_boundary_issues("", repaired, facts) == []
+
+
+def test_scientific_boundary_fallback_handles_two_issue_types_in_abstract():
+    facts = {
+        "deterministic_result_evidence": {
+            "paired_t_test": {
+                "method": "paired_t_test",
+                "p_value": 0.2273085782,
+                "confidence_interval_95": [-0.0041, 0.0096],
+            }
+        },
+        "final_result": {"epoch_metrics": []},
+    }
+    abstract = (
+        "结果呈现统计中性状态。"
+        "5个Epoch足以使基线进入收敛阶段。"
+        "研究边界保持不变。"
+    )
+    issues = WriterAgent._scientific_boundary_issues(abstract, [], facts)
+
+    repaired, _ = WriterAgent._apply_scientific_boundary_fallback(
+        abstract, [], issues
+    )
+
+    assert "统计中性状态" not in repaired
+    assert "足以使基线进入收敛阶段" not in repaired
+    assert "研究边界保持不变" in repaired
+    assert "尚未建立总体方向性差异证据" in repaired
+    assert "冻结实验计划规定的训练预算" in repaired
+    assert WriterAgent._scientific_boundary_issues(repaired, [], facts) == []
+
+
+def test_internal_leak_audit_requires_private_value_in_reader_facing_claim():
+    facts = {
+        "final_result": {
+            "environment": {"data_root": r"D:\Gewu\datasets\fashionmnist"}
+        }
+    }
+    generic_claim = "实验直接加载本地路径下的原始二进制文件。"
+    generic_failure = {
+        "code": "internal_leak",
+        "section_id": "method",
+        "paragraph_index": 0,
+        "claim": "直接加载本地路径下的原始二进制文件",
+        "source_path": "final_result.environment.data_root",
+        "source_fact": r"D:\Gewu\datasets\fashionmnist",
+        "required_correction": "删除具体路径。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [generic_failure],
+        facts=facts,
+        sections=[{"id": "method", "paragraphs": [generic_claim]}],
+    ) == []
+
+    leaked_claim = r"数据从 D:\Gewu\datasets\fashionmnist 直接读取。"
+    leaked_failure = {
+        **generic_failure,
+        "claim": leaked_claim,
+    }
+    assert WriterAgent._validated_hard_failures(
+        [leaked_failure],
+        facts=facts,
+        sections=[{"id": "method", "paragraphs": [leaked_claim]}],
+    ) == [leaked_failure]
+
+
+def test_reader_text_redaction_removes_runtime_paths_ids_and_hashes():
+    value = (
+        r"数据位于 D:\Gewu\datasets\fashionmnist，记录为 run_0a7d0876b742 / "
+        r"art_76813d81eef9，content_fingerprint=sha256:0123456789abcdef0123456789abcdef。"
+    )
+
+    redacted = WriterAgent._redact_reader_text(value)
+
+    assert r"D:\Gewu" not in redacted
+    assert "run_0a7d0876b742" not in redacted
+    assert "art_76813d81eef9" not in redacted
+    assert "content_fingerprint" not in redacted
+    assert "0123456789abcdef" not in redacted
+    assert "本地数据目录" in redacted
+    assert "内部记录" in redacted
+
+
+def test_reader_text_redaction_keeps_generic_local_path_wording():
+    claim = "实验直接加载本地路径下的原始二进制文件。"
+    assert WriterAgent._redact_reader_text(claim) == claim
+
+
+def test_unit_audit_keeps_relative_percent_for_an_absolute_delta_as_mismatch():
+    claim = "相对提升了10%。"
+    failure = {
+        "code": "unit_mismatch",
+        "section_id": "results",
+        "paragraph_index": 0,
+        "claim": claim,
+        "source_path": "deterministic_result_evidence.mean_delta",
+        "source_fact": "0.1",
+        "required_correction": "区分相对提升与绝对差值。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [failure],
+        facts={"deterministic_result_evidence": {"mean_delta": 0.1}},
+        sections=[{"id": "results", "paragraphs": [claim]}],
+    ) == [failure]
 
 
 def test_competition_export_blocks_simulated_results():

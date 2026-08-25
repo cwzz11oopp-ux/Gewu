@@ -103,9 +103,11 @@ def test_qwen_mode_semantically_reviews_high_risk_candidate_before_persisting(
                 for candidate in result["candidates"]:
                     candidate["evidence_basis"] = [
                         {
-                            "statement": source["claim"],
+                            # hypothesis.generate now receives Compact Paper
+                            # Cards; the claim text lives under "evidence".
+                            "statement": source["evidence"],
                             "source_title": source["title"],
-                            "source_url": source["url"],
+                            "source_url": source["provenance"]["url"],
                             "evidence_type": "FACT",
                         }
                     ]

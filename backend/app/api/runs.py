@@ -24,6 +24,7 @@ class CreateRunRequest(BaseModel):
     constraints: str = ""
     github_repository_url: str | None = None
     research_constraints: dict = Field(default_factory=dict)
+    knowledge_base_id: str = Field(default="default", min_length=1, max_length=100)
 
 
 class FeedbackRequest(BaseModel):
@@ -104,6 +105,7 @@ def build_router(deps) -> APIRouter:
             constraints=body.constraints,
             github_repository_url=body.github_repository_url,
             research_constraints=body.research_constraints,
+            knowledge_base_id=body.knowledge_base_id,
         )
 
     @router.get("")
@@ -303,6 +305,7 @@ def build_router(deps) -> APIRouter:
     @router.post("/{run_id}/steps/{step_id}/run")
     def run_step(run_id: str, step_id: str):
         try:
+            deps.sync_model_config()
             return deps.engine.run_step(run_id, step_id)
         except ValueError as exc:
             raise conflict(exc)
@@ -315,10 +318,13 @@ def build_router(deps) -> APIRouter:
             return deps.orchestrator.start(run_id)
         except KeyError:
             raise not_found("run", run_id)
+        except (ValueError, RuntimeError) as exc:
+            raise conflict(exc)
 
     @router.post("/{run_id}/preflight")
     def preflight(run_id: str):
         try:
+            deps.sync_model_config()
             return deps.engine.preflight_run(run_id)
         except KeyError:
             raise not_found("run", run_id)
@@ -335,6 +341,7 @@ def build_router(deps) -> APIRouter:
     @router.post("/{run_id}/steps/{step_id}/rerun-from")
     def rerun_from(run_id: str, step_id: str):
         try:
+            deps.sync_model_config()
             return deps.engine.rerun_from(run_id, step_id)
         except ValueError as exc:
             raise conflict(exc)
@@ -354,6 +361,16 @@ def build_router(deps) -> APIRouter:
     def select_hypothesis(run_id: str, body: HypothesisSelectionRequest):
         try:
             deps.engine.select_hypothesis(run_id, body.candidate_index)
+            return deps.orchestrator.start(run_id)
+        except KeyError:
+            raise not_found("run", run_id)
+        except ValueError as exc:
+            raise conflict(exc)
+
+    @router.post("/{run_id}/hypotheses/regenerate")
+    def regenerate_hypotheses(run_id: str):
+        try:
+            deps.engine.regenerate_hypotheses(run_id)
             return deps.orchestrator.start(run_id)
         except KeyError:
             raise not_found("run", run_id)

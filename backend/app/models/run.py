@@ -25,6 +25,7 @@ class RunRecord(BaseModel):
     title: str
     domain: str = "code-centered deep learning"
     problem_input: str
+    knowledge_base_id: str = "default"
     constraints: str = ""
     research_constraints: dict[str, Any] = Field(default_factory=dict)
     research_constraints_artifact_id: str | None = None
@@ -40,6 +41,9 @@ class RunRecord(BaseModel):
     stop_requested: bool = False
     feedback_iteration: int = 0
     force_new_attempt_experiment_ids: list[str] = Field(default_factory=list)
+    # Operational provider retries are durable so a process restart cannot turn
+    # a bounded recovery policy into an unbounded retry loop.
+    provider_retry_state: dict[str, dict[str, Any]] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     steps: list[StepRecord] = Field(default_factory=list)

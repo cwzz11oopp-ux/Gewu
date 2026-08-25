@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,7 @@ from backend.app.agents.experiment import ExperimentAgent
 from backend.app.providers.experiment_runtime import validate_result_payload
 from backend.app.workflow.experiment_code import normalize_experiment_bundle
 from backend.app.workflow.experiment_harness import (
+    SCAFFOLD_SOURCE,
     compile_bundle_runtime_contract,
     compile_runtime_contract,
     harness_source,
@@ -55,6 +57,26 @@ def test_runtime_contract_compilation_and_harness_source_are_deterministic():
     assert harness_source(first) == harness_source(second)
     assert first.contract_sha256
     assert "uuid" not in harness_source(first).lower()
+
+
+def test_runtime_scaffold_promotes_one_unambiguous_primary_metric_alias():
+    scope: dict = {}
+    exec(SCAFFOLD_SOURCE, scope)
+    scope["expected_metrics"] = lambda: ["Overall Test Accuracy", "Parameter Count Increase"]
+    scope["get_args"] = lambda: SimpleNamespace(
+        run_id="run_1", experiment_id="experiment_1", result_id="result_1", seed=7, output=""
+    )
+
+    result = scope["write_result"](
+        {
+            "ECA_Standard_Overall_Test_Accuracy": 0.91,
+            "Parameter_Count_Increase": 0.02,
+        },
+        primary_prefix="ECA_",
+    )
+
+    assert result["metrics"]["Overall Test Accuracy"] == 0.91
+    assert result["metrics"]["Parameter Count Increase"] == 0.02
 
 
 def test_compiled_contract_owns_dataset_seed_and_parameter_bindings():
@@ -286,6 +308,83 @@ def test_runtime_audit_rejects_single_seed_result_for_multiseed_contract():
     assert audit["integrity_status"] == "failed"
     assert "FORMAL_SEED_SET_MISMATCH" in audit["issues"]
     assert "FORMAL_SEED_RESULT_LINEAGE_MISMATCH" in audit["issues"]
+
+
+def test_runtime_audit_does_not_treat_semantic_info_as_an_integrity_issue():
+    class InformationalAuditProvider:
+        def generate_json(self, task, inputs, schema, instructions=""):
+            assert task == "experiment.audit_result"
+            return {
+                "integrity_status": "failed",
+                "issues": ["INFO: Low metric values are a scientific outcome."],
+            }
+
+    plan = _plan()
+    bundle = compile_bundle_runtime_contract(plan, {}, _bundle(plan))
+    result = {
+        "run_id": "run_1",
+        "experiment_id": "experiment_1",
+        "result_id": "experiment_1_result",
+        "metrics": {"accuracy": 0.9},
+        "runtime": {
+            "mode": "full",
+            "stage": bundle.runtime_contract.stage,
+            "epochs": bundle.runtime_contract.epochs,
+        },
+        "seeds": bundle.runtime_contract.seeds,
+        "seed_results": [
+            {"seed": seed, "metrics": {"accuracy": 0.9}}
+            for seed in bundle.runtime_contract.seeds
+        ],
+        "environment": {"cuda_available": True},
+        "attempts": [{"status": "completed"}],
+        "is_real_experiment": True,
+    }
+
+    audit = ExperimentAgent(InformationalAuditProvider()).audit_result(bundle, result)
+
+    assert audit["integrity_status"] == "passed"
+    assert audit["is_real_experiment"] is True
+    assert audit["issues"] == []
+
+
+def test_runtime_audit_accepts_harness_aggregate_despite_static_output_note():
+    class AggregateAwareAuditProvider:
+        def generate_json(self, task, inputs, schema, instructions=""):
+            return {
+                "integrity_status": "failed",
+                "issues": [
+                    "RESULT_SCHEMA_MISMATCH: static manifest output differs from harness output."
+                ],
+            }
+
+    plan = _plan()
+    bundle = compile_bundle_runtime_contract(plan, {}, _bundle(plan))
+    result = {
+        "run_id": "run_1",
+        "experiment_id": "experiment_1",
+        "result_id": "experiment_1_result",
+        "metrics": {"accuracy": 0.9},
+        "metric_summary": {"accuracy": {"mean": 0.9, "std": 0.0}},
+        "runtime": {
+            "mode": "full",
+            "stage": bundle.runtime_contract.stage,
+            "epochs": bundle.runtime_contract.epochs,
+        },
+        "seeds": bundle.runtime_contract.seeds,
+        "seed_results": [
+            {"seed": seed, "metrics": {"accuracy": 0.9}}
+            for seed in bundle.runtime_contract.seeds
+        ],
+        "environment": {"cuda_available": True},
+        "attempts": [{"status": "completed"}],
+        "is_real_experiment": True,
+    }
+
+    audit = ExperimentAgent(AggregateAwareAuditProvider()).audit_result(bundle, result)
+
+    assert audit["integrity_status"] == "passed"
+    assert audit["issues"] == []
 
 
 def test_runtime_result_validation_still_rejects_missing_or_nonfinite_metrics():

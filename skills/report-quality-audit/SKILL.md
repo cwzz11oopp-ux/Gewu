@@ -37,7 +37,12 @@ Return a hard failure only when the report contains at least one unresolved defe
 - a numeric claim contradicts the audited experiment artifact;
 - percent, proportion, and percentage-point units are confused;
 - a result, parameter, statistical test, causal explanation, or citation is invented;
+- a design-time rationale or expected artifact is presented as an executed pilot, observed
+  convergence analysis, or persisted training curve;
 - a negative or inconclusive result is presented as support;
+- a non-significant test or confidence interval containing zero is presented as proof of
+  equivalence, no effect, or an impossible improvement without a prespecified equivalence margin
+  and an appropriate equivalence test;
 - a conclusion exceeds the stated dataset, model, parameter, seed, or evaluation scope;
 - an unverified reference is used as evidence, or a citation cannot be linked to the final reference list;
 - a required core chapter is absent or contains no substantive content;
@@ -45,6 +50,28 @@ Return a hard failure only when the report contains at least one unresolved defe
 - two chapters make materially contradictory claims about the same experiment.
 
 For every hard failure, identify the chapter, paragraph, exact claim, conflicting source fact, and required correction. Never infer a hard failure from tone or a single phrase.
+
+Normalize units before declaring a mismatch. For a ratio-valued fact `x`, `x` and `100x%`
+are numerically equivalent after ordinary display rounding. For an absolute difference,
+standard deviation, standard error, or confidence-interval width of a ratio metric, `x` and
+`100x` percentage points are also equivalent. Equivalent conversion and terminology preference
+are not hard failures. Continue to reject a percentage-point expression for a metric level or a
+relative percentage change, because those are genuine semantic unit errors.
+
+Keep significance testing separate from equivalence testing. A non-significant two-sided test or
+a confidence interval spanning zero supports only “the evidence did not establish a difference.”
+It does not prove that groups are equal, that there is no meaningful effect, or that improvement is
+impossible. Permit an equivalence claim only when the facts contain a prespecified equivalence
+margin and the corresponding equivalence test.
+
+Failure to reject a null hypothesis is not evidence that the null is true. Do not turn it into
+support for a “cannot improve” claim. Likewise, when the confidence interval spans zero, an
+opposite-direction point estimate cannot by itself falsify or deny a directional prediction.
+
+Treat plan rationales and expected artifacts as intentions, not observations. In particular,
+`training_budget_rationale` does not prove that a convergence pilot was run, and an expected
+training curve does not prove that epoch-level history was persisted. Require matching result
+fields before describing either as completed evidence.
 
 Use only these stable hard-failure codes:
 
@@ -78,6 +105,11 @@ Request a targeted paragraph or chapter revision when:
 - the conclusion does not directly answer the research question;
 - prose is predominantly English although a Chinese report was requested;
 - paragraphs or chapters are exact or near duplicates.
+- the export has an avoidable visual imbalance: multiple early chapters are uninterrupted text walls while eligible, evidence-backed method, design, or iteration visuals are deferred to the results chapter;
+- figures form a late appendix-like cluster rather than appearing next to the chapter that establishes their reading question;
+- a figure, compact table, heading, caption, or body paragraph is used as decoration rather than serving a distinct reading task.
+
+For visual issues, prescribe a relocation, consolidation, or omission of an existing grounded visual; never request a decorative icon, stock illustration, or fabricated chart. Visual-balance issues are revision-required unless they create a factual misrepresentation.
 
 ## Soft style issues
 

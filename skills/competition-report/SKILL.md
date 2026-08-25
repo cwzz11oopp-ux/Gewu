@@ -8,6 +8,30 @@ allowed-tools: read_run, read_artifact, render_report
 
 Write the report as a continuous research narrative, not as an artifact dump or a list of conclusions.
 
+## Visual narrative and page balance
+
+Treat figures, tables, and typographic hierarchy as part of the research argument. They must make an evidence-backed relationship easier to scan; they are not decoration and must never introduce unverified facts.
+
+- Establish a visual anchor before the results chapter whenever the corresponding verified artifact exists. In the default eight-chapter structure, use the model-comparison visual in “数据集与实验方法”, the method pipeline and controlled-variable summary in “实验设计与评价标准”, and the research timeline or persisted training curve in “实验迭代与方法修正”.
+- Reserve the results chapter for outcome evidence: the main comparison, per-seed pairing, and per-seed delta. Do not move every available figure there simply because the data originates from an experiment result.
+- Keep the document visually paced: avoid more than two substantial prose-only chapters in a row when a grounded visual or compact comparison table is available; spread visuals across method, design, iteration, and results instead of appending them as a gallery.
+- Use at most one primary figure for a single claim. When two figures answer the same question, prefer the one that reveals the decision boundary more directly; retain both only when they show genuinely different views, such as aggregate comparison and paired seed variation.
+- Use a compact parameter/control table only for repeated fields. Do not convert explanatory prose into tables, and do not add emoji, decorative icons, stock imagery, or illustrative screenshots to an academic research report.
+- Place each visual immediately after the paragraph that introduces its reading question. Keep its caption with the visual, use the report's single visual style, and let the caption state provenance and scope rather than repeat the surrounding prose.
+
+Before export, perform a visual rhythm check: the opening third should contain at least one eligible method/design anchor; no later chapter should become a dense cluster while earlier chapters remain text walls; headings, tables, captions, and body text must remain visually distinct but restrained.
+
+## Figure production quality
+
+Treat publication quality as readability at the final Word display size, not merely a high pixel count. Use inline PNG figures at 300 DPI or better after placement; do not upscale a low-resolution source as a substitute for a legible chart.
+
+- Use a Chinese-capable sans-serif figure font and reader-facing Chinese labels where a metric key is otherwise long. Keep established method names only when they improve identification.
+- Reserve a clear text lane inside every flowchart node. Wrap long labels; never allow text to overlap arrows, borders, data marks, or adjacent nodes.
+- Keep legends outside the data region. For more than two series, use a compact multi-column legend or direct labels, and shorten series names before reducing type size.
+- If several recorded metrics are not on a common comparable scale, present them as labeled value cards or separate panels with explicit scales; do not imply a comparison through a shared bar height or an arbitrary axis.
+- For training small multiples, keep titles above panels and tick labels below panels so panel identity, axes, and data labels do not compete for the same space.
+- Before embedding, inspect every generated figure at 100% and reject/regenerate any figure with clipping, label overlap, legend intrusion, empty decorative space, or an unreadable caption relationship.
+
 ## Workflow
 
 1. Build a fact sheet from verified literature, the selected hypothesis, the final plan, every audited experiment result, and its linked revision.

@@ -12,11 +12,11 @@ For each claim, record the method used to judge it, the measured basis, the deci
 
 ## Output Contract
 
-Return `verdict` as `supported`, `partial`, or `failed`; also return `feedback`, `required_revision`, `supported_claims`, `unsupported_claims`, `revisions`, `next_action`, `evidence_links`, and `overclaim_risks`. Make every revision traceable to a named metric, audit issue, or unsupported claim. Do not strengthen language beyond the measured result.
+Return `verdict` as `supported`, `partial`, or `failed`, and return a separate workflow `decision` as `REPORT`, `REVISE`, or `PIVOT`. Use `REPORT` for an honest negative or saturated result when no legal, informative follow-up should run. Use `REVISE` or `PIVOT` only when `required_revision` names a concrete experiment change that remains within the frozen research constraints. Also return `feedback`, `required_revision`, `supported_claims`, `unsupported_claims`, `revisions`, `next_action`, `evidence_links`, and `overclaim_risks`. Make every revision traceable to a named metric, audit issue, or unsupported claim. Do not strengthen language beyond the measured result.
 
 ## Acceptance
 
-`partial` and `failed` are valid completed outputs. Put future evidence in `revisions` and `next_action`; never describe an unrun experiment as evidence. ReviewerAgent performs the independent semantic check.
+`partial` and `failed` are valid completed outputs and may use `decision=REPORT`. Put future evidence in `revisions` and `next_action`; never describe an unrun experiment as evidence. Do not infer the workflow decision from narrative text. ReviewerAgent performs the independent semantic check.
 
 ## Output Language
 

@@ -296,6 +296,29 @@ def test_qwen_llm_reports_invalid_experiment_json_with_response_summary():
     assert "raw_tail=" in message
 
 
+def test_qwen_llm_labels_an_empty_structured_response_as_recoverable_output_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "   "},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    provider = QwenLLMProvider(
+        Settings.from_env({"LLM_PROVIDER": "qwen", "QWEN_API_KEY": "key"}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="MODEL_EMPTY_OUTPUT:provider=qwen"):
+        provider.generate_json("research", {}, {})
+
+
 def test_qwen_llm_wraps_timeouts_in_actionable_error():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("The read operation timed out", request=request)

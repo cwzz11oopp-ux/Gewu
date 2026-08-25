@@ -29,7 +29,7 @@ from backend.app.workflow.dataset_catalog import (
     dataset_spec,
     supported_dataset_names,
 )
-from backend.app.workflow.dataset_inspection import verify_dataset_contract
+from backend.app.workflow.dataset_inspection import contract_dataset_name, verify_dataset_contract
 from backend.app.workflow.experiment_code import smoke_data_reduction_issues
 from backend.app.workflow.experiment_harness import harness_file_path, harness_source
 from backend.app.providers.experiment_runtime import (
@@ -1141,7 +1141,7 @@ class LocalGpuExperimentProvider:
             "device_names": probe.device_names if probe else [],
             "cuda_visible_devices": self.settings.local_gpu_cuda_visible_devices,
             "machine": socket.gethostname(),
-            "dataset": manifest.dataset,
+            "dataset": manifest.dataset or contract_dataset_name(plan_dataset),
             "dataset_contract_id": manifest.dataset_contract_id,
             "dataset_fingerprint": manifest.dataset_fingerprint,
             "dataset_source": (

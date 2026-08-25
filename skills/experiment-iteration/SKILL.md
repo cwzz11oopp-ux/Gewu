@@ -32,6 +32,8 @@ allowed-tools: read_run, read_artifact, audit_result, query_wiki, search_local_l
 
 选中方向必须说明：待解决问题、结果依据、资料依据、唯一主要改变、固定控制、目标指标、可能退化项、成功规则、失败规则和停止规则。
 
+方向输出必须包含机器字段 `decision`，取值只能是 `REPORT`、`REVISE` 或 `PIVOT`。当没有安全、可执行且有信息增益的后续实验时使用 `REPORT`；只有存在明确的 `selected_direction` 时才能使用 `REVISE` 或 `PIVOT`。不得通过 `next_action`、`selection_reason` 等自然语言暗示与 `decision` 相反的路由。
+
 ## 不变量
 
 - 只使用最新已审计结果及其准确的假设、计划、任务和 Bundle 血缘。
@@ -54,3 +56,14 @@ repair. Scientific statuses are exactly `SUPPORTED`, `CONTRADICTED`,
 never trigger training-code repair. Preserve the initial/user hypothesis Artifact;
 any working revision must be a new lineage node with `parent_hypothesis_id`,
 `derived_from`, and `revision_reason` grounded in a validated result and evidence.
+
+When the failed claim changes the intervention, mechanism, placement, or target
+comparison, declare a `PIVOT` rather than editing the parent hypothesis in place.
+The PIVOT must state one exact new claim, its parent hypothesis/result IDs, and a
+minimal `change_set`: what is inherited (verified loader, split, baseline,
+controls, metrics) and what must change in implementation. Historical parent
+results are read-only evidence; they are not a current experimental arm unless
+the new claim explicitly requires rerunning that comparator.
+
+For an adverse or null result, emit `CONTRADICTED` or `INCONCLUSIVE` as appropriate;
+never emit `FAILED`, `UNSUPPORTED`, or any other status synonym.

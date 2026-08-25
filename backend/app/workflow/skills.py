@@ -64,6 +64,7 @@ _ASSIGNMENTS = {
     "report_export": StepAssignment(
         "writer",
         ("competition-report", "report-quality-audit"),
+        ("paper-write",),
     ),
 }
 

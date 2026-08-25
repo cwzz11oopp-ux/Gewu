@@ -18,6 +18,12 @@ class ReviewingLLM(MockLLMProvider):
 
     def generate_json(self, task, inputs, schema_hint, instructions=""):
         self.calls.append((task, inputs))
+        if task == "planning.build_plan":
+            return {
+                "objective": "Test compact CNN regularization under a fixed budget.",
+                "procedure": {"steps": ["Train the controlled comparison."]},
+                "parameters": {"epochs": 5},
+            }
         if task == "planning.review_plan":
             result = self.reviews.pop(0)
             if result["verdict"] == "ACCEPT" and inputs.get("previous_issue_ledger"):
@@ -33,7 +39,7 @@ class ReviewingLLM(MockLLMProvider):
         if task == "planning.revise_from_review":
             self.revision_count += 1
             return dict(
-                inputs["current_plan"],
+                inputs["current_candidate"],
                 additional_sections={"deepseek_revision": f"applied-{self.revision_count}"},
                 fix_map={"PRI-control": ["additional_sections"]},
             )
@@ -104,9 +110,36 @@ def test_role_router_uses_configured_review_provider():
     settings = Settings.from_env({})
     object.__setattr__(settings, "model_role_assignments", {"RESEARCH_PLAN_REVIEW": {"provider_id": "deepseek", "model": "deepseek-chat"}})
     qwen, deepseek = Provider("qwen"), Provider("deepseek")
-    ModelRoleRouter(settings, qwen, deepseek).generate_json("planning.review_plan", {}, {})
+    providers = {("qwen", "qwen-model"): qwen, ("deepseek", "deepseek-chat"): deepseek}
+    ModelRoleRouter(settings, providers).generate_json("planning.review_plan", {}, {})
     assert deepseek.tasks == ["planning.review_plan"]
     assert qwen.tasks == []
+
+
+def test_role_router_separates_writer_from_semantic_reviewer():
+    class Provider:
+        fallback = False
+        def __init__(self, mode): self.mode, self.tasks = mode, []
+        def generate_json(self, task, inputs, schema_hint, instructions=""): self.tasks.append(task); return {}
+
+    from backend.app.config import Settings
+    settings = Settings.from_env({})
+    object.__setattr__(settings, "model_role_assignments", {
+        "WRITER": {"provider_id": "qwen", "model": "qwen-writer"},
+        "CRITIC": {"provider_id": "deepseek", "model": "deepseek-review"},
+    })
+    writer, reviewer = Provider("qwen"), Provider("deepseek")
+    providers = {
+        ("qwen", "qwen-writer"): writer,
+        ("deepseek", "deepseek-review"): reviewer,
+    }
+    router = ModelRoleRouter(settings, providers)
+
+    router.generate_json("writer.audit_report", {}, {})
+    router.generate_json("reviewer.semantic", {}, {})
+
+    assert writer.tasks == ["writer.audit_report"]
+    assert reviewer.tasks == ["reviewer.semantic"]
 
 
 def test_provider_settings_mask_keys_and_persist_role_assignment(tmp_path):

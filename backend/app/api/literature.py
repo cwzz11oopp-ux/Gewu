@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from backend.app.models.artifact import utc_now
 from backend.app.models.literature import DocumentVerification
@@ -20,6 +21,7 @@ def build_router(deps) -> APIRouter:
         abstract: str = Form(""),
         doi: str = Form(""),
         arxiv: str = Form(""),
+        knowledge_base_id: str = Form("default"),
     ):
         try:
             return deps.literature_library.upload(
@@ -34,13 +36,14 @@ def build_router(deps) -> APIRouter:
                     "doi": doi,
                     "arxiv": arxiv,
                 },
+                knowledge_base_id=knowledge_base_id,
             )
         except LiteratureError as exc:
             raise _literature_error(exc)
 
     @router.get("/api/literature/documents")
-    def list_documents():
-        return deps.literature_library.list_documents()
+    def list_documents(knowledge_base_id: str | None = Query(default=None)):
+        return deps.literature_library.list_documents(knowledge_base_id)
 
     @router.get("/api/literature/search")
     def search_online_literature(
@@ -66,6 +69,47 @@ def build_router(deps) -> APIRouter:
             return deps.literature_library.get(paper_id)
         except LiteratureError as exc:
             raise _literature_error(exc)
+
+    @router.get("/api/literature/documents/{paper_id}/file")
+    def download_document(paper_id: str):
+        try:
+            document = deps.literature_library.get(paper_id)
+            path = deps.literature_library.file_path(paper_id)
+        except LiteratureError as exc:
+            raise _literature_error(exc)
+        return FileResponse(path, media_type=document.media_type, filename=document.filename)
+
+    @router.get("/api/research-wiki/stats")
+    def research_wiki_stats(
+        knowledge_base_id: str = Query(default="default", min_length=1, max_length=100),
+    ):
+        return {
+            "knowledge_base_id": knowledge_base_id,
+            **deps.research_wiki.stats(knowledge_base_id),
+        }
+
+    @router.get("/api/research-wiki/knowledge-bases")
+    def list_research_knowledge_bases():
+        """Return named Wiki scopes that can be safely selected for a new Run.
+
+        Wiki data for non-default scopes is stored under a hash, so its directory
+        name cannot recover the original label.  Runs and local literature retain
+        that label and together form the durable index of selectable scopes.
+        """
+        scopes = {"default"}
+        for document in deps.literature_library.list_documents():
+            scopes.update(item.strip() for item in document.knowledge_base_ids if item.strip())
+            scopes.update(item.strip() for item in document.wiki_knowledge_base_ids if item.strip())
+        for run in deps.repository.list_runs():
+            if run.knowledge_base_id.strip():
+                scopes.add(run.knowledge_base_id.strip())
+        return [
+            {
+                "knowledge_base_id": scope,
+                **deps.research_wiki.stats(scope),
+            }
+            for scope in sorted(scopes, key=lambda item: (item != "default", item.casefold()))
+        ]
 
     @router.delete("/api/literature/documents/{paper_id}")
     def delete_document(paper_id: str):
@@ -103,7 +147,7 @@ def build_router(deps) -> APIRouter:
                 "title": card.title or document.title,
                 "authors": card.authors or document.authors,
                 "year": card.year or document.year,
-                "abstract": card.claim or document.abstract,
+                "abstract": card.abstract or document.abstract,
                 "identifiers": {
                     key: value
                     for key, value in card.identifiers.items()
@@ -123,53 +167,62 @@ def build_router(deps) -> APIRouter:
             except KeyError:
                 continue
         if saved.wiki_node_id:
-            deps.engine.supervisor_agent.commit_wiki_changes(
-                _wiki_change_for_document(saved),
-                deps.research_wiki,
-            )
+            for knowledge_base_id in saved.wiki_knowledge_base_ids or ["default"]:
+                deps.engine.supervisor_agent.commit_wiki_changes(
+                    _wiki_change_for_document(saved, knowledge_base_id),
+                    deps.research_wiki,
+                )
         return saved
 
     @router.post("/api/runs/{run_id}/literature/{paper_id}/attach")
     def attach_document(run_id: str, paper_id: str):
         try:
             document = deps.literature_library.get(paper_id)
-            artifact = deps.repository.attach_local_document(run_id, document)
+            run = deps.repository.get_run(run_id)
         except LiteratureError as exc:
             raise _literature_error(exc)
         except KeyError:
             raise HTTPException(status_code=404, detail={"code": "RUN_NOT_FOUND"})
-        if run_id not in document.run_ids:
-            deps.literature_library.save(
-                document.model_copy(update={"run_ids": [*document.run_ids, run_id]})
+        run_ids = list(dict.fromkeys([*document.run_ids, run_id]))
+        knowledge_base_ids = list(
+            dict.fromkeys([*document.knowledge_base_ids, run.knowledge_base_id])
+        )
+        document = deps.literature_library.save(
+            document.model_copy(
+                update={
+                    "run_ids": run_ids,
+                    "knowledge_base_ids": knowledge_base_ids,
+                }
             )
+        )
+        artifact = deps.repository.attach_local_document(run_id, document)
         return artifact
 
-    @router.post("/api/v2/research/sessions/{session_id}/literature/{paper_id}/attach")
-    def attach_document_to_v2_session(session_id: str, paper_id: str):
-        try:
-            deps.v2_sessions.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail={"code": "RESEARCH_SESSION_NOT_FOUND"}) from exc
-        try:
-            document = deps.literature_library.get(paper_id)
-        except LiteratureError as exc:
-            raise _literature_error(exc)
-        if session_id not in document.run_ids:
-            document = deps.literature_library.save(
-                document.model_copy(update={"run_ids": [*document.run_ids, session_id]})
-            )
-        return document
-
     @router.post("/api/literature/documents/{paper_id}/wiki")
-    def add_document_to_wiki(paper_id: str):
+    def add_document_to_wiki(
+        paper_id: str,
+        knowledge_base_id: str = Query(default="default", min_length=1, max_length=100),
+    ):
         try:
             document = deps.literature_library.get(paper_id)
         except LiteratureError as exc:
             raise _literature_error(exc)
-        changes = _wiki_change_for_document(document)
+        changes = _wiki_change_for_document(document, knowledge_base_id)
         result = deps.engine.supervisor_agent.commit_wiki_changes(changes, deps.research_wiki)
         node_id = result.node_ids[0]
-        deps.literature_library.save(document.model_copy(update={"wiki_node_id": node_id}))
+        scopes = list(dict.fromkeys([*document.knowledge_base_ids, knowledge_base_id]))
+        wiki_scopes = list(
+            dict.fromkeys([*document.wiki_knowledge_base_ids, knowledge_base_id])
+        )
+        deps.literature_library.save(
+            document.model_copy(
+                update={
+                    "wiki_node_id": node_id,
+                    "knowledge_base_ids": scopes,
+                    "wiki_knowledge_base_ids": wiki_scopes,
+                }
+            )
+        )
         return result
 
     return router
@@ -185,7 +238,10 @@ def _literature_error(exc: LiteratureError) -> HTTPException:
     return HTTPException(status_code=status, detail={"code": exc.code})
 
 
-def _wiki_change_for_document(document) -> WikiChangeSet:
+def _wiki_change_for_document(
+    document,
+    knowledge_base_id: str = "default",
+) -> WikiChangeSet:
     return WikiChangeSet(
         papers=[
             {
@@ -200,4 +256,5 @@ def _wiki_change_for_document(document) -> WikiChangeSet:
             }
         ],
         origin_run_id=document.run_ids[-1] if document.run_ids else "local_upload",
+        knowledge_base_id=knowledge_base_id,
     )

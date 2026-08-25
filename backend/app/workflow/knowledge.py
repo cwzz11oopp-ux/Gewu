@@ -46,14 +46,20 @@ class KnowledgeIntegrationService:
         self.policy = policy or LiteratureRetrievalPolicy()
         self.external_limit = external_limit or self.policy.max_results_per_query
 
-    def collect(self, run_id: str, problem: dict) -> KnowledgeIntegrationResult:
+    def collect(
+        self,
+        run_id: str,
+        problem: dict,
+        knowledge_base_id: str = "default",
+    ) -> KnowledgeIntegrationResult:
         queries = _queries(problem)
-        return self.collect_queries(run_id, queries)
+        return self.collect_queries(run_id, queries, knowledge_base_id)
 
     def collect_queries(
         self,
         run_id: str,
         queries: list[object],
+        knowledge_base_id: str = "default",
     ) -> KnowledgeIntegrationResult:
         expanded_queries: list[object] = []
         for value in queries:
@@ -70,6 +76,7 @@ class KnowledgeIntegrationService:
         warnings: list[str] = []
         calls: list[dict[str, str]] = []
         raw_counts = {"wiki": 0, "local": 0, "external": 0}
+        external_degraded = False
 
         for spec in query_specs:
             query = spec.query
@@ -77,7 +84,11 @@ class KnowledgeIntegrationService:
                 remaining = self.policy.max_results_per_source - raw_counts["wiki"]
                 wiki_limit = min(self.external_limit, max(0, remaining))
                 try:
-                    wiki_result = self.wiki.query(query, limit=wiki_limit)
+                    wiki_result = self.wiki.query(
+                        query,
+                        limit=wiki_limit,
+                        knowledge_base_id=knowledge_base_id,
+                    )
                 except TypeError:
                     wiki_result = self.wiki.query(query)
                     wiki_result.papers = wiki_result.papers[:wiki_limit]
@@ -93,7 +104,9 @@ class KnowledgeIntegrationService:
             try:
                 remaining = self.policy.max_results_per_source - raw_counts["local"]
                 local_documents = self.library.search(
-                    query, min(self.external_limit, max(0, remaining))
+                    query,
+                    min(self.external_limit, max(0, remaining)),
+                    knowledge_base_id=knowledge_base_id,
                 )
                 calls.append({"source": "local", "query": query, "intent": spec.intent.value})
                 cards = [_with_query(_local_card(document), spec) for document in local_documents]
@@ -103,21 +116,32 @@ class KnowledgeIntegrationService:
                 calls.append({"source": "local", "query": query, "intent": spec.intent.value})
                 warnings.append("LOCAL_LITERATURE_DEGRADED")
 
-            try:
-                remaining = self.policy.max_results_per_source - raw_counts["external"]
-                external_cards = self.external_provider.search(
-                    query, min(self.external_limit, max(0, remaining))
-                )
-                calls.append({"source": "external", "query": query, "intent": spec.intent.value})
-                cards = [
-                    _with_query(card.model_copy(update={"source_kind": "external"}), spec)
-                    for card in external_cards
-                ]
-                raw_counts["external"] += len(cards)
-                candidates.extend(cards)
-            except Exception:
-                calls.append({"source": "external", "query": query, "intent": spec.intent.value})
-                warnings.append("EXTERNAL_LITERATURE_FAILED")
+            if external_degraded:
+                calls.append({"source": "external", "query": query, "intent": spec.intent.value, "skipped": True})
+            else:
+                try:
+                    remaining = self.policy.max_results_per_source - raw_counts["external"]
+                    try:
+                        external_cards = self.external_provider.search(
+                            query, min(self.external_limit, max(0, remaining))
+                        )
+                    except Exception:
+                        # One bounded retry for transient provider/network failures
+                        # before the external source is declared degraded for this run.
+                        external_cards = self.external_provider.search(
+                            query, min(self.external_limit, max(0, remaining))
+                        )
+                    calls.append({"source": "external", "query": query, "intent": spec.intent.value})
+                    cards = [
+                        _with_query(card.model_copy(update={"source_kind": "external"}), spec)
+                        for card in external_cards
+                    ]
+                    raw_counts["external"] += len(cards)
+                    candidates.extend(cards)
+                except Exception:
+                    external_degraded = True
+                    calls.append({"source": "external", "query": query, "intent": spec.intent.value, "retried": True})
+                    warnings.append("EXTERNAL_LITERATURE_FAILED")
 
         merged = _merge(candidates)
         ranked_all = _rerank(merged, query_specs, self.policy)
@@ -154,6 +178,7 @@ class KnowledgeIntegrationService:
                 "bounded_candidate_count": len(ranked),
                 "dedup_count": len(merged),
                 "core_reference_count": len(core),
+                "external_degraded": external_degraded,
                 "wiki": sum(card.source_kind == "wiki" for card in merged),
                 "local": sum(bool(card.local_document_id) for card in merged),
                 "external": sum(card.source_kind == "external" for card in merged),
@@ -169,6 +194,7 @@ class KnowledgeIntegrationService:
             wiki_changes=WikiChangeSet(
                 papers=proposed,
                 origin_run_id=run_id,
+                knowledge_base_id=knowledge_base_id,
             ),
         )
 
@@ -247,7 +273,7 @@ def _wiki_card(paper: dict) -> EvidenceCard:
         source=str(paper.get("source") or "research_wiki"),
         source_kind="wiki",
         local_document_id=paper.get("local_document_id"),
-        claim=str(paper.get("abstract") or ""),
+        abstract=str(paper.get("abstract") or ""),
         url=str(paper.get("url") or ""),
         identifiers=dict(paper.get("identifiers") or {}),
         verified=bool(paper.get("verified")),
@@ -262,7 +288,7 @@ def _local_card(document: LocalDocument) -> EvidenceCard:
         source=document.source,
         source_kind="local",
         local_document_id=document.id,
-        claim=document.abstract,
+        abstract=document.abstract,
         url=(
             f"https://doi.org/{document.identifiers['doi']}"
             if document.identifiers.get("doi")
@@ -314,7 +340,7 @@ def _rerank(
     current_year = datetime.now(timezone.utc).year
 
     def score(card: EvidenceCard) -> tuple[float, str, float]:
-        text_terms = set(re.findall(r"[a-z0-9]+", f"{card.title} {card.claim}".casefold()))
+        text_terms = set(re.findall(r"[a-z0-9]+", f"{card.title} {card.abstract}".casefold()))
         lexical = max((len(terms & text_terms) / max(1, len(terms)) for terms in query_terms), default=0.0)
         # Provider relevance is only one signal, never a blanket default.  The
         # query/document match is calculated for every card and persisted below.

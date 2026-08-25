@@ -21,6 +21,7 @@ READINESS_STATES = {
 SCIENTIFIC_RUN_STATES = {
     "NEEDS_VERIFICATION", "NEEDS_EVIDENCE", "NEEDS_PROTOCOL_RESOLUTION",
     "NEEDS_PLAN_REVISION", "POLICY_INTEGRITY_REQUIRED", "RECOVERABLE_PROVIDER_ERROR", "HYPOTHESIS_REJECTED",
+    "EVIDENCE_RETRY_REQUIRED",
     "COMPLETED_NEGATIVE", "COMPLETED_INCONCLUSIVE", "COMPLETED_WITH_BOUNDARY",
 }
 HARD_CONTRACT_KINDS = {
@@ -225,11 +226,19 @@ def build_world_state(*, run: Any, profile: dict[str, Any], dataset: dict[str, A
             "experiment_state": {}, "scientific_boundaries": [], "run_id": getattr(run, "id", "")}
 
 
+class EvidenceInsufficientGapsError(Exception):
+    """The evidence synthesis produced no research gaps, so hypothesis grounding is
+    impossible.  Recoverable: re-running the literature step re-collects evidence
+    (with a bounded external retry) before the run proceeds."""
+
+
 def failure_state_for(exc: Exception) -> str:
     """Classify operational failures separately from scientific outcomes."""
     text = f"{type(exc).__name__}:{exc}".casefold()
     if "planreviewpolicyintegrityerror" in text or "plan_review_policy_integrity" in text:
         return "POLICY_INTEGRITY_REQUIRED"
+    if "evidence_insufficient_gaps" in text or "evidenceinsufficientgapserror" in text:
+        return "EVIDENCE_RETRY_REQUIRED"
     if any(token in text for token in ("timeout", "429", "connection", "provider", "model_", "llm", "json", "schema")):
         return "RECOVERABLE_PROVIDER_ERROR"
     return "FAILED_SYSTEM"

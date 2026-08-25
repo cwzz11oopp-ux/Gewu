@@ -5,6 +5,7 @@ import pytest
 from backend.app.workflow.dataset_inspection import (
     DatasetInspectionError,
     contract_canonical_name,
+    contract_dataset_name,
     dataset_option,
     inspect_dataset_directory,
     verify_dataset_contract,
@@ -157,3 +158,14 @@ def test_named_contract_separates_semantics_from_directory_name(tmp_path):
 def test_legacy_generic_directory_name_is_not_a_canonical_dataset():
     assert contract_canonical_name({"name": "datasets"}) == ""
     assert contract_canonical_name({"name": "FashionMNIST"}) == "fashion-mnist"
+
+
+def test_custom_dataset_has_a_runtime_name_without_a_catalog_alias():
+    assert contract_dataset_name(
+        {
+            "canonical_name": "",
+            "display_name": "IPIX17",
+            "directory_name": "IPIX17",
+        }
+    ) == "IPIX17"
+    assert contract_dataset_name({"name": "datasets"}) == ""

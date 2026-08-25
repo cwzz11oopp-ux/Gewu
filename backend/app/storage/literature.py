@@ -42,6 +42,7 @@ class LiteratureLibrary:
         filename: str,
         media_type: str,
         metadata: dict,
+        knowledge_base_id: str = "default",
     ) -> LocalDocument:
         payload = self._read_limited(stream)
         kind, extension = _detect_kind(filename, media_type, payload)
@@ -86,6 +87,7 @@ class LiteratureLibrary:
             abstract=abstract,
             identifiers=identifiers,
             statuses=statuses,
+            knowledge_base_ids=[knowledge_base_id.strip() or "default"],
         )
         original_path = self.files_dir / f"{document_id}{extension}"
         text_path = self.text_path(document_id)
@@ -95,8 +97,12 @@ class LiteratureLibrary:
         self._write_documents(documents)
         return document
 
-    def list_documents(self) -> list[LocalDocument]:
-        return sorted(self._read_documents().values(), key=lambda item: item.id)
+    def list_documents(self, knowledge_base_id: str | None = None) -> list[LocalDocument]:
+        documents = self._read_documents().values()
+        if knowledge_base_id:
+            scope = knowledge_base_id.strip() or "default"
+            documents = [item for item in documents if scope in item.knowledge_base_ids]
+        return sorted(documents, key=lambda item: item.id)
 
     def get(self, document_id: str) -> LocalDocument:
         try:
@@ -122,12 +128,17 @@ class LiteratureLibrary:
         self.text_path(document_id).unlink(missing_ok=True)
         self._write_documents(documents)
 
-    def search(self, query: str, limit: int = 10) -> list[LocalDocument]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        knowledge_base_id: str = "default",
+    ) -> list[LocalDocument]:
         terms = tuple(dict.fromkeys(_tokens(query)))
         if not terms or limit <= 0:
             return []
         scored: list[tuple[int, str, LocalDocument]] = []
-        for document in self.list_documents():
+        for document in self.list_documents(knowledge_base_id):
             title = document.title.lower()
             abstract = document.abstract.lower()
             text = self.text_path(document.id).read_text(encoding="utf-8").lower()

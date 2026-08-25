@@ -1,4 +1,62 @@
-from backend.app.workflow.plan_contract import authoritative_plan_contract, normalize_plan
+from backend.app.workflow.plan_contract import (
+    authoritative_plan_contract,
+    merge_plan_patch,
+    normalize_plan,
+)
+
+
+def _full_plan():
+    return normalize_plan(
+        {
+            "objective": "compare treatment with control",
+            "procedure": {"steps": ["verify loader", "run smoke"]},
+            "comparisons": [{"baseline": "MLP", "variant": "CNN", "controls": []}],
+            "dataset": {"name": "frozen-ds", "split": "train/val/test"},
+        },
+        {"selected": [{"claim": "CNN wins"}]},
+    )
+
+
+def test_merge_plan_patch_carries_unchanged_fields_and_applies_patch():
+    base = _full_plan()
+    patch = {
+        "comparisons": [{"baseline": "MLP", "variant": "SE-CNN", "controls": ["width-matched"]}],
+        "fix_map": {"PRI-control": ["comparisons"]},
+    }
+    merged = merge_plan_patch(base, patch)
+    # Unchanged fields keep the candidate's exact values.
+    assert merged["objective"] == base["objective"]
+    assert merged["procedure"] == base["procedure"]
+    assert merged["dataset"] == base["dataset"]
+    # Patched fields take the new values; fix_map survives.
+    assert merged["comparisons"][0]["variant"] == "SE-CNN"
+    assert merged["fix_map"] == {"PRI-control": ["comparisons"]}
+
+
+def test_merge_plan_patch_unwraps_plan_wrapper_and_keeps_top_level_fix_map():
+    base = _full_plan()
+    patch = {
+        "plan": {"comparisons": [{"baseline": "MLP", "variant": "ECA-CNN", "controls": []}]},
+        "fix_map": {"PRI-control": ["comparisons"]},
+    }
+    merged = merge_plan_patch(base, patch)
+    assert merged["comparisons"][0]["variant"] == "ECA-CNN"
+    assert merged["fix_map"] == {"PRI-control": ["comparisons"]}
+    assert merged["objective"] == base["objective"]
+
+
+def test_merge_plan_patch_drops_non_canonical_provider_metadata():
+    base = _full_plan()
+    patch = {
+        "comparisons": [{"baseline": "MLP", "variant": "SE-CNN", "controls": []}],
+        "model_used": "qwen3.7-plus",
+        "thinking_enabled": True,
+        "fix_map": {"PRI-control": ["comparisons"]},
+    }
+    merged = merge_plan_patch(base, patch)
+    assert "model_used" not in merged
+    assert "thinking_enabled" not in merged
+    assert merged["comparisons"][0]["variant"] == "SE-CNN"
 
 
 def test_plan_contract_is_shared_and_preserves_scientific_gate_fields():

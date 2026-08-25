@@ -37,7 +37,7 @@ def extract_claim_evidence(papers: list[dict[str, Any]]) -> list[dict[str, Any]]
         if not isinstance(paper, dict) or not paper.get("verified"):
             continue
         text = str(
-            paper.get("available_text") or paper.get("abstract") or paper.get("claim") or ""
+            paper.get("available_text") or paper.get("abstract") or ""
         ).strip()
         if not text:
             continue

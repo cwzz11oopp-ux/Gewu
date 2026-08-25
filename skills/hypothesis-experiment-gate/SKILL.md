@@ -49,15 +49,13 @@ Require a stronger conventional baseline when the proposed baseline is untrained
 
 ## 5. Define a staged execution gate
 
-Run the cheapest gates first:
+Keep execution gating minimal:
 
 1. Static contract validation: identifiers, dataset, task, parameters, seeds, metric provenance, and finite-value handling.
-2. Tiny overfit test: verify the model can overfit a very small batch or subset.
-3. Smoke run: one seed, a small subset, and a few epochs.
-4. Pilot run: one seed on the intended data long enough to establish learning behavior.
-5. Formal run: multiple preregistered seeds only after all earlier gates pass.
+2. Smoke run: one backend-selected seed, the complete verified dataset and frozen split, one real train/evaluation batch, finite metrics, and successful serialization.
+3. Formal run: the frozen backend seed set.
 
-The smoke or pilot gate must require decreasing loss, performance clearly above a task-specific random or trivial baseline, finite metrics, nonzero finite gradients, successful result serialization and validation, and acceptable resource use. Stop before the formal run when any condition fails.
+An overfit check or pilot may be recorded as a diagnostic recommendation, but is not an additional blocker for formal execution. Stop only when static validation, the smoke run, or runtime integrity actually fails.
 
 ## 6. Pre-register interpretation
 

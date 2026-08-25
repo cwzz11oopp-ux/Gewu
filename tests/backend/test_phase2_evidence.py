@@ -6,6 +6,7 @@ from backend.app.workflow.phase2_evidence import (
     dataset_profile,
     fair_experiment_contract,
     metric_direction,
+    paired_seed_metrics,
     progressive_protocol,
     reproduction_check,
     result_evidence,
@@ -81,7 +82,12 @@ def test_baseline_profile_priority_and_ten_percent_reproduction_logic():
 def test_fair_contract_and_three_progressive_stages_are_independent():
     dataset = dataset_profile(inspected(["x", "label"]), {"task_type": "classification"})
     baseline = baseline_profile({"epochs": 20, "seed": [3, 5, 7]}, {}, dataset)
-    contract = fair_experiment_contract(dataset, baseline, {"epochs": 20, "seed": [3, 5, 7], "primary_metrics": ["accuracy"], "secondary_metrics": ["f1"]}, {})
+    contract = fair_experiment_contract(
+        dataset,
+        baseline,
+        {"seed": [3, 5, 7], "primary_metrics": ["accuracy"], "secondary_metrics": ["f1"]},
+        {"parameters": {"epochs": 20}},
+    )
     smoke, small, formal = (progressive_protocol(contract, stage) for stage in ("smoke", "small_scale", "formal_validation"))
     assert smoke["stage"] == "smoke" and smoke["epochs"] == 1 and smoke["seeds"] == [3]
     assert small["stage"] == "small_scale" and small["seeds"] == [3, 5]
@@ -111,3 +117,117 @@ def test_result_analyzer_requires_paired_seeds():
     evidence = result_evidence({1: .7}, {2: .8}, "accuracy")
     assert evidence["status"] == "not_comparable"
     assert evidence["route"] == "engineering_diagnosis"
+
+
+def test_named_multi_arm_metrics_use_plan_primary_comparison():
+    result = {
+        "seed_results": [
+            {
+                "seed": 7,
+                "metrics": {
+                    "PR-AUC": 0.99,
+                    "LR-Amplitude_PR-AUC": 0.71,
+                    "SVM-PhaseDiff_PR-AUC": 0.99,
+                },
+            },
+            {
+                "seed": 17,
+                "metrics": {
+                    "PR-AUC": 1.0,
+                    "LR-Amplitude_PR-AUC": 0.73,
+                    "SVM-PhaseDiff_PR-AUC": 1.0,
+                },
+            },
+        ]
+    }
+    baseline, idea = paired_seed_metrics(
+        result,
+        "pr_auc",
+        ["PR-AUC"],
+        comparisons=[
+            {"baseline": "LR-Amplitude", "variant": "SVM-PhaseDiff"}
+        ],
+    )
+    assert baseline == {7: 0.71, 17: 0.73}
+    assert idea == {7: 0.99, 17: 1.0}
+
+
+def test_primary_metric_pairing_does_not_bind_baseline_loss_and_computes_t_test():
+    result = {
+        "seed_results": [
+            {
+                "seed": 732063777,
+                "metrics": {
+                    "Baseline_Final_Training_Loss": 0.2720236312796566,
+                    "Baseline_Test_Accuracy": 0.8834,
+                    "Test Accuracy": 0.8889,
+                },
+            },
+            {
+                "seed": 1879472466,
+                "metrics": {
+                    "Baseline_Final_Training_Loss": 0.27313650531301115,
+                    "Baseline_Test_Accuracy": 0.8822,
+                    "Test Accuracy": 0.8849,
+                },
+            },
+            {
+                "seed": 427915357,
+                "metrics": {
+                    "Baseline_Final_Training_Loss": 0.27558194339148273,
+                    "Baseline_Test_Accuracy": 0.8834,
+                    "Test Accuracy": 0.8834,
+                },
+            },
+        ]
+    }
+
+    baseline, idea = paired_seed_metrics(
+        result,
+        "Test Accuracy",
+        ["Test Accuracy", "Final Training Loss"],
+    )
+    evidence = result_evidence(baseline, idea, "Test Accuracy")
+
+    assert baseline == {
+        732063777: 0.8834,
+        1879472466: 0.8822,
+        427915357: 0.8834,
+    }
+    assert evidence["mean_delta"] == pytest.approx(0.0027333333333333174)
+    assert evidence["paired_t_test"]["statistic"] == pytest.approx(1.7214586864)
+    assert evidence["paired_t_test"]["degrees_of_freedom"] == 2
+    assert evidence["paired_t_test"]["p_value"] == pytest.approx(0.2273085782)
+    assert evidence["paired_t_test"]["significant"] is False
+    assert evidence["confidence_interval_95"] == pytest.approx(
+        [-0.004098421748113749, 0.00956508841478048]
+    )
+
+
+def test_ambiguous_baseline_metric_binding_fails_closed():
+    result = {
+        "seed_results": [
+            {
+                "seed": 7,
+                "metrics": {
+                    "Baseline_Test_Accuracy": 0.80,
+                    "Baseline_Test_Accuracy_Copy": 0.81,
+                    "Test Accuracy": 0.82,
+                },
+            }
+        ]
+    }
+
+    assert paired_seed_metrics(result, "Test Accuracy", ["Test Accuracy"]) == ({}, {})
+
+
+def test_zero_variance_paired_test_never_serializes_fake_or_non_finite_p_value():
+    evidence = result_evidence(
+        {1: 0.70, 2: 0.70, 3: 0.70},
+        {1: 0.80, 2: 0.80, 3: 0.80},
+        "accuracy",
+    )
+
+    assert evidence["paired_t_test"]["status"] == "degenerate_zero_variance"
+    assert evidence["paired_t_test"]["p_value"] is None
+    assert evidence["paired_t_test"]["significant"] is None

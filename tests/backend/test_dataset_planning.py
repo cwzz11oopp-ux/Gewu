@@ -52,6 +52,30 @@ def test_availability_status_reports_cached_downloadable_and_missing(tmp_path):
     assert local["mnist"] == "missing"
 
 
+def test_build_task_uses_preregistered_plan_seed_contract():
+    seeds = [687603589, 369531869, 2110560859]
+    plan = {
+        "seeds": seeds,
+        "experiment_constraints": {"epochs": 5},
+        "dataset": {
+            "canonical_name": "ipix17",
+            "root": "/datasets/ipix17",
+            "contract_id": "dataset_ipix17",
+        },
+    }
+
+    task = ExperimentAgent(MockExperimentProvider()).build_task(plan)
+
+    assert task["constraints"] == {
+        "epochs": 5,
+        "seed": seeds[0],
+        "seeds": seeds,
+    }
+    assert task["seed"] == seeds[0]
+    assert task["seeds"] == seeds
+    assert task["plan"]["seeds"] == seeds
+
+
 def test_build_plan_passes_dataset_options_and_contract():
     llm = InputRecorder()
     options = _options(**{"cifar-10": "cached"})

@@ -196,6 +196,21 @@ def test_upload_list_get_and_delete_local_literature(tmp_path):
     assert client.get(f"/api/literature/documents/{document['id']}").status_code == 404
 
 
+def test_research_knowledge_bases_lists_default_document_and_run_scopes(tmp_path):
+    client = TestClient(mock_app(tmp_path))
+    client.post(
+        "/api/literature/documents",
+        files={"file": ("paper.txt", b"robust training", "text/plain")},
+        data={"title": "Robust Training", "knowledge_base_id": "vision"},
+    )
+    client.post("/api/runs", json={"title": "NLP run", "problem_input": "classify text", "knowledge_base_id": "nlp"})
+
+    response = client.get("/api/research-wiki/knowledge-bases")
+
+    assert response.status_code == 200
+    assert [item["knowledge_base_id"] for item in response.json()] == ["default", "nlp", "vision"]
+
+
 def test_online_literature_search_reuses_configured_provider(tmp_path):
     client = TestClient(mock_app(tmp_path))
 
@@ -207,49 +222,6 @@ def test_online_literature_search_reuses_configured_provider(tmp_path):
     assert payload["provider"] == "mock_literature"
     assert len(payload["results"]) == 2
     assert "claim" in payload["results"][0]
-
-
-def test_attach_local_literature_to_v2_session_only_updates_association(tmp_path):
-    client = TestClient(mock_app(tmp_path))
-    document = client.post(
-        "/api/literature/documents",
-        files={"file": ("paper.md", b"# Local evidence", "text/markdown")},
-        data={"title": "Local Evidence"},
-    ).json()
-    created = client.post(
-        "/api/v2/research/sessions",
-        json={
-            "problem": {
-                "question": "Does the local change improve the locked metric?",
-                "task": "repository research",
-                "repository": "fixture://repository",
-                "dataset": {"name": "fixture", "version": "1", "source": "tracked", "fingerprint": "fixture-v1"},
-                "compute_constraints": {},
-                "research_constraints": [],
-                "success_criteria": ["produce auditable evidence"],
-                "open_questions": [],
-            },
-            "budget": {
-                "experiment_limit": 2,
-                "compute_minutes_limit": 10,
-                "model_call_limit": 2,
-                "experiments_used": 0,
-                "compute_minutes_used": 0,
-                "model_calls_used": 0,
-            },
-        },
-    )
-    assert created.status_code == 201, created.text
-    session_id = created.json()["session_id"]
-
-    response = client.post(
-        f"/api/v2/research/sessions/{session_id}/literature/{document['id']}/attach"
-    )
-
-    assert response.status_code == 200
-    assert response.json()["run_ids"] == [session_id]
-    state = client.get(f"/api/v2/research/sessions/{session_id}/state").json()
-    assert state["iteration"] == 0
 
 
 def test_duplicate_literature_upload_returns_409_with_existing_id(tmp_path):
@@ -877,6 +849,24 @@ def test_api_accepts_user_hypothesis_selection_after_reasoning(tmp_path):
     ]
     assert selections[-1]["content"]["selected_indexes"] == [0]
     assert selections[-1]["content"]["selection_mode"] == "user_selected_after_evidence_reasoning"
+
+
+def test_api_regenerates_hypotheses_as_new_round_without_rerunning_literature(tmp_path):
+    client = TestClient(mock_app(tmp_path))
+    run = client.post("/api/runs", json={"title": "regenerate", "problem_input": "train compact cnn"}).json()
+    run_id = run["id"]
+    for step in ["problem_understanding", "knowledge_integration", "hypothesis_generation", "evidence_reasoning"]:
+        run = client.post(f"/api/runs/{run_id}/steps/{step}/run").json()
+
+    evidence_before = [a for a in run["artifacts"] if a["type"] == "evidence"]
+    response = client.post(f"/api/runs/{run_id}/hypotheses/regenerate")
+    assert response.status_code == 200, response.text
+
+    hypotheses = [a for a in response.json()["artifacts"] if a["type"] == "hypothesis"]
+    assert len(hypotheses) == 2
+    assert hypotheses[-1]["content"]["hypothesis_round"]["round_index"] == 2
+    # Regeneration reuses the existing literature collection.
+    assert len([a for a in response.json()["artifacts"] if a["type"] == "evidence"]) == len(evidence_before)
 
 
 def test_api_adds_user_hypothesis_after_evidence_review(tmp_path):
