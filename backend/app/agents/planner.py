@@ -9,7 +9,56 @@ from backend.app.workflow.plan_contract import (
 )
 
 
-PLAN_REVIEW_PROMPT_SCHEMA_VERSION = 3
+PLAN_REVIEW_PROMPT_SCHEMA_VERSION = 4
+CLAIM_COHERENCE_FIELDS = (
+    "objective",
+    "hypotheses",
+    "primary_claim",
+    "original_question_link",
+    "secondary_endpoints",
+    "method",
+    "comparisons",
+    "evaluations",
+    "procedure",
+    "statistical_summary",
+    "success_criteria",
+    "failure_criteria",
+    "stop_conditions",
+    "primary_experiment",
+    "traceability",
+    "risks",
+    "mechanism_and_evidence",
+    "boundary_conditions",
+    "alignment_contract",
+    "baseline_and_controls",
+    "positive_negative_inconclusive_rules",
+    "capacity_confounder",
+)
+
+PLAN_COHERENCE_INSTRUCTIONS = (
+    "Treat the frozen original question and selected hypothesis as one atomic scientific anchor. "
+    "Before returning a Plan, audit every claim-bearing or interpretive field for stale terminology "
+    "from an abandoned method, mechanism, comparator, or endpoint. The objective, hypotheses, "
+    "primary_claim, original_question_link, method, comparisons, evaluations, procedure, "
+    "statistical_summary, success_criteria, failure_criteria, stop_conditions, primary_experiment, "
+    "traceability, mechanism_and_evidence, alignment_contract, baseline_and_controls, "
+    "positive_negative_inconclusive_rules, risks, boundary_conditions, and capacity_confounder must "
+    "describe the same intervention and claim boundary. If the claim requires improvement on multiple "
+    "primary endpoints, preregister a justified minimum meaningful improvement for every endpoint. "
+    "Positive requires every required endpoint to meet its minimum improvement; negative means at "
+    "least one endpoint shows a clear adverse or null result under the preregistered rule; mixed "
+    "directions, insufficient precision, or an underpowered result are inconclusive rather than "
+    "silently positive or equivalent. With few seeds, report effect sizes and uncertainty and do not "
+    "turn non-significance into proof of no effect. For multi-round single-variable optimization, name "
+    "the one changed variable in each round, keep all other controls fixed, select only on validation "
+    "data, state the minimum improvement, reject and roll back a non-improving change, stop after the "
+    "preregistered consecutive no-improvement limit or round budget, and evaluate the untouched test "
+    "set only once after the final configuration is frozen. Use only evidence IDs supplied in context; "
+    "never invent provenance IDs. Concrete seeds are backend-owned: a non-empty seeds list in the "
+    "candidate is immutable backend provenance, not model-authored content. Do not request that it "
+    "be cleared or changed; assess only procedure.repetitions and the statistical role of repeats."
+)
+
 PLAN_REVIEW_FIXED_INSTRUCTIONS = (
     "Review only scientific-plan feasibility. Do not select a hypothesis, write scientific "
     "state, produce ExperimentResult, or demand code-level implementation details. A BLOCKER "
@@ -31,7 +80,14 @@ PLAN_REVIEW_FIXED_INSTRUCTIONS = (
     "only. Warnings and suggestions never block; only the governance ledger determines ACCEPT or "
     "REVISE. All contract_fields must use the frozen canonical Plan Contract field registry. A PIVOT "
     "may not alter frozen controls (including split, architecture/capacity, or primary metric) within "
-    "the current contract; such a change requires a separately authorized child experiment."
+    "the current contract; such a change requires a separately authorized child experiment. For a "
+    "CLAIM_PLAN_MISMATCH, inspect the complete Plan for stale method, mechanism, comparator, endpoint, "
+    "decision-rule, experiment-name, risk, and claim-boundary text. Keep all such contradictions in "
+    "the same stable blocker and name every affected canonical top-level field; do not leave the same "
+    "scientific contradiction behind as a new warning. Verify that every required primary endpoint "
+    "appears consistently in evaluations, success/failure criteria, traceability, alignment_contract, "
+    "and positive/negative/inconclusive rules, and that iterative optimization has validation-only "
+    "acceptance, rollback, stopping, and final test-isolation rules."
 )
 PLAN_REVISION_FIXED_INSTRUCTIONS = (
     "Apply a patch to the current Plan Contract. Return ONLY the canonical top-level "
@@ -43,17 +99,25 @@ PLAN_REVISION_FIXED_INSTRUCTIONS = (
     "as the exact mapping from each blocker ID to a non-empty list of frozen canonical "
     "top-level Plan Contract fields actually changed for that blocker. Do not use "
     "nested paths, text, evidence, values, or metadata in fix_map; it is not a complete "
-    "plan diff manifest. Preserve the frozen problem anchor and CLOSED ledger."
+    "plan diff manifest. Preserve the frozen problem anchor and CLOSED ledger. A "
+    "CLAIM_PLAN_MISMATCH repair is atomic across scientific meaning: inspect every field made available "
+    "by the schema and patch every field that still carries stale method, mechanism, comparator, "
+    "endpoint, experiment-name, decision-rule, risk, or claim-boundary language. Do not repair only "
+    "the headline while retaining the contradicted framing elsewhere. For multi-endpoint improvement, "
+    "make success, failure, mixed/inconclusive, traceability, and alignment rules exhaustive and "
+    "mutually consistent. For iterative optimization, include validation-only accept/reject, rollback, "
+    "consecutive-no-improvement or round-budget stopping, and one-time final test evaluation."
 )
 MODEL_TRAINING_BUDGET_INSTRUCTIONS = (
     "The planning model, not a global backend default or incoming research constraint, owns the "
-    "formal training budget. Set parameters.epochs to a positive integer chosen from the method's "
-    "training semantics, observed dataset scale, convergence needs, and available resources; do not "
-    "copy a universal value across unrelated studies. Explain the choice in "
-    "additional_sections.training_budget_rationale. For estimators that are not trained by epochs, "
-    "set parameters.epochs to 1 and declare the real optimizer limit separately as parameters.max_iter; "
-    "never fabricate repeated epochs by calling a converged fit() multiple times. Once the first Plan "
-    "is accepted, follow-up experimental revisions must preserve that formal epoch budget."
+    "formal training budget. First choose exactly one reproducible algorithm or network in method.name; "
+    "do not write alternatives such as 'SVM or a lightweight classifier'. For epoch-trained methods, set parameters.epochs to a positive integer "
+    "chosen from the method's training semantics, observed dataset scale, convergence needs, and "
+    "available resources; do not copy a universal value across unrelated studies. For a single-fit "
+    "LogisticRegression, SVC, or LinearSVC, do not invent an epoch loop: specify a positive parameters.max_iter "
+    "and state that each arm is fitted once. Explain the chosen budget in "
+    "additional_sections.training_budget_rationale. Once the first Plan is accepted, follow-up "
+    "experimental revisions must preserve its formal training budget."
 )
 
 
@@ -64,7 +128,7 @@ _PLAN_SCHEMA = {
     "original_question_link": "字符串：主张如何回答、收窄或部分回答原始问题",
     "secondary_endpoints": ["字符串：保留原问题解释所需的最小次要终点或控制"],
     "method": {
-        "name": "字符串：待验证方法名称",
+        "name": "字符串：唯一、可复现的算法或网络名称（不得使用‘或’、‘等’或未定的泛称）",
         "mechanism": "字符串：方法为何可能影响目标指标",
         "components": ["字符串：实现中必须保留的方法组件"],
     },
@@ -84,19 +148,32 @@ _PLAN_SCHEMA = {
         "direction": "字符串：指标方向",
         "method": "字符串：统计或判定方法",
     }],
-    "procedure": {"steps": ["字符串：执行步骤"], "repetitions": "整数：重复次数"},
-    "parameters": {
-        "epochs": "正整数：模型依据训练语义、数据规模、收敛需求和资源制定的正式训练轮数",
-        "参数名称": "其他固定值；非 epoch 训练器应另列 max_iter 等真实优化预算",
+    "procedure": {
+        "steps": ["字符串：执行步骤"],
+        "repetitions": "整数：重复次数；只写次数，不返回后端拥有的具体种子",
+        "optimization_rounds": [{
+            "round": "整数或稳定轮次名",
+            "changed_variable": "本轮唯一改变的变量",
+            "fixed_controls": ["其余冻结控制"],
+            "validation_decision_rule": "仅使用验证集的最小改善判定",
+            "on_no_improvement": "reject_and_rollback",
+        }],
+        "termination_rule": "连续无改善上限或最大轮数，并说明最终测试集只评估一次",
     },
+    "parameters": {
+        "epochs": "仅 epoch 训练模型填写的正整数：依据训练语义、数据规模、收敛需求和资源制定",
+        "max_iter": "LogisticRegression、SVC 或 LinearSVC 等单次拟合模型必须填写的正整数优化上限",
+        "参数名称": "其他固定值；必须与 method.name 的唯一算法相对应",
+    },
+    "seeds": "后端拥有的预注册字段：模型必须返回空数组，不得自行选择具体种子；只在 procedure.repetitions 写重复次数",
     "statistical_summary": {
         "aggregation": "字符串：如 mean/std 或置信区间",
         "significance_test": "字符串：统计检验；不适用时说明原因",
     },
-    "success_criteria": ["字符串：指标满足何条件时支持主张"],
-    "failure_criteria": ["字符串：何种结果反驳或限制主张"],
+    "success_criteria": ["字符串：每个必要主指标达到预注册最小有意义提升才支持主张"],
+    "failure_criteria": ["字符串：任一必要主指标明确不利或达到预注册否定规则时反驳/限制主张"],
     "expected_artifacts": ["字符串：结果、日志、模型或图表"],
-    "stop_conditions": ["字符串：提前停止或阻断条件"],
+    "stop_conditions": ["字符串：无改善回退、连续无改善停止、轮数预算与异常阻断条件"],
     "primary_experiment": {"name": "字符串", "purpose": "字符串"},
     "optional_ablations": [{
         "name": "字符串",
@@ -112,7 +189,7 @@ _PLAN_SCHEMA = {
     "traceability": [{
         "claim": "字符串：待验证主张",
         "mechanism": "字符串：对应机制",
-        "metric": "字符串：对应指标",
+        "metric": "字符串：每个必要主指标各有一条记录",
         "decision_rule": "字符串：支持或反驳规则",
     }],
     "resources": {"gpu": "字符串：计算资源", "time": "字符串：时间约束"},
@@ -127,7 +204,11 @@ _PLAN_SCHEMA = {
     "feasibility_risks": [{"risk": "字符串", "mitigation": "字符串"}],
     "staged_gates": [{"name": "static|overfit|smoke|pilot|formal", "pass_criteria": ["字符串"], "fail_criteria": ["字符串"]}],
     "formal_experiment_entry_conditions": ["字符串"],
-    "positive_negative_inconclusive_rules": {"positive": ["字符串"], "negative": ["字符串"], "inconclusive": ["字符串"]},
+    "positive_negative_inconclusive_rules": {
+        "positive": ["全部必要主指标均达到预注册最小提升"],
+        "negative": ["至少一个必要主指标达到明确不利或预注册否定规则"],
+        "inconclusive": ["指标方向混合、精度不足、置信区间过宽或统计功效不足"],
+    },
     "remaining_unknowns": ["字符串"],
     "capacity_confounder": {"confounder": "字符串", "control_strategy": "字符串", "justification": "字符串", "claim_boundary": "字符串"},
     "local_dataset_loader_verification": {"procedure": "字符串", "expected_shape": "字符串", "expected_labels": "字符串", "failure_policy": "字符串"},
@@ -209,6 +290,15 @@ def plan_revision_patch_schema(
             canonical = canonical_contract_field(raw)
             if canonical in registry and canonical not in named:
                 named.append(canonical)
+        # Claim drift is transitive: stale framing can live outside the few
+        # fields a reviewer happened to quote.  Make the full semantic closure
+        # available to the patch model while fix_map still records only fields
+        # that actually changed.  This does not turn warnings into blockers or
+        # authorize a wider scientific claim.
+        if str(item.get("blocker_class") or "") == "CLAIM_PLAN_MISMATCH":
+            for field in CLAIM_COHERENCE_FIELDS:
+                if field in registry and field not in named:
+                    named.append(field)
     if not named:
         return full
     patch = {}
@@ -378,6 +468,7 @@ class PlanningAgent:
                 instructions,
                 contract,
                 dataset_contract,
+                PLAN_COHERENCE_INSTRUCTIONS,
                 MODEL_TRAINING_BUDGET_INSTRUCTIONS,
             )
             if part

@@ -257,6 +257,65 @@ def test_drive_retries_recoverable_model_output_before_pausing(tmp_path, monkeyp
     )
 
 
+def test_drive_retries_recoverable_interruption_returned_by_plan_governance(
+    tmp_path, monkeypatch
+):
+    repository = Repository(str(tmp_path))
+    run = repository.create_run("problem", "title")
+    repository.update_workflow_state(
+        run.id, status="queued", automatic=True, current_step="research_plan"
+    )
+
+    class Engine:
+        universal_scientific_stability = True
+        max_feedback_iterations = 4
+
+        def __init__(self):
+            self.calls = 0
+
+        def run_step(self, run_id, step_id):
+            self.calls += 1
+            repository.update_step_state(run_id, step_id, "running")
+            if self.calls == 1:
+                repository.update_step_state(
+                    run_id,
+                    step_id,
+                    "interrupted",
+                    error={
+                        "code": "MODEL_OUTPUT_VALIDATION_FAILURE",
+                        "message": (
+                            "MODEL_OUTPUT_VALIDATION_FAILURE:"
+                            "PLAN_REVIEW_FIX_MAP_EMPTY:BR-2"
+                        ),
+                        "recoverable": True,
+                        "user_action_required": False,
+                    },
+                )
+                return
+            repository.update_step_state(run_id, step_id, "completed")
+
+    engine = Engine()
+    orchestrator = WorkflowOrchestrator(
+        repository,
+        lambda: engine,
+        provider_retry_limit=2,
+        provider_retry_backoff_seconds=0,
+    )
+    routes = iter(("research_plan", "research_plan", None))
+    monkeypatch.setattr(orchestrator, "_next_step", lambda *_args, **_kwargs: next(routes))
+
+    orchestrator._drive(run.id)
+
+    completed = repository.get_run(run.id)
+    assert engine.calls == 2
+    assert completed.status == "completed"
+    assert completed.provider_retry_state == {}
+    assert any(
+        event.message == "Retrying provider operation automatically (1/2)."
+        for event in completed.events
+    )
+
+
 def test_drive_pauses_only_after_the_provider_retry_budget_is_exhausted(
     tmp_path, monkeypatch
 ):

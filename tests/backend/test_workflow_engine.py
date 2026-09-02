@@ -271,7 +271,7 @@ class RecordingLLM:
                     paragraph * 7 + "本段聚焦结论边界。",
                 ],
                 "subsections": [],
-                "citations": ["Dropout"],
+                "citations": [item["paper_id"] for item in inputs["facts"]["verified_references"]],
             }
         if task == "writer.report_abstract":
             return {
@@ -290,6 +290,8 @@ class RecordingLLM:
             }
         if task == "writer.build_report":
             return {"Paper Title": "Qwen-guided Neural Network Experiment"}
+        if task == "writer.verify_report_audit":
+            return {"hard_failures": []}
         raise AssertionError(task)
 
     @staticmethod
@@ -3766,3 +3768,134 @@ def test_hypothesis_revision_is_append_only_across_persisted_checkpoint(tmp_path
     assert [item.content["hypothesis_round"]["round_index"] for item in artifacts if item.type == "hypothesis"] == [1, 2]
     assert any(item.type == "evidence_review" and item.content.get("round") == 1 for item in artifacts)
     assert any(item.type == "evidence_review" and item.content.get("round") == 2 for item in artifacts)
+
+
+class SerialOptimizationLLM(FeedbackIterationLLM):
+    def __init__(self, *, direction="REVISE"):
+        super().__init__(["supported"] * 5)
+        self.direction = direction
+
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        value = super().generate_json(task, inputs, schema_hint, instructions)
+        if task == "research.structure_problem":
+            value["research_intent"] = {
+                "kind": "optimization", "goal_quote": inputs["problem_input"],
+                "reason": "fixture optimization goal",
+            }
+        if task == "critic.select_iteration_direction":
+            context = inputs["feedback"]["research_context"]
+            assert inputs["feedback"]["scientific_synthesis"]["hypothesis_status"] == "INCONCLUSIVE"
+            value["decision"] = self.direction
+            value["selected_direction"]["source_result_ids"] = [context["current"]["result_id"]]
+            if self.direction == "PIVOT":
+                value["proposed_hypothesis"] = {"claim": "A lower dropout rate improves the frozen accuracy endpoint."}
+        return value
+
+
+@pytest.mark.parametrize("direction,budget,expected", [
+    ("REVISE", 4, "REVISE"), ("PIVOT", 4, "PIVOT"),
+    ("REPORT", 4, "REPORT"), ("REVISE", 1, "REPORT"),
+])
+def test_serial_optimization_separates_supported_from_continuation(tmp_path, direction, budget, expected):
+    llm = SerialOptimizationLLM(direction=direction)
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(repository, llm, MockLiteratureProvider(), MockExperimentProvider(),
+                            max_feedback_iterations=budget)
+    run = _run_through_experiment(engine, _selected_hypothesis_run(engine, repository))
+    run = engine.run_step(run.id, "feedback_revision")
+    revision = [a for a in run.artifacts if a.type == "revision"][-1].content
+    assert revision["verdict"] == "supported"
+    assert revision["decision"] == expected
+    assert any(a.type == "optimization_state" for a in run.artifacts)
+    assert ("critic.select_iteration_direction" in llm.tasks) == (budget > 1)
+    if expected in {"REVISE", "PIVOT"}:
+        assert revision["required_revision"]
+        assert revision["revised_plan"]["iteration_contract"]["source_result_ids"]
+        from backend.app.workflow.orchestrator import WorkflowOrchestrator
+        assert WorkflowOrchestrator._next_step(run) == "research_plan"
+        # Replaying feedback cannot add a second revision or spend another round.
+        replay = engine.run_step(run.id, "feedback_revision")
+        assert len([a for a in replay.artifacts if a.type == "revision"]) == 1
+
+
+def test_serial_optimization_invalid_direction_cannot_schedule_experiment(tmp_path):
+    class InvalidDirectionLLM(SerialOptimizationLLM):
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            value = super().generate_json(task, inputs, schema_hint, instructions)
+            if task == "critic.select_iteration_direction":
+                value["selected_direction"]["source_result_ids"] = ["not-a-result"]
+            return value
+
+    llm = InvalidDirectionLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(repository, llm, MockLiteratureProvider(), MockExperimentProvider())
+    run = _run_through_experiment(engine, _selected_hypothesis_run(engine, repository))
+    run = engine.run_step(run.id, "feedback_revision")
+    revision = [a for a in run.artifacts if a.type == "revision"][-1].content
+    assert revision["decision"] == "REPORT"
+    assert llm.tasks.count("critic.select_iteration_direction") == 3
+    assert "planning.refine_plan" not in llm.tasks
+
+
+@pytest.mark.parametrize("malformed_patch_first", [False, True])
+def test_serial_optimization_next_trial_inherits_retained_best_code_and_plan(tmp_path, malformed_patch_first):
+    class RetainedBaseLLM(SerialOptimizationLLM):
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            value = super().generate_json(task, inputs, schema_hint, instructions)
+            if task == "planning.refine_plan":
+                value["parameters"] = {**inputs["current_plan"]["parameters"], "rate": self.review_count / 10}
+            if task == "experiment.generate_bundle" and inputs.get("implementation_base"):
+                assert "edits" in schema_hint and "files" not in schema_hint
+                value = {"edits": [{"old": "'accuracy': 0.9", "new": f"'accuracy': {0.8 + self.review_count / 100}"}]}
+                if malformed_patch_first and not getattr(self, "invalid_patch_sent", False):
+                    self.invalid_patch_sent = True
+                    value = {"edits": [{"old": "NONEXISTENT_FRAGMENT", "new": "x"}]}
+            return value
+
+    def audited_fixture(run, scores):
+        # Synthetic measurements for wiring tests only, never stored in live runs.
+        latest = {a.type: a for a in run.artifacts}
+        task = latest["experiment_task"]
+        bundle = latest["experiment_bundle"]
+        result = latest["experiment_result"]
+        bundle.content["runtime_contract"]["dataset_fingerprint"] = "fixture-data"
+        seeds = bundle.content["runtime_contract"]["seeds"]
+        assert len(seeds) == len(scores)
+        task.content["phase2_protocol"]["primary_metric"] = "accuracy"
+        task.content["phase2_protocol"]["split"] = {"source": "fixture-frozen"}
+        result.content["is_real_experiment"] = True
+        result.content["audit"] = {"integrity_status": "passed"}
+        result.content["seed_results"] = [
+            {"seed": seed, "metrics": {"baseline_accuracy": b, "accuracy": s}}
+            for seed, b, s in zip(seeds, [.5, .51, .49], scores)
+        ]
+        repository.save_run(run)
+        return result.id, bundle.id, latest["plan"].id
+
+    llm = RetainedBaseLLM()
+    repository = Repository(data_dir=str(tmp_path / "data"))
+    engine = WorkflowEngine(repository, llm, MockLiteratureProvider(), MockExperimentProvider())
+    run = _run_through_experiment(engine, _selected_hypothesis_run(engine, repository))
+    first_result, first_bundle, first_plan = audited_fixture(run, [.7, .71, .69])
+    run = engine.run_step(run.id, "feedback_revision")
+    first_revision = [a for a in run.artifacts if a.type == "revision"][-1].content
+    assert first_revision["implementation_reference"]["bundle_id"] == first_bundle
+    run = _run_through_experiment(engine, run)
+    audited_fixture(run, [.6, .61, .59])
+    run = engine.run_step(run.id, "feedback_revision")
+    latest_revision = [a for a in run.artifacts if a.type == "revision"][-1].content
+    assert latest_revision["decision"] == "REVISE"
+    assert latest_revision["implementation_reference"]["result_id"] == first_result
+    assert latest_revision["implementation_reference"]["plan_id"] == first_plan
+    assert latest_revision["research_context"]["current"]["selection"] == "keep_incumbent"
+    refine_calls = [inputs for task, inputs in llm.inputs if task == "planning.refine_plan"]
+    assert "rate" not in refine_calls[-1]["current_plan"]["parameters"]
+    run = engine.run_step(run.id, "research_plan")
+    run = engine.run_step(run.id, "experiment_task")
+    generation = [inputs for task, inputs in llm.inputs if task == "experiment.generate_bundle"][-1]
+    assert generation["implementation_base"]["bundle_artifact_id"] == first_bundle
+    assert "'accuracy': 0.9" in generation["implementation_base"]["files"][0]["content"]
+    task = [a for a in run.artifacts if a.type == "experiment_task"][-1]
+    assert task.content["implementation_base_reference"]["bundle_id"] == first_bundle
+    assert "experiment.repair_bundle" not in llm.tasks
+    assert llm.tasks.count("experiment.generate_bundle") == (4 if malformed_patch_first else 3)

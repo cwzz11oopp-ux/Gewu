@@ -68,6 +68,7 @@ class CriticAgent:
         plan: dict | None = None,
         analysis: dict | None = None,
         audit: dict | None = None,
+        research_context: dict | None = None,
         instructions: str = "",
     ) -> dict:
         return self.llm_provider.generate_json(
@@ -78,6 +79,7 @@ class CriticAgent:
                 "result": result,
                 "analysis": analysis or result.get("analysis") or {},
                 "audit": audit or result.get("audit") or {},
+                **({"research_context": research_context} if research_context is not None else {}),
             },
             {
                 "verdict": "supported|partial|failed",
@@ -197,6 +199,9 @@ class CriticAgent:
                 }],
                 "selected_direction": {
                     "name": "string",
+                    "problem_addressed": "specific unresolved issue or improvement opportunity",
+                    "result_basis": ["measured observation motivating the experiment"],
+                    "source_result_ids": ["exact result artifact ID from research_context.history"],
                     "changed_variable": "string",
                     "fixed_controls": ["string"],
                     "target_metrics": ["string"],
@@ -204,6 +209,7 @@ class CriticAgent:
                     "failure_rule": "string",
                     "stop_rule": "string",
                 },
+                "proposed_hypothesis": {"claim": "New bounded claim when decision is PIVOT; otherwise empty string"},
                 "selection_reason": "string",
                 "next_action": "string",
             },

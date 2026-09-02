@@ -633,7 +633,7 @@ def _compact_report(report: dict) -> dict:
     keys = (
         "Paper Title", "Paper Abstract", "Executive Summary", "Problem Statement",
         "Rationale", "Technical Details", "Datasets", "Source", "Target", "Methods",
-        "Experiments", "Iteration Summary", "Results", "Research Conclusion",
+        "Experiments", "Iteration Summary", "Results", "Report Evidence", "Research Conclusion",
         "Limitations", "References", "标题", "摘要", "执行摘要", "待研究问题",
         "解决思路", "方法论", "实验设计", "实验结果", "研究结论", "参考文献",
     )

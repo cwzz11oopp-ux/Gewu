@@ -16,6 +16,10 @@ Design the smallest credible experiment set within the stated compute budget. Bu
 
 For each experiment state the method used, why that method is diagnostic, its evidence basis, the one changed factor, fixed controls, decisive metric, success/failure threshold, and positive/negative interpretation. Distinguish the primary experiment from optional ablations and provide enough detail for ExperimentAgent to generate a bundle without guessing.
 
+When the claim requires improvement on multiple primary endpoints, preregister a justified minimum meaningful improvement for every endpoint. Positive requires all required endpoints to pass; a clear adverse/null outcome on any required endpoint is negative under the preregistered rule; mixed directions, inadequate precision, or low-power results are inconclusive. Every required endpoint must appear in evaluations, success/failure criteria, traceability, alignment, and outcome rules.
+
+For multi-round single-variable optimization, list the exact variable changed in each round and freeze all other controls. Select on validation data only, reject and roll back a change that misses the minimum improvement, stop after the declared consecutive-no-improvement limit or maximum rounds, freeze the selected configuration, and evaluate the test set once.
+
 ## Output Contract
 
 Return the research objective and hypotheses, method and mechanism, dataset, comparisons, evaluations, procedure, parameters, statistical summary, success and failure criteria, expected artifacts, stop conditions, primary experiment, optional ablations, resources, risks, and claim-to-metric traceability. Also return the shared Plan Contract fields: `diagnosis`, `revised_hypothesis`, `mechanism_and_evidence`, `boundary_conditions`, `alignment_contract`, `baseline_and_controls`, `feasibility_risks`, `staged_gates`, `formal_experiment_entry_conditions`, `positive_negative_inconclusive_rules`, `remaining_unknowns`, `capacity_confounder`, and `local_dataset_loader_verification`.

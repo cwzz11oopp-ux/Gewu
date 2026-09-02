@@ -16,6 +16,7 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from backend.app.report_visualization import FigureSpec, ReportSpec, render_figure_png
+from backend.app.workflow.research_synthesis import stable_paper_id
 
 
 SECTION_ALIASES = (
@@ -89,7 +90,7 @@ def build_report_docx(report: dict, *, run_id: str, run_title: str) -> bytes:
     abstract = _pick(report, "Paper Abstract", "摘要")
     if abstract:
         document.add_heading("摘要", level=1)
-        _add_prose(document, abstract)
+        _add_prose(document, _render_citations(str(abstract), report))
         keywords = report.get("Keywords") or []
         if keywords:
             paragraph = document.add_paragraph()
@@ -337,7 +338,7 @@ def _add_narrative_sections(
             continue
         document.add_heading(title, level=1)
         for paragraph in section.get("paragraphs") or []:
-            _add_prose(document, paragraph)
+            _add_prose(document, _render_citations(str(paragraph), report))
         for subsection in section.get("subsections") or []:
             if not isinstance(subsection, dict):
                 continue
@@ -345,16 +346,66 @@ def _add_narrative_sections(
             if subtitle:
                 document.add_heading(subtitle, level=2)
             for paragraph in subsection.get("paragraphs") or []:
-                _add_prose(document, paragraph)
+                _add_prose(document, _render_citations(str(paragraph), report))
 
         section_id = str(section.get("id") or "")
         if section_id == "design":
             _add_design_support_table(document, report.get("Experiments"), table_number=1)
         elif section_id == "results":
             _add_result_support_table(document, report.get("Results"), table_number=2)
+            _add_statistical_evidence(document, report)
         elif section_id == "conclusion":
             _add_reproducibility_support_table(document, report.get("Reproducibility"), table_number=4)
         _add_section_figures(document, report, section_id)
+
+
+def _render_citations(text: str, report: dict) -> str:
+    numbers = {
+        str(item.get("paper_id") or stable_paper_id(item)).casefold(): index
+        for index, item in enumerate(report.get("References") or [], 1)
+        if isinstance(item, dict)
+    }
+    # Older saved reports used PAPER-<arXiv id> rather than the hashed ID.
+    # Resolve only identifiers present in this report's bibliography.
+    for index, item in enumerate(report.get("References") or [], 1):
+        if not isinstance(item, dict):
+            continue
+        arxiv = str((item.get("identifiers") or {}).get("arxiv") or "").strip().casefold()
+        if arxiv:
+            numbers["paper-" + re.sub(r"v\d+$", "", arxiv)] = index
+
+    def replace(match: re.Match) -> str:
+        identifier = match.group(1).casefold()
+        identifier = re.sub(r"^(paper-\d{4}\.\d{4,5})v\d+$", r"\1", identifier)
+        if identifier not in numbers:
+            raise ValueError(f"REPORT_CITATION_UNRESOLVED:{identifier}")
+        return f"[{numbers[identifier]}]"
+
+    return re.sub(r"\[?(\bPAPER-(?:\d{4}\.\d{4,5}(?:v\d+)?|[a-z0-9]+)\b)\]?", replace, text, flags=re.IGNORECASE)
+
+
+def _add_statistical_evidence(document: Document, report: dict) -> None:
+    """Render recorded statistics, never model-generated or recomputed numbers."""
+    evidence = (report.get("Report Evidence") or {}).get("deterministic_result_evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        return
+    test = evidence.get("paired_t_test") or {}
+    rows = [("指标", str(evidence.get("metric") or "未记录"))]
+    for label, value in (
+        ("检验方法", test.get("method")),
+        ("检验状态", test.get("status")),
+        ("配对样本数", test.get("n_pairs")),
+        ("差值方向", test.get("difference_orientation")),
+        ("平均差值", evidence.get("mean_delta")),
+        ("统计量", test.get("statistic")),
+        ("自由度", test.get("degrees_of_freedom")),
+        ("p值", test.get("p_value")),
+        ("95%置信区间", evidence.get("confidence_interval_95")),
+        ("区间计算方法", evidence.get("confidence_interval_method")),
+    ):
+        rows.append((label, "未计算/未记录" if value is None or value == [] else str(value)))
+    _add_table_caption(document, 3, "已保存的统计检验结果")
+    _add_label_table(document, rows)
 
 
 def _add_design_support_table(document: Document, value: Any, *, table_number: int) -> None:
@@ -649,7 +700,7 @@ def _add_references(document: Document, value: Any) -> None:
     if not isinstance(value, list):
         _add_human_value(document, value)
         return
-    for index, reference in enumerate(value[:15], 1):
+    for index, reference in enumerate(value, 1):
         if not isinstance(reference, dict):
             document.add_paragraph(f"[{index}] {reference}")
             continue

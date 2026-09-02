@@ -27,6 +27,8 @@ export type EvidenceItem = {
 export type HypothesisItem = {
   id: string;
   claim: string;
+  method: string;
+  mechanism: string;
   status: "candidate" | "selected" | "refuted" | "partial" | "evidence_insufficient" | "rejected" | "revision_required";
   scores: { falsifiability?: number; coverage?: number; novelty?: number };
   compositeScore?: number;
@@ -276,6 +278,8 @@ function normalizeHypotheses(artifacts: Artifact[]): HypothesisItem[] {
     return {
       id,
       claim: text(item.claim, item.hypothesis, item.objective) || "候选假设内容待生成",
+      method: text(item.method) || "方法待规划阶段确定",
+      mechanism: text(item.mechanism) || "机制说明待补充",
       status,
       scores,
       compositeScore,

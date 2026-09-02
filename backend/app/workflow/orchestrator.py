@@ -319,6 +319,38 @@ class WorkflowOrchestrator:
                     if self.repository.get_run(run_id).stop_requested:
                         raise LLMRequestCancelled()
                     raise
+                # Some durable governance paths persist a recoverable
+                # interruption and return normally so their review artifacts
+                # remain the authoritative checkpoint.  Treat that outcome the
+                # same as a raised provider error; otherwise the retry state is
+                # cleared below and the pipeline silently stops at a state that
+                # is labelled recoverable but was never actually retried.
+                current = self.repository.get_run(run_id)
+                current_step = next(
+                    (item for item in current.steps if item.id == step_id), None
+                )
+                if (
+                    current_step is not None
+                    and current_step.status == "interrupted"
+                    and isinstance(current_step.error, dict)
+                    and current_step.error.get("recoverable") is True
+                    and current_step.error.get("user_action_required") is not True
+                ):
+                    retry_error = ValueError(
+                        str(
+                            current_step.error.get("message")
+                            or current_step.error.get("code")
+                            or "RECOVERABLE_PROVIDER_ERROR"
+                        )
+                    )
+                    if self._schedule_provider_retry(run_id, step_id, retry_error):
+                        continue
+                    self.repository.update_workflow_state(
+                        run_id,
+                        status="RECOVERABLE_PROVIDER_ERROR",
+                        automatic=False,
+                    )
+                    return
                 self.repository.update_provider_retry_state(run_id, step_id, None)
                 if self._must_stop_automatic(self.repository.get_run(run_id)):
                     return

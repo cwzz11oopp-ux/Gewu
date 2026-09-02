@@ -11,7 +11,7 @@ from backend.app.models.experiment import (
     ExperimentBundle,
     ExperimentRuntimeContract,
 )
-from backend.app.workflow.plan_contract import canonical_training_epochs
+from backend.app.workflow.plan_contract import execution_training_budget
 
 
 def compile_runtime_contract(
@@ -29,9 +29,12 @@ def compile_runtime_contract(
     phase2_protocol = task.get("phase2_protocol") or {}
     protocol_stage = str(phase2_protocol.get("stage") or "formal_validation")
     protocol_seeds = list(phase2_protocol.get("seeds") or manifest.seeds)
-    protocol_epochs = phase2_protocol.get("epochs") or canonical_training_epochs(plan)
-    if protocol_epochs is None:
-        raise ValueError("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
+    training_budget = execution_training_budget(plan)
+    protocol_epochs = phase2_protocol.get("epochs") or (
+        int(training_budget.get("epochs") or training_budget["runtime_passes"])
+        if training_budget is not None
+        else None
+    ) or 1
     protocol_epochs = int(protocol_epochs)
     expected_metrics = list(manifest.expected_metrics)
     required_metrics = [

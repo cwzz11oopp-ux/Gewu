@@ -49,6 +49,19 @@ def test_reviewer_uses_raw_artifact_and_wiki_in_fresh_qwen_request(tmp_path):
     assert "supervisor_summary" not in call["inputs"]
 
 
+def test_report_reviewer_receives_writer_evidence_even_without_wiki(tmp_path):
+    evidence = {"deterministic_result_evidence": {"paired_t_test": {"p_value": .06378557524}},
+                "verified_references": [{"paper_id": "PAPER-abc", "abstract": "Source passage"}]}
+    artifact_path = tmp_path / "candidate.json"
+    artifact_path.write_text(json.dumps({"Report Evidence": evidence}), encoding="utf-8")
+    llm = RecordingReviewerLLM()
+    ReviewerAgent(llm).review("report_export", artifact_path, (), ReviewRubric("1", ("evidence",)))
+    call = llm.calls[0]
+    assert call["inputs"]["artifact"]["Report Evidence"] == evidence
+    assert "Do not declare evidence absent" in call["instructions"]
+    assert "source passage must also support the claim" in call["instructions"]
+
+
 @pytest.mark.parametrize(
     "step_id",
     ["evidence_reasoning", "research_plan", "feedback_revision", "report_export"],

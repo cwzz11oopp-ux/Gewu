@@ -112,15 +112,23 @@ def canonical_dataset_name_from_text(value: object) -> str:
     """
     if not isinstance(value, str):
         return ""
-    compact = re.sub(r"[\s_-]+", "", value.lower())
     candidates = sorted(
         ((re.sub(r"[\s_-]+", "", alias), canonical) for alias, canonical in _ALIASES.items()),
         key=lambda item: len(item[0]), reverse=True,
     )
     for alias, canonical in candidates:
-        if alias and alias in compact:
+        if dataset_name_in_text(value, alias):
             return canonical
     return ""
+
+
+def dataset_name_in_text(text: str, name: str) -> bool:
+    """Match whole dataset names, allowing separators but not MNIST in KMNIST."""
+    compact = re.sub(r"[\s_-]+", "", name.casefold())
+    if not compact:
+        return False
+    pattern = r"[\s_-]*".join(re.escape(char) for char in compact)
+    return bool(re.search(r"(?<![a-z0-9])" + pattern + r"(?![a-z0-9])", text.casefold()))
 
 
 def dataset_display_name(name: object) -> str:

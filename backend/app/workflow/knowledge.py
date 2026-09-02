@@ -15,6 +15,7 @@ from backend.app.workflow.literature_policy import (
     LiteratureRetrievalPolicy,
     normalize_queries,
 )
+from backend.app.workflow.literature_contract import literature_summary_text
 from backend.app.workflow.research_synthesis import (
     build_research_synthesis,
     evaluate_literature_coverage,
@@ -103,11 +104,21 @@ class KnowledgeIntegrationService:
 
             try:
                 remaining = self.policy.max_results_per_source - raw_counts["local"]
-                local_documents = self.library.search(
-                    query,
-                    min(self.external_limit, max(0, remaining)),
-                    knowledge_base_id=knowledge_base_id,
-                )
+                local_limit = min(self.external_limit, max(0, remaining))
+                try:
+                    local_documents = self.library.search(
+                        query,
+                        local_limit,
+                        knowledge_base_id=knowledge_base_id,
+                    )
+                except TypeError as exc:
+                    # Compatibility for an older/local LiteratureLibrary
+                    # implementation whose search signature predates scoped
+                    # knowledge bases. Do not hide unrelated TypeErrors raised
+                    # from inside the implementation.
+                    if "knowledge_base_id" not in str(exc):
+                        raise
+                    local_documents = self.library.search(query, local_limit)
                 calls.append({"source": "local", "query": query, "intent": spec.intent.value})
                 cards = [_with_query(_local_card(document), spec) for document in local_documents]
                 raw_counts["local"] += len(cards)
@@ -273,7 +284,7 @@ def _wiki_card(paper: dict) -> EvidenceCard:
         source=str(paper.get("source") or "research_wiki"),
         source_kind="wiki",
         local_document_id=paper.get("local_document_id"),
-        abstract=str(paper.get("abstract") or ""),
+        abstract=literature_summary_text(paper),
         url=str(paper.get("url") or ""),
         identifiers=dict(paper.get("identifiers") or {}),
         verified=bool(paper.get("verified")),

@@ -23,7 +23,7 @@ test("create research resets to a blank topic and Part A starts research", async
   const workbench = await readSource("src/pages/WorkbenchPage.tsx");
   const controls = await readSource("src/components/RunControls.tsx");
 
-  assert.match(app, /const EMPTY_TOPIC = \{\s*domain: "",\s*problem: "",\s*constraints: "",\s*githubRepositoryUrl: "",\s*\}/);
+  assert.match(app, /const EMPTY_TOPIC = \{\s*domain: "",\s*problem: "",\s*constraints: "",\s*githubRepositoryUrl: "",\s*knowledgeBaseId: "default",\s*\}/);
   assert.match(app, /function createResearch\(\)/);
   assert.match(app, /setRun\(null\)/);
   assert.match(app, /setTopicDraft\(EMPTY_TOPIC\)/);
@@ -49,7 +49,7 @@ test("edited topic creates a new run instead of continuing mismatched artifacts"
 
   assert.match(app, /function topicMatchesRun\(run: RunRecord, draft: typeof EMPTY_TOPIC\)/);
   assert.match(startBody, /current === null \|\| !topicMatchesRun\(current, topicDraft\)/);
-  assert.match(startBody, /api\.createRun\(title, topicDraft\.problem, topicDraft\.domain, topicDraft\.constraints, topicDraft\.githubRepositoryUrl\)/);
+  assert.match(startBody, /api\.createRun\(title, topicDraft\.problem, topicDraft\.domain, topicDraft\.constraints, topicDraft\.githubRepositoryUrl, \{\}, topicDraft\.knowledgeBaseId\)/);
   assert.match(workbench, /onQuestionChange=\{\(problem\) => onTopicDraftChange/);
   assert.match(workbench, /githubRepositoryUrl=\{topicDraft\.githubRepositoryUrl\}/);
 });
@@ -447,9 +447,10 @@ test("experiment settings expose dataset-parent-directory guidance and runtime A
   const settings = await readSource("src/components/ProjectSettingsModal.tsx");
   const types = await readSource("src/api/types.ts");
 
-  assert.match(settings, /数据集父目录/);
+  assert.match(settings, /数据集目录/);
   assert.match(settings, /D:\\\\Gewu\\\\datasets/);
-  assert.match(settings, /系统自动解析具体数据集目录/);
+  assert.match(settings, /可直接填写具体数据集文件夹/);
+  assert.match(settings, /填写父目录时按研究中的数据集名称匹配/);
   assert.match(settings, /api\.testExperimentSettings/);
   assert.match(types, /device_names\?: string\[\]/);
   assert.match(types, /available_device_indexes\?: number\[\]/);
@@ -537,7 +538,7 @@ test("maintained workspace exposes local-first repository and dataset inputs", a
 
   assert.match(research, /githubRepositoryUrl/);
   assert.match(research, /GitHub/);
-  assert.match(settings, /数据集父目录/);
+  assert.match(settings, /数据集目录/);
   assert.match(settings, /api\.getExperimentSettings/);
   assert.match(settings, /api\.saveExperimentSettings/);
   assert.match(settings, /api\.testExperimentSettings/);

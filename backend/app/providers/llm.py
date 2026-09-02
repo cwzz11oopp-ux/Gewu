@@ -80,13 +80,13 @@ def normalize_task_output_shape(task: str, value: object) -> tuple[dict, bool]:
         return value, False
     return dict(next(iter(unique.values()))), True
 
-# Task-scoped output caps.  hypothesis.generate must emit 3-4 candidates with
-# 20+ fields each; without a bounded max_tokens the model can run past the
-# reasoning timeout and surface as a MODAL_REQUEST_TIMEOUT.  Giving only this
-# task an explicit cap keeps its output complete (3000-4000 tokens) while every
-# other task keeps the provider's configured default.
+# Task-scoped output caps. hypothesis.generate emits 3-5 candidates with 20+
+# fields each. A 4000-token cap truncated the IPIX candidate response; allow
+# 12000 tokens after a real Fashion-MNIST retry still truncated at the 8000-token
+# boundary, while retaining a finite output budget. Other task caps and
+# provider defaults remain unchanged.
 _TASK_MAX_TOKENS: dict[str, int] = {
-    "hypothesis.generate": 4000,
+    "hypothesis.generate": 12000,
     # Full-plan regeneration tasks: cap runaway generation (~30k tokens is far
     # above any real ~17k-char plan) so an unbounded output cannot hang a request
     # for 20+ min, while a genuine plan is never truncated.
@@ -430,6 +430,50 @@ class MockLLMProvider:
                 "provider_mode": self.mode,
                 "fallback_used": True,
                 "fallback_reason": "Development fallback; diagnosis is advisory only.",
+            }
+        if task == "planning.build_plan":
+            hypothesis = dict(inputs.get("active_hypothesis") or {})
+            claim = str(
+                hypothesis.get("claim")
+                or "Development-only controlled comparison."
+            )
+            return {
+                "objective": claim,
+                "hypotheses": [claim],
+                "primary_claim": claim,
+                "original_question_link": "Development fixture preserves the selected claim boundary.",
+                "method": {
+                    "name": "Compact neural-network controlled comparison",
+                    "mechanism": "One isolated component differs between the baseline and variant.",
+                    "components": ["parameter-matched baseline", "single controlled variant"],
+                },
+                "comparisons": [{
+                    "baseline": "compact baseline",
+                    "variant": "single controlled variant",
+                    "controls": ["dataset", "split", "optimizer", "training budget"],
+                }],
+                "evaluations": [{
+                    "metric": "accuracy",
+                    "direction": "higher-is-better",
+                    "method": "paired seed-level comparison",
+                }],
+                "procedure": {
+                    "steps": ["Run the parameter-matched controlled comparison."],
+                    "repetitions": 2,
+                },
+                "parameters": {"epochs": 1},
+                "seeds": [],
+                "success_criteria": ["The variant improves the preregistered primary metric."],
+                "failure_criteria": ["The variant does not improve the preregistered primary metric."],
+                "stop_conditions": ["Stop after the frozen development fixture budget."],
+                "positive_negative_inconclusive_rules": {
+                    "positive": ["Both repetitions improve."],
+                    "negative": ["A reproducible adverse result is observed."],
+                    "inconclusive": ["Directions disagree across repetitions."],
+                },
+                "provider_mode": self.mode,
+                "fallback_used": True,
+                "fallback_reason": "Development fallback; not competition reasoning.",
             }
         if task == "planning.refine_plan":
             current_plan = dict(inputs.get("current_plan") or {})
@@ -975,6 +1019,15 @@ class QwenLLMProvider:
         timeout_seconds: int,
     ) -> httpx.Response:
         url = f"{self.settings.qwen_base_url}/chat/completions"
+        # JSON mode is deliberately accompanied by a concrete syntax example.
+        # DeepSeek documents that JSON mode may otherwise occasionally complete
+        # with an empty ``content`` field; its mitigation is to include both the
+        # word "JSON" and an example in the prompt.
+        json_instruction = (
+            "Return JSON only. Use valid object syntax, for example: "
+            '{"field":"value","items":[]}. '
+            "Match the supplied schema_hint; do not wrap the JSON in Markdown."
+        )
         request_kwargs = dict(
             headers={"Authorization": f"Bearer {self.settings.qwen_api_key}"},
             timeout=httpx.Timeout(
@@ -985,17 +1038,16 @@ class QwenLLMProvider:
             ),
             json={
                 "model": model,
-                **(
-                    {"enable_thinking": enable_thinking}
-                    if enable_thinking is not None
-                    else {}
-                ),
+                **self._thinking_request_payload(enable_thinking),
                 **_max_tokens_payload(task, self.settings.qwen_max_tokens),
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are an AI Scientist assistant for verifiable neural-network experiments.",
+                        "content": (
+                            "You are an AI Scientist assistant for verifiable neural-network experiments. "
+                            + json_instruction
+                        ),
                     },
                     *([
                         {"role": "system", "content": instructions},
@@ -1036,6 +1088,14 @@ class QwenLLMProvider:
         if cancel_event is None or not self._owns_client:
             return self.client.post(url, **request_kwargs)
         return asyncio.run(self._post_cancellable(url, request_kwargs, cancel_event))
+
+    def _thinking_request_payload(self, enable_thinking: bool | None) -> dict:
+        """Map the common policy flag to the provider's request dialect."""
+        return (
+            {"enable_thinking": enable_thinking}
+            if enable_thinking is not None
+            else {}
+        )
 
     @staticmethod
     async def _post_cancellable(
@@ -1081,6 +1141,18 @@ class QwenLLMProvider:
                 return httpx.Response(
                     response.status_code,
                     content=error_body,
+                    headers=dict(response.headers),
+                    request=response.request,
+                )
+            # Some OpenAI-compatible gateways (and deterministic test
+            # transports) may ignore ``stream=true`` and return an ordinary
+            # JSON chat-completions body. Preserve that valid response instead
+            # of treating it as an empty SSE stream.
+            if "application/json" in response.headers.get("content-type", "").lower():
+                response_body = response.read()
+                return httpx.Response(
+                    response.status_code,
+                    content=response_body,
                     headers=dict(response.headers),
                     request=response.request,
                 )
@@ -1149,6 +1221,14 @@ class QwenLLMProvider:
                         return httpx.Response(
                             response.status_code,
                             content=error_body,
+                            headers=dict(response.headers),
+                            request=response.request,
+                        )
+                    if "application/json" in response.headers.get("content-type", "").lower():
+                        response_body = await response.aread()
+                        return httpx.Response(
+                            response.status_code,
+                            content=response_body,
                             headers=dict(response.headers),
                             request=response.request,
                         )
@@ -1260,6 +1340,16 @@ class DeepSeekLLMProvider(QwenLLMProvider):
     def _models_for_policy(self, policy: _TaskPolicy) -> list[str]:
         return [self.settings.deepseek_model]
 
+    def _thinking_request_payload(self, enable_thinking: bool | None) -> dict:
+        # ``enable_thinking`` is a DashScope/Qwen extension.  DeepSeek silently
+        # ignores it and defaults to thinking mode, so use DeepSeek's documented
+        # Chat Completions parameter instead.
+        return (
+            {"thinking": {"type": "enabled" if enable_thinking else "disabled"}}
+            if enable_thinking is not None
+            else {}
+        )
+
 
 class _ConfiguredProvider(QwenLLMProvider):
     """A role-routed provider bound to one concrete provider_id + model."""
@@ -1267,6 +1357,15 @@ class _ConfiguredProvider(QwenLLMProvider):
     def __init__(self, settings: Settings, provider_id: str, client: httpx.Client | None = None) -> None:
         super().__init__(settings, client=client)
         self.mode = provider_id
+
+    def _thinking_request_payload(self, enable_thinking: bool | None) -> dict:
+        if self.mode == "deepseek":
+            return (
+                {"thinking": {"type": "enabled" if enable_thinking else "disabled"}}
+                if enable_thinking is not None
+                else {}
+            )
+        return super()._thinking_request_payload(enable_thinking)
 
 
 def _build_role_providers(settings: Settings, client: httpx.Client | None = None) -> dict[tuple[str, str], QwenLLMProvider]:
@@ -1333,6 +1432,14 @@ class ModelRoleRouter:
                 return provider
         return None
 
+    def _feedback_fallback_provider(self, primary: LLMProvider):
+        """Return the configured Qwen reviewer fallback, if it is distinct."""
+        for provider_id in ("provider_4", "qwen"):
+            candidate = self._provider_for_id(provider_id)
+            if candidate is not None and candidate is not primary:
+                return candidate
+        return None
+
     def generate_json(self, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
         role = "WRITER" if task.startswith("writer.") else {
             "research.structure_problem": "RESEARCH",
@@ -1353,7 +1460,37 @@ class ModelRoleRouter:
         }.get(task, "GENERAL_REASONING")
         provider = self._route(role)
         self._last_provider = provider
-        return provider.generate_json(task, inputs, schema_hint, instructions)
+        try:
+            return provider.generate_json(task, inputs, schema_hint, instructions)
+        except ValueError as exc:
+            # DeepSeek's own JSON-mode documentation notes that it can
+            # occasionally return an HTTP-successful response with empty
+            # content.  Feedback must not strand an otherwise completed run on
+            # that transient provider failure.  Use the independently
+            # configured Qwen reviewer for the two blocking feedback calls.
+            if (
+                provider.mode != "deepseek"
+                or task not in {"critic.review_result", "reviewer.semantic"}
+                or not str(exc).startswith("MODEL_EMPTY_OUTPUT:")
+            ):
+                raise
+            fallback = self._feedback_fallback_provider(provider)
+            if fallback is None:
+                raise
+            result = fallback.generate_json(task, inputs, schema_hint, instructions)
+            result["deepseek_empty_output_fallback"] = True
+            result["deepseek_empty_output_error"] = str(exc)
+            metadata = getattr(fallback, "_call_state", None)
+            if metadata is not None:
+                current = dict(getattr(metadata, "metadata", {}) or {})
+                current.update({
+                    "provider_fallback_used": True,
+                    "provider_fallback_reason": str(exc),
+                    "primary_provider": "deepseek",
+                })
+                metadata.metadata = current
+            self._last_provider = fallback
+            return result
 
     def generate_json_for_provider(self, provider_id: str, task: str, inputs: dict, schema_hint: dict, instructions: str = "") -> dict:
         provider = self._provider_for_id(provider_id)

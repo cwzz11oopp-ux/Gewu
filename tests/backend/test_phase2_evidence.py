@@ -95,8 +95,45 @@ def test_fair_contract_and_three_progressive_stages_are_independent():
     assert contract["evaluation_protocol"]["same_seed_pairing"] is True
 
 
+def test_fair_contract_preserves_single_fit_logistic_regression_budget():
+    dataset = dataset_profile(inspected(["x", "label"]), {"task_type": "classification"})
+    baseline = baseline_profile({"seed": [3, 5, 7]}, {}, dataset)
+    contract = fair_experiment_contract(
+        dataset,
+        baseline,
+        {"seed": [3, 5, 7], "primary_metrics": ["roc_auc"]},
+        {
+            "method": {"components": ["LogisticRegression(solver='lbfgs')"]},
+            "parameters": {"solver": "lbfgs", "max_iter": 500},
+        },
+    )
+
+    assert contract["epochs"] == 1
+    assert contract["training_budget"] == {
+        "mode": "single_fit",
+        "fit_count": 1,
+        "max_iter": 500,
+        "runtime_passes": 1,
+    }
+
+
+def test_fair_contract_preserves_single_fit_svc_budget():
+    dataset = dataset_profile(inspected(["x", "label"]), {"task_type": "classification"})
+    baseline = baseline_profile({"seed": [3, 5, 7]}, {}, dataset)
+    contract = fair_experiment_contract(
+        dataset,
+        baseline,
+        {"seed": [3, 5, 7], "primary_metrics": ["roc_auc"]},
+        {"method": {"name": "SVC(kernel='rbf')"}, "parameters": {"max_iter": 2_000}},
+    )
+
+    assert contract["epochs"] == 1
+    assert contract["training_budget"]["mode"] == "single_fit"
+    assert contract["training_budget"]["max_iter"] == 2_000
+
+
 def test_result_analyzer_statistics_direction_and_routes_are_deterministic():
-    positive = result_evidence({1: .70, 2: .71, 3: .69, 4: .70}, {1: .80, 2: .81, 3: .79, 4: .80}, "accuracy")
+    positive = result_evidence({1: .70, 2: .71, 3: .69, 4: .70}, {1: .79, 2: .82, 3: .79, 4: .80}, "accuracy")
     assert positive["route"] == "expand_validation"
     assert positive["positive_direction_count"] == 4
     assert positive["mean_delta"] == pytest.approx(.10)
@@ -106,7 +143,7 @@ def test_result_analyzer_statistics_direction_and_routes_are_deterministic():
     assert minimized["direction"] == "minimize" and minimized["mean_delta"] > 0
     ambiguous = result_evidence({1: .70, 2: .70, 3: .70, 4: .70}, {1: .71, 2: .69, 3: .71, 4: .69}, "accuracy")
     assert ambiguous["route"] == "add_seeds"
-    negative = result_evidence({1: .8, 2: .8}, {1: .7, 2: .7}, "accuracy")
+    negative = result_evidence({1: .8, 2: .8, 3: .8}, {1: .69, 2: .70, 3: .71}, "accuracy")
     assert negative["route"] == "scientific_review"
     assert route_result(ambiguous, seed_limit_reached=True) == "scientific_review"
     assert route_result(positive, anomalies=["NaN"]) == "engineering_diagnosis"
@@ -231,3 +268,39 @@ def test_zero_variance_paired_test_never_serializes_fake_or_non_finite_p_value()
     assert evidence["paired_t_test"]["status"] == "degenerate_zero_variance"
     assert evidence["paired_t_test"]["p_value"] is None
     assert evidence["paired_t_test"]["significant"] is None
+    assert evidence["confidence_interval_95"] == []
+    assert evidence["status"] == "inconclusive"
+    assert evidence["effect_size"] is None
+
+
+def test_single_seed_is_not_stable_and_evidence_is_strict_json():
+    import json
+    evidence = result_evidence({1: .6}, {1: .7}, "auc")
+    assert evidence["status"] == "inconclusive"
+    assert evidence["paired_t_test"]["status"] == "unavailable"
+    assert evidence["confidence_interval_method"] == "unavailable"
+    assert evidence["confidence_interval_95"] == []
+    assert evidence["effect_size"] is None
+    json.dumps(evidence, allow_nan=False)
+
+
+@pytest.mark.parametrize("baseline,variant", [({1:.7, 2:.8}, {1:.9}), ({1:float('nan')}, {1:.9})])
+def test_partial_or_non_finite_pairs_do_not_produce_scientific_conclusions(baseline, variant):
+    evidence = result_evidence(baseline, variant, "auc")
+    assert evidence["status"] == "not_comparable"
+    assert evidence["route"] == "engineering_diagnosis"
+
+
+@pytest.mark.parametrize("metric", ["Brier score", "ECE", "MAE", "log_loss"])
+def test_error_metrics_use_lower_is_better(metric):
+    assert metric_direction(metric) == "minimize"
+    evidence = result_evidence({1:.20, 2:.21, 3:.22}, {1:.10, 2:.09, 3:.08}, metric)
+    assert evidence["mean_delta"] > 0
+    assert evidence["status"] == "positive_stable"
+
+
+def test_primary_metric_direction_uses_explicit_plan_evaluation():
+    contract = fair_experiment_contract({}, {}, {"primary_metrics": ["custom_score"]}, {
+        "parameters": {"epochs": 5}, "evaluations": [{"metric": "custom_score", "direction": "minimize"}],
+    })
+    assert contract["primary_metric_direction"] == "minimize"

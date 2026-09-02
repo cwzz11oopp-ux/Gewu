@@ -9,6 +9,7 @@ from backend.app.models.experiment import ExperimentBundle
 from backend.app.workflow.dataset_catalog import dataset_card, normalize_dataset_name
 from backend.app.workflow.dataset_inspection import contract_canonical_name
 from backend.app.workflow.experiment_harness import compile_bundle_runtime_contract
+from backend.app.workflow.serial_iteration import apply_source_edits
 
 
 _BUNDLE_TRANSPORT_INSTRUCTIONS = (
@@ -280,6 +281,16 @@ class ExperimentAgent:
                 _result_contract_instructions(plan_metrics or ["test_accuracy"]),
             ) if part
         )
+        serial_base = bool(implementation_base and implementation_base.get("kind") == "serial_optimization")
+        parameters_changed = bool(serial_base and plan.get("parameters") != implementation_base.get("parameters"))
+        patch_instructions = (
+            "For serial optimization return edits, not files. Each edit has old/new literal source "
+            "strings applied in order to implementation_base train.py. old must match exactly once. "
+            "Use small local edits for the accepted Plan; preserve unrelated implementation. "
+            "Do not return a full replacement file. Return requirements only if dependencies change."
+            " An empty edits array is allowed only when accepted runtime parameters changed and "
+            "the inherited source already reads those parameters; never add a meaningless source edit."
+        )
         raw = self.llm_provider.generate_json(
             "experiment.generate_bundle",
             {
@@ -294,11 +305,12 @@ class ExperimentAgent:
                 },
                 "dataset_card": card,
                 "observed_structure": self._observed_structure_for(plan, task),
-                # A PIVOT may reuse a previously audited implementation as a
-                # read-only source base. The model still returns a full bundle.
+                # PIVOTs may use a source base; serial optimization returns
+                # exact edits, which the backend applies to this audited base.
                 "implementation_base": deepcopy(implementation_base or {}),
             },
-            {
+            ({"edits": [{"old": "exact unique source fragment", "new": "replacement source fragment"}],
+              "requirements": ["existing and newly required dependencies"]} if serial_base else {
                 "files": [
                     {
                         "path": "train.py",
@@ -310,7 +322,7 @@ class ExperimentAgent:
                     }
                 ],
                 "requirements": ["numpy", "torch", "torchvision"],
-            },
+            }),
             instructions="\n\n".join(
                 part
                 for part in (
@@ -331,7 +343,7 @@ class ExperimentAgent:
                     ),
                     _CLASSIFICATION_SMOKE_INSTRUCTIONS,
                     (
-                        "PIVOT implementation rule: implementation_base is a read-only, "
+                        "Iteration implementation rule: implementation_base is a read-only, "
                         "previously audited source snapshot. Start from it and make only the "
                         "declared change_set needed by the current Plan. Preserve the loader, "
                         "split, controls, metric calculation, runtime scaffold, and result "
@@ -339,13 +351,23 @@ class ExperimentAgent:
                         if implementation_base
                         else ""
                     ),
-                    output_contract,
+                    patch_instructions + "\n" + _result_contract_instructions(plan_metrics or ["test_accuracy"])
+                    if serial_base else output_contract,
                 )
                 if part
             ),
         )
         if capture is not None:
             capture["raw_model_output"] = deepcopy(raw)
+        if serial_base:
+            try:
+                raw = apply_source_edits(implementation_base, raw, allow_unchanged=parameters_changed)
+            except ValueError as exc:
+                # Keep a complete base for the existing bounded repair path.
+                raise ExperimentBundleCandidateError(exc, {
+                    "files": deepcopy(implementation_base["files"]),
+                    "requirements": deepcopy(implementation_base["requirements"]),
+                }) from exc
         try:
             bundle = normalize_experiment_bundle(
                 _system_bundle_payload(raw, plan, task),

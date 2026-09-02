@@ -22,6 +22,8 @@ def test_compact_literature_units_respect_reference_budget():
     selected = select_units(cards, budget.max_reference_chars)
 
     assert selected
+    assert selected[0]["claim"].startswith("evidence")
+    assert selected[0]["evidence_summary"] == selected[0]["claim"]
     assert len(json.dumps(selected, ensure_ascii=False, separators=(",", ":"))) <= 700
 
 

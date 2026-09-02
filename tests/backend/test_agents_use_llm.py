@@ -57,6 +57,8 @@ class TaskRecorder:
                 "revised_abstract": "",
                 "section_revisions": [],
             }
+        if task == "writer.verify_report_audit":
+            return {"hard_failures": []}
         return {"ok": True}
 
 
@@ -78,7 +80,7 @@ def test_reasoning_agents_call_llm_provider():
     ]
     assert llm.tasks.count("writer.report_section") == 8
     assert llm.tasks.count("writer.revise_report_section") == 0
-    assert llm.tasks[-2:] == ["writer.report_abstract", "writer.audit_report"]
+    assert llm.tasks[-3:] == ["writer.report_abstract", "writer.audit_report", "writer.verify_report_audit"]
 
 
 def test_feedback_schemas_separate_scientific_verdict_from_workflow_decision():

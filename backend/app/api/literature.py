@@ -57,10 +57,18 @@ def build_router(deps) -> APIRouter:
                 status_code=502,
                 detail={"code": "LITERATURE_SEARCH_FAILED", "message": str(exc)},
             ) from exc
+        results = []
+        for card in cards:
+            payload = card.model_dump(mode="json")
+            # Transitional response alias for callers that still consume the
+            # former field name. It is derived from the canonical abstract so
+            # the two values can never diverge in storage.
+            payload["claim"] = payload.get("abstract") or ""
+            results.append(payload)
         return {
             "query": query.strip(),
             "provider": deps.literature_provider.provider_name,
-            "results": [card.model_dump(mode="json") for card in cards],
+            "results": results,
         }
 
     @router.get("/api/literature/documents/{paper_id}")

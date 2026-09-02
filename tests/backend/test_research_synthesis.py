@@ -42,6 +42,22 @@ def test_synthesis_uses_every_verified_card_and_links_future_work_to_gap():
     assert synthesis_prompt_context(synthesis)["source_collection"]["paper_count"] == 3
 
 
+def test_synthesis_accepts_legacy_claim_text_without_losing_provenance():
+    synthesis = build_research_synthesis([
+        {
+            "title": "Legacy evidence card",
+            "url": "https://example.test/legacy",
+            "verified": True,
+            "claim": "A limitation remains unresolved. Future work should test sea-clutter transfer.",
+        }
+    ])
+
+    assert synthesis["claims"]
+    assert synthesis["limitations"]
+    assert synthesis["future_work"]
+    assert synthesis["claims"][0]["paper_id"] == synthesis["papers"][0]["paper_id"]
+
+
 def test_candidate_provenance_is_derived_only_from_persisted_gap_ids():
     synthesis = build_research_synthesis([
         {
@@ -159,3 +175,11 @@ def test_legacy_synthesis_without_round_or_coverage_contract_remains_unavailable
     assert context["gap_processing"]["total_gap_count"] == 0
     assert candidate["provenance_status"] == "unavailable"
     assert candidate["source_paper_ids"] == []
+
+
+def test_claim_extraction_and_synthesis_share_canonical_paper_ids():
+    from backend.app.workflow.evidence_pipeline import _paper_id
+    from backend.app.workflow.research_synthesis import stable_paper_id
+    paper = {"title": "A source", "identifiers": {"doi": " 10.1000/ABC "}}
+    normalized = {"title": "A source", "identifiers": {"doi": "10.1000/abc"}}
+    assert _paper_id(paper, 0) == stable_paper_id(paper) == stable_paper_id(normalized)

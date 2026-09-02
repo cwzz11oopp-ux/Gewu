@@ -1,8 +1,11 @@
 from docx import Document
+from io import BytesIO
+import pytest
 
 from backend.app.models.artifact import Artifact
 from backend.app.report_visualization import build_report_spec, render_figure_png
 from backend.app.reporting import FIGURE_SECTION, build_report_docx
+from backend.app.workflow.research_synthesis import stable_paper_id
 
 
 def artifact(kind: str, content: dict, identifier: str) -> Artifact:
@@ -16,6 +19,48 @@ def artifact(kind: str, content: dict, identifier: str) -> Artifact:
         source_step=kind,
         created_by="test",
     )
+
+
+def test_seed_delta_figure_uses_the_same_error_direction_as_statistics():
+    from backend.app.report_visualization import _seed_delta_figure
+    for metric in ("mae", "brier_score", "ece"):
+        figure = _seed_delta_figure({"seed_results": [
+            {"seed": 1, "metrics": {f"baseline_{metric}": .3, f"variant_{metric}": .2}},
+            {"seed": 2, "metrics": {f"baseline_{metric}": .4, f"variant_{metric}": .2}},
+        ]}, None)
+        assert figure.chart.metric_direction == "lower"
+
+
+def test_saved_legacy_arxiv_citations_resolve_without_allowing_unknown_sources():
+    from backend.app.reporting import _render_citations
+    report = {"References": [{"title": "Existing source", "identifiers": {"arxiv": "2101.12445"}}]}
+    assert _render_citations("旧引用[PAPER-2101.12445v1]。", report) == "旧引用[1]。"
+    with pytest.raises(ValueError, match="REPORT_CITATION_UNRESOLVED"):
+        _render_citations("[PAPER-9999.12345v1]", report)
+
+
+def test_docx_renders_all_cited_references_and_saved_statistics_without_rewriting():
+    refs = [{"title": f"Source {index}", "identifiers": {"doi": f"10.1/{index}"}} for index in range(16)]
+    identifier = stable_paper_id(refs[-1])
+    report = {
+        "Paper Abstract": f"摘要引用[{identifier}]。",
+        "Narrative Sections": [{"id": "results", "title": "结果", "paragraphs": [f"论点[{identifier}]。"]}],
+        "References": refs,
+        "Report Evidence": {"deterministic_result_evidence": {
+            "metric": "AUC", "mean_delta": -.02689279047,
+            "paired_t_test": {"method": "paired_t_test", "status": "computed", "n_pairs": 3,
+                              "statistic": -3.767492203, "p_value": .06378557524},
+            "confidence_interval_95": [-.0576056, .0038200], "confidence_interval_method": "student_t",
+        }},
+    }
+    doc = Document(BytesIO(build_report_docx(report, run_id="test", run_title="test")))
+    text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
+    assert "摘要引用[16]" in text and "论点[16]" in text
+    assert "[16] Source 15" in text
+    assert "PAPER-" not in text
+    tables = "\n".join(cell.text for table in doc.tables for row in table.rows for cell in row.cells)
+    assert "0.06378557524" in tables and "-3.767492203" in tables
+    assert "0.227" not in tables
 
 
 def test_report_spec_uses_persisted_values_and_never_invents_training_curve():

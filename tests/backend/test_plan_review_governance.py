@@ -21,6 +21,7 @@ from backend.app.workflow.plan_review_governance import (
     PlanReviewPolicyIntegrityError,
     adjudicate_review,
     canonical_sha256,
+    deterministic_fix_map,
     fix_map_issues,
     is_plan_governance_accepted,
 )
@@ -544,22 +545,11 @@ def test_fix_map_still_rejects_unknown_unrelated_and_unchanged_fields(
     assert any(code in item for item in issues)
 
 
-def test_one_bounded_fix_map_repair_creates_one_revision_candidate(tmp_path):
+def test_deterministic_fix_map_creates_one_revision_candidate(tmp_path):
     class RepairOnceLLM(BoundedReviewLLM):
         def generate_json(self, task, inputs, schema_hint, instructions=""):
             if task == "planning.revise_from_review":
                 self.calls.append((task, deepcopy(inputs), instructions))
-                if inputs.get("fix_map_repair") is True:
-                    assert inputs["open_validated_blocker_ids"] == ["PRI-control"]
-                    assert inputs["allowed_canonical_fields_by_blocker"] == {
-                        "PRI-control": ["additional_sections"]
-                    }
-                    assert "additional_sections" in inputs[
-                        "actual_changed_contract_fields"
-                    ]
-                    return {
-                        "fix_map": {"PRI-control": ["additional_sections"]}
-                    }
                 self.revision_count += 1
                 return {
                     **deepcopy(inputs["current_candidate"]),
@@ -590,7 +580,7 @@ def test_one_bounded_fix_map_repair_creates_one_revision_candidate(tmp_path):
     revision_calls = [
         call for call in llm.calls if call[0] == "planning.revise_from_review"
     ]
-    assert len(revision_calls) == 2
+    assert len(revision_calls) == 1
     assert len(candidates) == 2
     assert candidates[-1].content["revision_attempt"] == 1
     assert candidates[-1].content["normalized_plan"]["fix_map"] == {
@@ -599,13 +589,11 @@ def test_one_bounded_fix_map_repair_creates_one_revision_candidate(tmp_path):
     assert is_plan_governance_accepted(completed.artifacts)
 
 
-def test_two_invalid_fix_maps_stop_recoverably_without_candidate_or_budget(tmp_path):
+def test_invalid_model_fix_map_is_derived_from_actual_changes(tmp_path):
     class InvalidRepairLLM(BoundedReviewLLM):
         def generate_json(self, task, inputs, schema_hint, instructions=""):
             if task == "planning.revise_from_review":
                 self.calls.append((task, deepcopy(inputs), instructions))
-                if inputs.get("fix_map_repair") is True:
-                    return {"fix_map": {"PRI-control": ["procedure"]}}
                 self.revision_count += 1
                 return {
                     **deepcopy(inputs["current_candidate"]),
@@ -614,25 +602,26 @@ def test_two_invalid_fix_maps_stop_recoverably_without_candidate_or_budget(tmp_p
                 }
             return super().generate_json(task, inputs, schema_hint, instructions)
 
-    llm = InvalidRepairLLM([_review(_issue())])
+    llm = InvalidRepairLLM([
+        _review(_issue()),
+        _review(_issue(status="CLOSED"), verdict="ACCEPT", closed=("PRI-control",)),
+    ])
     repo, engine, run = _ready_engine(tmp_path, llm)
-    orchestrator = WorkflowOrchestrator(repo, lambda: engine)
-
-    orchestrator._drive(run.id)
-
-    stopped = repo.get_run(run.id)
+    completed = engine.run_step(run.id, "research_plan")
     candidates = [
         item
-        for item in stopped.artifacts
+        for item in completed.artifacts
         if item.type == "research_plan_candidate"
     ]
     revision_calls = [
         call for call in llm.calls if call[0] == "planning.revise_from_review"
     ]
-    assert stopped.status == "RECOVERABLE_PROVIDER_ERROR"
-    assert len(revision_calls) == 2
-    assert len(candidates) == 1
-    assert candidates[0].content["revision_attempt"] == 0
+    assert len(revision_calls) == 1
+    assert len(candidates) == 2
+    assert candidates[-1].content["normalized_plan"]["fix_map"] == {
+        "PRI-control": ["additional_sections"]
+    }
+    assert is_plan_governance_accepted(completed.artifacts)
 
 
 def test_production_supervisor_reviewer_cannot_adjudicate_research_plan(tmp_path):
@@ -1307,6 +1296,65 @@ def test_revision_patch_schema_ignores_unknown_fields_and_falls_back_when_empty(
     assert "fix_map" in full
 
 
+def test_deterministic_fix_map_uses_verified_changed_fields_only():
+    blockers = [
+        _issue("PRI-a", field="comparisons"),
+        _issue("PRI-b", field="dataset_identity"),
+    ]
+
+    actual = deterministic_fix_map(
+        blockers,
+        changed_fields=("comparisons", "dataset", "objective"),
+    )
+
+    assert actual == {"PRI-a": ["comparisons"], "PRI-b": ["dataset"]}
+
+
+def test_backend_owned_seed_feedback_cannot_block_plan_acceptance(tmp_path):
+    llm = BoundedReviewLLM([_review(_issue(field="seeds"))])
+    repo, engine, run = _ready_engine(tmp_path, llm)
+
+    completed = engine.run_step(run.id, "research_plan")
+
+    assert any(item.type == "plan" for item in completed.artifacts)
+    review = next(item for item in completed.artifacts if item.type == "plan_review")
+    issue = review.content["issues"][0]
+    assert issue["severity"] == "WARNING"
+    assert issue["backend_owned_fields_ignored"] == ["seeds"]
+
+
+def test_revision_derives_fix_map_without_a_second_model_call(tmp_path):
+    class MissingFixMapLLM(BoundedReviewLLM):
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            if task == "planning.revise_from_review":
+                self.calls.append((task, deepcopy(inputs), instructions))
+                self.revision_count += 1
+                return {
+                    "additional_sections": {
+                        "bounded_revision": self.revision_count,
+                    }
+                }
+            return super().generate_json(task, inputs, schema_hint, instructions)
+
+    llm = MissingFixMapLLM([
+        _review(_issue()),
+        _review(_issue(status="CLOSED"), verdict="ACCEPT"),
+    ])
+    repo, engine, run = _ready_engine(tmp_path, llm)
+
+    completed = engine.run_step(run.id, "research_plan")
+
+    revision_calls = [task for task, *_ in llm.calls if task == "planning.revise_from_review"]
+    assert revision_calls == ["planning.revise_from_review"]
+    candidate = [
+        item for item in completed.artifacts
+        if item.type == "research_plan_candidate" and item.content["round_index"] == 2
+    ][0]
+    assert candidate.content["normalized_plan"]["fix_map"] == {
+        "PRI-control": ["additional_sections"]
+    }
+
+
 def test_backend_preregisters_seeds_before_plan_review_and_reuses_them(tmp_path):
     llm = BoundedReviewLLM([_review(verdict="ACCEPT")])
     repo, engine, run = _ready_engine(tmp_path, llm)
@@ -1344,3 +1392,24 @@ def test_backend_preregisters_seeds_before_plan_review_and_reuses_them(tmp_path)
     )
     assert reused.id == contracts[0].id
     assert reused.content["seeds"] == seeds
+
+
+def test_backend_preregisters_explicit_seeds_from_string_constraint(tmp_path):
+    llm = BoundedReviewLLM([_review(verdict="ACCEPT")])
+    repo, engine, run = _ready_engine(tmp_path, llm)
+    stored = repo.get_run(run.id)
+    stored.research_constraints = {
+        "seed_policy": "exactly 3 fixed paired seeds: 101, 202, 303",
+    }
+    repo.save_run(stored)
+
+    completed = engine.run_step(run.id, "research_plan")
+    contract = next(
+        item for item in completed.artifacts
+        if item.type == "execution_seed_contract"
+    )
+    final_plan = next(item for item in completed.artifacts if item.type == "plan")
+
+    assert contract.content["seeds"] == [101, 202, 303]
+    assert contract.content["allocation"] == "user_preregistered"
+    assert final_plan.content["seeds"] == [101, 202, 303]

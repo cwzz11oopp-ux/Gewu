@@ -428,6 +428,10 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .hypothesis-row.is-selected { border-color: var(--gew-blue); background: #f8faff; }
 .hypothesis-row-main { display: grid; grid-template-columns: 28px minmax(0,1fr) 54px; align-items: start; gap: 8px; }
 .hypothesis-row-main p { min-width: 0; margin: 1px 0; overflow-wrap: anywhere; font-size: 10px; line-height: 1.65; }
+.candidate-method { display: grid; gap: 6px; margin: 10px 0 0; padding: 8px; border-radius: 4px; background: #f5f7fb; }
+.candidate-method div { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 7px; }
+.candidate-method dt { color: #68758b; font-size: 9px; }
+.candidate-method dd { margin: 0; color: #35445c; font-size: 9px; line-height: 1.55; overflow-wrap: anywhere; }
 .hypothesis-state { color: var(--gew-blue); font-size: 9px; text-align: right; }.status-refuted .hypothesis-state { color: var(--gew-red); }.status-partial .hypothesis-state { color: var(--gew-orange); }.status-selected .hypothesis-state { color: var(--gew-green); }
 .score-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 12px; }
 .idea-score { display: grid; justify-items: center; gap: 5px; padding: 8px 4px; background: #f2f3f4; }

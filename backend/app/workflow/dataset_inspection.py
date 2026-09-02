@@ -3,10 +3,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
-from backend.app.workflow.dataset_catalog import dataset_card, dataset_display_name, normalize_dataset_name
+from backend.app.workflow.dataset_catalog import (
+    canonical_dataset_name_from_text, dataset_card, dataset_display_name,
+    dataset_name_in_text, dataset_spec, normalize_dataset_name, supported_dataset_names,
+)
 
 
 SUPPORTED_TABULAR_SUFFIXES = {".csv", ".tsv"}
@@ -58,6 +62,83 @@ def resolve_dataset_directory(value: str) -> Path:
     if not path.is_dir():
         raise DatasetInspectionError(f"DATASET_DIRECTORY_NOT_FOUND:{path}")
     return path
+
+
+def _directory_dataset_names(path: Path) -> set[str]:
+    names = {path.name, re.sub(r"[\s_-]*dataset$", "", path.name, flags=re.I)} - {""}
+    for canonical in supported_dataset_names():
+        marker = Path(dataset_spec(canonical).marker).parts[0]
+        if path.name.casefold() == marker.casefold() or normalize_dataset_name(path.name) == canonical:
+            names.add(canonical)
+    return names
+
+
+def resolve_local_dataset_directory(
+    value: str, problem: str = "", constraints: str = ""
+) -> tuple[Path, str]:
+    """Bind one concrete directory; never silently bind a shared dataset cache."""
+    root = resolve_dataset_directory(value)
+
+    def matches(path: Path, text: str) -> bool:
+        return any(dataset_name_in_text(text, name) for name in _directory_dataset_names(path))
+
+    def has_data_files(path: Path) -> bool:
+        return any(
+            item.is_file()
+            and not item.name.startswith(".")
+            and item.suffix.casefold() not in {".md", ".zip", ".names"}
+            and not item.name.casefold().endswith(".tar.gz")
+            for item in path.iterdir()
+        )
+
+    canonical = canonical_dataset_name_from_text(problem) or canonical_dataset_name_from_text(constraints)
+    children = [path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")]
+    selected = None
+    for text in (problem, constraints):
+        if not text:
+            continue
+        if root.name.casefold() not in {"data", "dataset", "datasets", "cache"} and matches(root, text):
+            selected = root
+            break
+        candidates = [path for path in children if matches(path, text)]
+        if len(candidates) > 1:
+            raise DatasetInspectionError(
+                "DATASET_DIRECTORY_AMBIGUOUS:" + ",".join(sorted(str(path) for path in candidates))
+            )
+        if candidates:
+            selected = candidates[0]
+            break
+    if selected is None:
+        if canonical:
+            raise DatasetInspectionError(f"DATASET_SELECTED_DIRECTORY_NOT_FOUND:{canonical}:under={root}")
+        if root.name.casefold() in {"data", "dataset", "datasets", "cache"} and (
+            not has_data_files(root)
+            or any(path.name.casefold() not in {"train", "test", "val", "validation", "raw", "processed"} for path in children)
+        ):
+            raise DatasetInspectionError(f"DATASET_DIRECTORY_SELECTION_REQUIRED:{root}")
+        selected = root  # An explicitly configured custom dataset remains supported.
+
+    # Some downloads wrap the real dataset in one same-named directory (UCI HAR).
+    # Only unwrap that exact name, never an arbitrary train/test/raw subdirectory.
+    if not has_data_files(selected):
+        nested = [
+            path for path in selected.iterdir()
+            if path.is_dir() and any(matches(path, name) for name in _directory_dataset_names(selected))
+        ]
+        if len(nested) > 1:
+            raise DatasetInspectionError(f"DATASET_DIRECTORY_AMBIGUOUS:{selected}")
+        if nested:
+            selected = nested[0]
+    selected = selected.resolve()
+    if selected != root and not selected.is_relative_to(root):
+        raise DatasetInspectionError(f"DATASET_DIRECTORY_OUTSIDE_CONFIGURED_ROOT:{selected}")
+    # A comparison mentioned in the question must not relabel a custom dataset.
+    canonical = next((
+        name for name in supported_dataset_names()
+        if matches(selected, name)
+        and (dataset_name_in_text(problem, name) or dataset_name_in_text(constraints, name))
+    ), "")
+    return selected, canonical
 
 
 def inspect_dataset_directory(
@@ -183,6 +264,11 @@ def dataset_option(profile: dict[str, Any]) -> dict[str, Any]:
         "schemas": profile["schemas"],
         "observed_structure": profile.get("observed_structure") or [],
         "limitations": profile["limitations"],
+        "loader": (
+            "Read the verified relative file paths beneath os.environ['DATA_ROOT']. "
+            "DATA_ROOT is the selected dataset directory, not a shared cache: do not "
+            "append the dataset name again, walk to a parent, or download fallback data."
+        ),
     }
     return {
         "name": canonical or profile["name"],

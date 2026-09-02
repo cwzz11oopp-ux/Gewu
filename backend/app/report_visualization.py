@@ -16,6 +16,8 @@ from typing import Any, Literal
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
+from backend.app.workflow.phase2_evidence import metric_direction
+
 
 class ChartSeries(BaseModel):
     name: str
@@ -382,7 +384,7 @@ def _seed_delta_figure(result: dict[str, Any], result_artifact: Any) -> FigureSp
         float(metrics[experiment_key]) - float(metrics[baseline_key])
         for metrics in metric_maps
     ]
-    direction = "lower" if any(token in _normalized_metric_name(metric_name) for token in ("loss", "error")) else "higher"
+    direction = "lower" if metric_direction(metric_name) == "minimize" else "higher"
     return FigureSpec(
         figure_id="seed_delta",
         kind="seed_delta",

@@ -54,16 +54,15 @@ from backend.app.workflow.idea_selection import (
     weighted_score,
 )
 from backend.app.workflow.dataset_catalog import (
-    canonical_dataset_name_from_text,
     dataset_card,
     dataset_display_name,
-    dataset_spec,
     normalize_dataset_name,
 )
 from backend.app.workflow.dataset_inspection import (
     contract_canonical_name,
     dataset_option,
     inspect_dataset_directory,
+    resolve_local_dataset_directory,
 )
 from backend.app.workflow.research_constraints import normalize_constraints
 from backend.app.workflow.phase2_evidence import (
@@ -110,6 +109,7 @@ from backend.app.workflow.plan_contract import (
     authoritative_plan_contract,
     canonical_training_epochs,
     canonical_contract_field,
+    execution_training_budget,
     merge_plan_patch,
     normalize_plan,
 )
@@ -117,9 +117,9 @@ from backend.app.workflow.plan_review_governance import (
     GOVERNANCE_IMPLEMENTATION_SEMANTIC_VERSION,
     PlanReviewPolicyIntegrityError,
     adjudicate_review,
-    canonicalize_fix_map,
     canonical_sha256,
     changed_contract_fields,
+    deterministic_fix_map,
     fix_map_issues,
     freeze_plan_review_recovery,
     freeze_plan_governance_migration,
@@ -137,6 +137,10 @@ from backend.app.workflow.policies import (
     normalize_feedback_verdict,
 )
 from backend.app.workflow.research_state import build_research_state
+from backend.app.workflow.serial_iteration import (
+    build_iteration_memory, continuation_stop, direction_issues,
+    freeze_iteration_policy, implementation_base, prompt_memory, trial_signature,
+)
 from backend.app.workflow.knowledge import (
     KnowledgeIntegrationService,
 )
@@ -583,6 +587,13 @@ class WorkflowEngine:
             self.repository.add_artifact(
                 run_id, "problem", "Structured Problem", content, step_id, self.research_agent.name
             )
+            if not any(a.type == "iteration_policy" for a in run.artifacts):
+                iteration_policy_artifact = self.repository.add_artifact(
+                    run_id, "iteration_policy", "Frozen Iteration Policy",
+                    freeze_iteration_policy(content, run.problem_input, self.max_feedback_iterations),
+                    "iteration_policy", "Workflow Engine",
+                )
+                self.repository.lock_artifact(run_id, iteration_policy_artifact.id, True)
             self._trace(
                 run_id,
                 step_id,
@@ -1324,7 +1335,7 @@ class WorkflowEngine:
                     provider_mode=self.llm_provider.mode,
                     fallback_used=self.llm_provider.fallback,
                 )
-                if canonical_training_epochs(candidate) is None:
+                if execution_training_budget(candidate) is None:
                     candidate.setdefault("_validation_issues", []).append(
                         "MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED"
                     )
@@ -1361,7 +1372,7 @@ class WorkflowEngine:
                     )
                     or ""
                 )
-                candidate = (
+                migrated_candidate = (
                     normalize_plan(
                         deepcopy(existing_final_plan.content or {}),
                         selection,
@@ -1369,11 +1380,32 @@ class WorkflowEngine:
                         fallback_used=self.llm_provider.fallback,
                     )
                     if existing_final_plan is not None and migration_id
-                    else build_plan(None)
+                    else None
                 )
+                # A legacy final plan predating the executable training-budget
+                # contract remains provenance, not an executable candidate. Ask
+                # the planner for a current contract instead of inventing epochs
+                # or failing before governance can migrate the run.
+                if (
+                    migrated_candidate is not None
+                    and execution_training_budget(migrated_candidate) is not None
+                ):
+                    candidate = migrated_candidate
+                elif migrated_candidate is not None:
+                    candidate = normalize_plan(
+                        merge_plan_patch(
+                            build_plan(None),
+                            deepcopy(existing_final_plan.content or {}),
+                        ),
+                        selection,
+                        provider_mode=self.llm_provider.mode,
+                        fallback_used=self.llm_provider.fallback,
+                    )
+                else:
+                    candidate = build_plan(None)
                 candidate["seeds"] = list(execution_seeds)
                 structural_issues = list(candidate.pop("_validation_issues", []) or [])
-                if canonical_training_epochs(candidate) is None:
+                if execution_training_budget(candidate) is None:
                     structural_issues.append("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
                 structural_decision = self.supervisor_agent.validate(step_id, candidate)
                 structural_issues.extend(structural_decision.issues)
@@ -1436,8 +1468,11 @@ class WorkflowEngine:
             plan["accepted_candidate_payload_sha256"] = canonical_sha256(
                 (plan_candidate.content or {}).get("normalized_plan") or {}
             )
-            frozen_training_epochs = self._frozen_model_training_epochs(run_id)
-            if frozen_training_epochs is not None and canonical_training_epochs(plan) != frozen_training_epochs:
+            frozen_training_budget = self._frozen_model_training_budget(run_id)
+            if (
+                frozen_training_budget is not None
+                and execution_training_budget(plan) != frozen_training_budget
+            ):
                 raise ValueError("MODEL_TRAINING_BUDGET_CHANGED_DURING_ITERATION")
             plan_artifact = self.repository.add_artifact(
                 run_id, "plan", "Research Plan", plan, step_id,
@@ -1514,10 +1549,11 @@ class WorkflowEngine:
                 experiment_plan,
                 plan_artifact_id=latest["plan"].id,
             )
-            experiment_plan = self._with_frozen_training_epochs(
-                experiment_plan,
-                int(training_budget_contract.content["epochs"]),
-            )
+            if (training_budget_contract.content or {}).get("mode") == "epochs":
+                experiment_plan = self._with_frozen_training_epochs(
+                    experiment_plan,
+                    int(training_budget_contract.content["epochs"]),
+                )
             # Reuse the preregistered backend seed contract that plan governance
             # already reviewed.  Never resample seeds at execution time.
             execution_seed_artifact = self._ensure_backend_execution_seed_contract(
@@ -1559,6 +1595,15 @@ class WorkflowEngine:
             pivot_base = self._pivot_implementation_base(
                 run.artifacts, experiment_plan
             )
+            serial_reference = (experiment_plan.get("iteration_contract") or {}).get("implementation_reference")
+            pending_proposal = latest.get("plan_refinement_proposal")
+            if pending_proposal:
+                expected_reference = ((pending_proposal.content.get("normalized_plan") or {}).get("iteration_contract") or {}).get("implementation_reference")
+                if expected_reference and serial_reference != expected_reference:
+                    raise ValueError("ITERATION_BASE_REFERENCE_CHANGED_DURING_REVIEW")
+            if serial_reference:
+                pivot_base = implementation_base(run.artifacts, serial_reference)
+                base_task["implementation_base_reference"] = deepcopy(serial_reference)
 
             def build_experiment(revision):
                 nonlocal previous_bundle, previous_candidate, frozen_contract
@@ -1595,6 +1640,7 @@ class WorkflowEngine:
                         and previous_candidate is None
                         and formal_validation
                         and reusable_bundle_artifact is not None
+                        and not serial_reference
                     ):
                         reused = ExperimentBundle.model_validate(
                             reusable_bundle_artifact.content
@@ -1632,7 +1678,7 @@ class WorkflowEngine:
                             experiment_id,
                             experiment_plan,
                             task,
-                            instructions,
+                            self._with_revision(instructions, revision),
                             python_command,
                             require_smoke_test=True,
                             validate=False,
@@ -1673,7 +1719,7 @@ class WorkflowEngine:
                     # A malformed repair is audit evidence, not a replacement
                     # for the last complete Bundle.  Only an initial malformed
                     # generation needs its raw candidate as the next repair base.
-                    if previous_bundle is None:
+                    if previous_bundle is None and not str(exc).startswith("EXPERIMENT_CODE_ITERATION_PATCH_INVALID"):
                         previous_candidate = failed_candidate
                         if frozen_contract is None:
                             frozen_contract = self.experiment_agent.frozen_contract_from_candidate(
@@ -2373,6 +2419,11 @@ class WorkflowEngine:
             iteration = max(run.feedback_iteration, historical_iteration) + 1
             active_hypothesis = self._feedback_hypothesis(latest)
             current_plan = latest["plan"].content
+            iteration_memory = build_iteration_memory(run.artifacts)
+            optimizing = iteration_memory.get("enabled") is True
+            retained_best = iteration_memory.get("best") if optimizing else None
+            research_context = prompt_memory(iteration_memory) if optimizing else None
+            optimization_stop = continuation_stop(iteration_memory, iteration, self.max_feedback_iterations) if optimizing else ""
             deterministic_evidence = (
                 deepcopy(latest["result_evidence"].content)
                 if latest.get("result_evidence") else {}
@@ -2404,6 +2455,13 @@ class WorkflowEngine:
             claim_instructions = self._with_output_language(
                 claim_instructions, output_language
             )
+            if optimizing:
+                claim_instructions += (
+                    "\nThe frozen goal is optimization. Keep the honest hypothesis verdict separate "
+                    "from whether another experiment is useful. supported does not by itself end "
+                    "this goal. Never require extra rounds merely to satisfy a round count. Use the "
+                    "bounded research_context history and preserve negative findings."
+                )
 
             def review_result(revision):
                 candidate = self.critic_agent.review_result(
@@ -2412,6 +2470,7 @@ class WorkflowEngine:
                     plan=current_plan,
                     analysis=result_analysis,
                     audit=result.get("audit") or {},
+                    **({"research_context": research_context} if optimizing else {}),
                     instructions=self._with_revision(claim_instructions, revision),
                 )
                 candidate.setdefault(
@@ -2440,7 +2499,7 @@ class WorkflowEngine:
                     in {"REPORT", "STOP", "TERMINATE", "FINALIZE", "REVISE", "PIVOT"}
                     else "MISSING_OR_INVALID_DECISION"
                 )
-                if verdict == "supported":
+                if verdict == "supported" and not optimizing:
                     decision = "REPORT"
                     route_reason = "VERDICT_SUPPORTED"
                 elif iteration >= self.max_feedback_iterations:
@@ -2482,6 +2541,7 @@ class WorkflowEngine:
                 "audit": result.get("audit") or {},
                 "output_language": output_language,
                 "research_constraints_reference": {"artifact_id": run.research_constraints_artifact_id or "", "schema_version": 1},
+                **({"research_context": research_context} if optimizing else {}),
             }
             feedback = self._produce_validated(
                 run_id,
@@ -2543,7 +2603,7 @@ class WorkflowEngine:
                 if not any(token in str(exc) for token in (
                     "DEEPSEEK", "SECONDARY_REVIEW_UNAVAILABLE", "MODEL_REQUEST_",
                     "MODEL_PROVIDER_CONFIG_ERROR", "JSONDecodeError",
-                    "SCIENTIFIC_ANALYSIS_",
+                    "SCIENTIFIC_ANALYSIS_", "MODEL_EMPTY_OUTPUT",
                 )):
                     raise
                 deepseek_analysis = unavailable_secondary_review(str(exc))
@@ -2593,6 +2653,17 @@ class WorkflowEngine:
             )
             feedback["scientific_conclusion_id"] = conclusion_artifact.id
             feedback["hypothesis_evolution_decision_id"] = evolution_artifact.id
+            if optimizing:
+                feedback["research_context"] = research_context
+                feedback["scientific_synthesis"] = deepcopy(synthesis)
+                feedback["scientific_disagreement"] = deepcopy(disagreement)
+                if optimization_stop:
+                    route_to_report(feedback, optimization_stop)
+                else:
+                    # Direction selection, below, is the final continuation
+                    # decision and sees both independent scientific analyses.
+                    # This provisional flag is never saved as a final decision.
+                    feedback["requires_follow_up"] = True
             working_hypothesis = None
             if feedback["requires_follow_up"] and evolution["create_working_hypothesis"]:
                 working_hypothesis = build_working_hypothesis(
@@ -2662,6 +2733,16 @@ class WorkflowEngine:
                     ),
                     output_language,
                 )
+                if optimizing:
+                    direction_instructions += (
+                        "\nDecide whether the frozen optimization goal has a useful next experiment "
+                        "AFTER reading feedback.scientific_synthesis and research_context. Do not "
+                        "copy the provisional review decision. supported is not a stop condition. "
+                        "REPORT is valid at any round. A continuation must cite exact source_result_ids, "
+                        "name the measured result_basis, and be one of the compared candidates. "
+                        "Never claim a high AUC alone proves leakage, or a drop after changing splits "
+                        "proves its cause. Treat those as hypotheses to test."
+                    )
                 direction = {}
                 for direction_attempt in range(3):
                     direction = self._normalize_iteration_direction(
@@ -2677,6 +2758,8 @@ class WorkflowEngine:
                     direction_issues = self._iteration_direction_issues(
                         direction, output_language
                     )
+                    if optimizing:
+                        direction_issues.extend(self._serial_direction_issues(direction, iteration_memory))
                     if not direction_issues:
                         break
                     direction_instructions += (
@@ -2729,6 +2812,19 @@ class WorkflowEngine:
                     feedback["decision"] = direction_decision
                     feedback["route_reason"] = "EVIDENCE_GROUNDED_DIRECTION"
                     feedback["requires_follow_up"] = True
+                    if optimizing:
+                        feedback["required_revision"] = (
+                            str(direction["selected_direction"].get("problem_addressed") or "")
+                            + ": " + str(direction["selected_direction"].get("changed_variable") or "")
+                        )
+                        proposal = direction.get("proposed_hypothesis") or {}
+                        if direction_decision == "PIVOT" and proposal.get("claim") and not working_hypothesis:
+                            working_hypothesis = build_working_hypothesis(
+                                parent_hypothesis_id=conclusion["hypothesis_id"],
+                                parent_claim=conclusion["claim"], proposal=proposal,
+                                derived_from=conclusion["derived_from"],
+                                reason=direction["selection_reason"], revision=iteration,
+                            )
                 if feedback["requires_follow_up"] and direction["next_action"] and (
                     query_specs or not feedback.get("next_action")
                 ):
@@ -2759,14 +2855,14 @@ class WorkflowEngine:
                         derived_from=list(
                             (working_hypothesis or {}).get("derived_from") or []
                         ),
-                        base_plan_artifact_id=latest["plan"].id,
+                        base_plan_artifact_id=retained_best["plan_id"] if retained_best else latest["plan"].id,
                         base_experiment_task_id=(
-                            latest.get("experiment_task").id
+                            retained_best["task_id"] if retained_best else latest.get("experiment_task").id
                             if latest.get("experiment_task")
                             else ""
                         ),
                         base_bundle_id=(
-                            latest.get("experiment_bundle").id
+                            retained_best["bundle_id"] if retained_best else latest.get("experiment_bundle").id
                             if latest.get("experiment_bundle")
                             else ""
                         ),
@@ -2805,10 +2901,25 @@ class WorkflowEngine:
                     refinement_instructions = self._with_output_language(
                         refinement_instructions, output_language
                     )
+                    refinement_base = current_plan
+                    best = retained_best
+                    if best:
+                        refinement_base = next(a.content for a in run.artifacts if a.id == best["plan_id"])
+                        feedback["implementation_reference"] = {
+                            key: best[key] for key in
+                            ("result_id", "plan_id", "task_id", "bundle_id", "bundle_sha256", "protocol_key")
+                        }
+                        feedback["latest_trial_plan"] = current_plan
+                        refinement_instructions += (
+                            "\ncurrent_plan is the retained best implementation, not necessarily the "
+                            "latest trial. experiment_result is the latest observation; never attribute "
+                            "its metrics to the base. Inherit current_plan and implement only the selected "
+                            "change. Use research_context and scientific_synthesis in feedback."
+                        )
                     revised_plan = normalize_plan(
                         self.planning_agent.refine_plan(
                             selection,
-                            current_plan,
+                            refinement_base,
                             result,
                             feedback,
                             instructions=refinement_instructions,
@@ -2821,13 +2932,14 @@ class WorkflowEngine:
                         provider_mode=self.llm_provider.mode,
                         fallback_used=self.llm_provider.fallback,
                     )
-                    frozen_training_epochs = self._frozen_model_training_epochs(run_id)
-                    if frozen_training_epochs is None:
+                    frozen_training_budget = self._frozen_model_training_budget(run_id)
+                    if frozen_training_budget is None:
                         raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_MISSING")
-                    revised_plan = self._with_frozen_training_epochs(
-                        revised_plan,
-                        frozen_training_epochs,
-                    )
+                    if frozen_training_budget.get("mode") == "epochs":
+                        revised_plan = self._with_frozen_training_epochs(
+                            revised_plan,
+                            int(frozen_training_budget["epochs"]),
+                        )
                     revised_plan["seeds"] = list(
                         self._ensure_backend_execution_seed_contract(
                             run_id,
@@ -2847,10 +2959,16 @@ class WorkflowEngine:
                         )
                     revised_plan["iteration_contract"] = self._build_iteration_contract(
                         iteration,
-                        current_plan,
+                        refinement_base,
                         revised_plan,
                         feedback,
                     )
+                    if optimizing and best:
+                        revised_plan["iteration_contract"]["implementation_reference"] = deepcopy(feedback["implementation_reference"])
+                    if optimizing:
+                        revised_plan["iteration_contract"]["source_result_ids"] = list(
+                            feedback["selected_direction"]["source_result_ids"]
+                        )
                     if pivot_lineage:
                         revised_plan["iteration_contract"]["hypothesis_lineage"] = pivot_lineage
                     revised_plan = self._attach_dataset_card(
@@ -2860,6 +2978,11 @@ class WorkflowEngine:
                         revised_plan["iteration_contract"].get("changed_fields")
                         or []
                     )
+                    if optimizing and trial_signature(revised_plan) in {
+                        row.get("trial_signature") for row in iteration_memory.get("history", [])
+                    }:
+                        material_changes = set()
+                        feedback["duplicate_trial_detected"] = True
                     if material_changes:
                         if working_hypothesis:
                             working_artifact = self.repository.add_artifact(
@@ -2959,6 +3082,13 @@ class WorkflowEngine:
                     parent_artifact_id=revision_artifact.id,
                 )
             state_run = self.repository.get_run(run_id)
+            if optimizing:
+                self.repository.add_artifact(
+                    run_id, "optimization_state", f"Serial Optimization State {iteration}",
+                    build_iteration_memory(state_run.artifacts), step_id, "Workflow Engine",
+                    parent_artifact_id=revision_artifact.id,
+                )
+                state_run = self.repository.get_run(run_id)
             research_state = build_research_state(state_run.artifacts)
             self.repository.add_artifact(
                 run_id,
@@ -4361,8 +4491,7 @@ class WorkflowEngine:
         blockers = [
             item
             for item in open_blockers
-            if str(item.get("blocker_class") or "") == "CLAIM_PLAN_MISMATCH"
-            and "hypotheses" in set(item.get("contract_fields") or [])
+            if "hypotheses" in set(item.get("contract_fields") or [])
         ]
         primary = str(current_plan.get("primary_claim") or "").strip()
         old_hypothesis = str(((current_plan.get("hypotheses") or [""])[0]) or "").strip()
@@ -4535,6 +4664,10 @@ class WorkflowEngine:
         return frozen
 
     def _frozen_model_training_epochs(self, run_id: str) -> int | None:
+        budget = self._frozen_model_training_budget(run_id)
+        return int(budget["epochs"]) if budget and budget.get("mode") == "epochs" else None
+
+    def _frozen_model_training_budget(self, run_id: str) -> dict | None:
         contracts = [
             artifact
             for artifact in self.repository.get_run(run_id).artifacts
@@ -4544,11 +4677,21 @@ class WorkflowEngine:
             raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_DUPLICATE")
         if not contracts:
             return None
-        raw = (contracts[0].content or {}).get("epochs")
+        budget = dict(contracts[0].content or {})
+        if budget.get("mode") == "single_fit":
+            if int(budget.get("fit_count") or 0) != 1 or int(budget.get("max_iter") or 0) < 1:
+                raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_INVALID")
+            return {
+                "mode": "single_fit",
+                "fit_count": 1,
+                "max_iter": int(budget["max_iter"]),
+                "runtime_passes": 1,
+            }
+        raw = budget.get("epochs")
         epochs = canonical_training_epochs({"parameters": {"epochs": raw}})
         if epochs is None:
             raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_INVALID")
-        return epochs
+        return {"mode": "epochs", "epochs": epochs}
 
     def _freeze_model_training_budget(
         self,
@@ -4558,10 +4701,10 @@ class WorkflowEngine:
         plan_artifact_id: str,
     ):
         """Persist the accepted model choice once; later plans may only inherit it."""
-        chosen = canonical_training_epochs(plan)
+        chosen = execution_training_budget(plan)
         if chosen is None:
             raise ValueError("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
-        existing = self._frozen_model_training_epochs(run_id)
+        existing = self._frozen_model_training_budget(run_id)
         if existing is not None:
             if chosen != existing:
                 raise ValueError("MODEL_TRAINING_BUDGET_CHANGED_DURING_ITERATION")
@@ -4576,7 +4719,7 @@ class WorkflowEngine:
             "Model-Planned Training Budget",
             {
                 "schema_version": 1,
-                "epochs": chosen,
+                **chosen,
                 "source": "accepted_model_plan",
                 "source_plan_artifact_id": plan_artifact_id,
                 "frozen_for_follow_up_experiments": True,
@@ -4844,7 +4987,11 @@ class WorkflowEngine:
             "selected_direction": deepcopy(selected) if isinstance(selected, dict) else {},
             "selection_reason": str(direction.get("selection_reason") or "").strip(),
             "next_action": str(direction.get("next_action") or "").strip(),
+            "proposed_hypothesis": deepcopy(direction.get("proposed_hypothesis"))
+            if isinstance(direction.get("proposed_hypothesis"), dict) else {},
         }
+
+    _serial_direction_issues = staticmethod(direction_issues)
 
     @staticmethod
     def _iteration_direction_issues(
@@ -5163,23 +5310,11 @@ class WorkflowEngine:
         dataset_dir = str(getattr(settings, "dataset_dir", "") or "").strip()
         if not dataset_dir:
             raise ValueError("DATASET_DIRECTORY_REQUIRED")
-        canonical = canonical_dataset_name_from_text(
-            str(getattr(run, "problem_input", "") or "")
-        ) or canonical_dataset_name_from_text(str(getattr(run, "constraints", "") or ""))
-        configured_root = Path(dataset_dir).expanduser().resolve()
-        resolved_root = configured_root
-        if canonical:
-            marker_root = Path(*dataset_spec(canonical).marker.split("/")).parts[0]
-            candidates = (
-                configured_root / marker_root,
-                configured_root / canonical.replace("-", ""),
-                configured_root / canonical,
-            )
-            resolved_root = next((path for path in candidates if path.is_dir()), configured_root)
-            if resolved_root == configured_root:
-                raise ValueError(
-                    f"DATASET_SELECTED_DIRECTORY_NOT_FOUND:{canonical}:under={configured_root}"
-                )
+        resolved_root, canonical = resolve_local_dataset_directory(
+            dataset_dir,
+            str(getattr(run, "problem_input", "") or ""),
+            str(getattr(run, "constraints", "") or ""),
+        )
         return inspect_dataset_directory(
             str(resolved_root),
             canonical_name=canonical,
@@ -5327,6 +5462,43 @@ class WorkflowEngine:
             "model_used": str(value.get("model_used") or ""),
         }
         return normalized
+
+    @staticmethod
+    def _remove_backend_owned_review_fields(review: dict) -> dict:
+        """Prevent reviewers from vetoing values only the backend may write.
+
+        Candidate plans contain preregistered concrete seeds so the accepted
+        plan and executable task share one immutable record. Those values are
+        injected after model generation, therefore a reviewer must never demand
+        that a revision changes ``seeds``. Keep such feedback visible as a
+        warning, while removing it from the repairable contract fields.
+        """
+        sanitized = deepcopy(review)
+        issues = sanitized.get("issues")
+        if not isinstance(issues, list):
+            return sanitized
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            fields = list(issue.get("contract_fields") or [])
+            retained = [
+                field
+                for field in fields
+                if canonical_contract_field(field) != "seeds"
+            ]
+            if len(retained) == len(fields):
+                continue
+            issue["contract_fields"] = retained
+            issue["backend_owned_fields_ignored"] = ["seeds"]
+            if not retained:
+                issue["severity"] = "WARNING"
+                issue["blocker_class"] = None
+                issue["required_fix"] = None
+                issue["reason"] = (
+                    str(issue.get("reason") or "")
+                    + " Concrete seeds are injected and frozen by the backend."
+                ).strip()
+        return sanitized
 
     def _execute_plan_review_governance(
         self,
@@ -5537,13 +5709,14 @@ class WorkflowEngine:
             proposal_plan = deepcopy(
                 (proposal.content or {}).get("normalized_plan") or {}
             )
-            frozen_training_epochs = self._frozen_model_training_epochs(run_id)
-            if frozen_training_epochs is None:
+            frozen_training_budget = self._frozen_model_training_budget(run_id)
+            if frozen_training_budget is None:
                 raise ValueError("MODEL_TRAINING_BUDGET_CONTRACT_MISSING")
-            proposal_plan = self._with_frozen_training_epochs(
-                proposal_plan,
-                frozen_training_epochs,
-            )
+            if frozen_training_budget.get("mode") == "epochs":
+                proposal_plan = self._with_frozen_training_epochs(
+                    proposal_plan,
+                    int(frozen_training_budget["epochs"]),
+                )
             proposal_plan["seeds"] = list(execution_seeds)
             plan_candidate = self.repository.add_artifact(
                 run_id,
@@ -5678,15 +5851,17 @@ class WorkflowEngine:
                     candidate_plan_id=plan_candidate.id,
                 )
                 try:
-                    review = self._normalize_plan_review(
-                        self.planning_agent.review_plan(
-                            review_context,
-                            runtime_contract_snapshot=frozen_policy[
-                                "review_runtime_contract_snapshot"
-                            ],
-                            schema_snapshot=frozen_policy[
-                                "review_prompt_schema_snapshot"
-                            ],
+                    review = self._remove_backend_owned_review_fields(
+                        self._normalize_plan_review(
+                            self.planning_agent.review_plan(
+                                review_context,
+                                runtime_contract_snapshot=frozen_policy[
+                                    "review_runtime_contract_snapshot"
+                                ],
+                                schema_snapshot=frozen_policy[
+                                    "review_prompt_schema_snapshot"
+                                ],
+                            )
                         )
                     )
                 except LLMRequestCancelled:
@@ -6017,11 +6192,11 @@ class WorkflowEngine:
                     provider_mode=self.llm_provider.mode,
                     fallback_used=self.llm_provider.fallback,
                 )
-                frozen_training_epochs = self._frozen_model_training_epochs(run_id)
-                if frozen_training_epochs is not None:
+                frozen_training_budget = self._frozen_model_training_budget(run_id)
+                if frozen_training_budget and frozen_training_budget.get("mode") == "epochs":
                     revised_plan = self._with_frozen_training_epochs(
                         revised_plan,
-                        frozen_training_epochs,
+                        int(frozen_training_budget["epochs"]),
                     )
                 backend_seed_changed = revised_plan.get("seeds") != execution_seeds
                 revised_plan["seeds"] = list(execution_seeds)
@@ -6061,13 +6236,6 @@ class WorkflowEngine:
                     revised_plan["fix_map"] = {
                         str(claim_alignment_blocker): ["hypotheses"]
                     }
-                revised_plan["fix_map"] = canonicalize_fix_map(
-                    revised_plan.get("fix_map"),
-                    field_registry=frozen_policy[
-                        "canonical_contract_field_registry"
-                    ],
-                    field_aliases=frozen_policy["contract_field_aliases"],
-                )
                 comparable_base = {key: plan.get(key) for key in revised_plan}
                 revision_changed_fields = changed_contract_fields(
                     comparable_base,
@@ -6077,28 +6245,18 @@ class WorkflowEngine:
                     ],
                     field_aliases=frozen_policy["contract_field_aliases"],
                 )
-                # Bound the model's per-blocker fix_map declaration to the fields
-                # that ACTUALLY changed.  Attribution (which blocker each real
-                # change serves) is still the model's; only impossible claims —
-                # fields it declared but never touched — are stripped
-                # deterministically, so an over-claim can never fail governance
-                # with PLAN_REVIEW_FIX_MAP_UNCHANGED.
-                revision_material_changes = {
-                    str(item)
-                    for item in revision_changed_fields
-                    if str(item)
-                    not in {"fix_map", "provider_mode", "fallback_used", "normalization"}
-                }
-                revised_plan["fix_map"] = {
-                    str(blocker_id): sorted(
-                        {
-                            str(field)
-                            for field in fields
-                            if str(field) in revision_material_changes
-                        }
-                    )
-                    for blocker_id, fields in revised_plan.get("fix_map", {}).items()
-                }
+                # ``fix_map`` is derived from the verified contract diff. The
+                # model no longer gets a second attempt to describe its own
+                # edits, which previously consumed revision budget without
+                # changing scientific content.
+                revised_plan["fix_map"] = deterministic_fix_map(
+                    open_blockers,
+                    changed_fields=revision_changed_fields,
+                    field_registry=frozen_policy[
+                        "canonical_contract_field_registry"
+                    ],
+                    field_aliases=frozen_policy["contract_field_aliases"],
+                )
                 revision_fix_map_issues = fix_map_issues(
                     revised_plan.get("fix_map"),
                     open_blockers=open_blockers,
@@ -6109,88 +6267,10 @@ class WorkflowEngine:
                     field_aliases=frozen_policy["contract_field_aliases"],
                 )
                 if revision_fix_map_issues:
-                    if not revision_changed_fields:
-                        raise ValueError(
-                            "MODEL_OUTPUT_VALIDATION_FAILURE:"
-                            + ";".join(revision_fix_map_issues)
-                        )
-                    allowed_fields_by_blocker = canonicalize_fix_map(
-                        {
-                            str(item.get("issue_id") or ""): list(
-                                item.get("contract_fields") or []
-                            )
-                            for item in open_blockers
-                        },
-                        field_registry=frozen_policy[
-                            "canonical_contract_field_registry"
-                        ],
-                        field_aliases=frozen_policy["contract_field_aliases"],
+                    raise ValueError(
+                        "MODEL_OUTPUT_VALIDATION_FAILURE:"
+                        + ";".join(revision_fix_map_issues)
                     )
-                    repair_payload = self.planning_agent.revise_from_review(
-                        {
-                            "fix_map_repair": True,
-                            "open_validated_blocker_ids": list(open_ids),
-                            "allowed_canonical_fields_by_blocker": (
-                                allowed_fields_by_blocker
-                            ),
-                            "actual_changed_contract_fields": list(
-                                revision_changed_fields
-                            ),
-                            "invalid_fix_map": deepcopy(
-                                revised_plan.get("fix_map") or {}
-                            ),
-                            "validation_errors": list(revision_fix_map_issues),
-                        },
-                        runtime_contract_snapshot=(
-                            frozen_policy["revision_runtime_contract_snapshot"]
-                            + "\n\nFix-map repair only. Return exactly one top-level "
-                            "fix_map object. Its keys must exactly equal the supplied "
-                            "OPEN blocker IDs. Each value must be a non-empty array of "
-                            "allowed canonical top-level fields that actually changed. "
-                            "Return no plan fields, nested paths, text, evidence, values, "
-                            "or metadata."
-                        ),
-                        schema_snapshot={
-                            "fix_map": deepcopy(
-                                frozen_policy["revision_prompt_schema_snapshot"].get(
-                                    "fix_map", {}
-                                )
-                            )
-                        },
-                    )
-                    revised_plan["fix_map"] = canonicalize_fix_map(
-                        (repair_payload or {}).get("fix_map"),
-                        field_registry=frozen_policy[
-                            "canonical_contract_field_registry"
-                        ],
-                        field_aliases=frozen_policy["contract_field_aliases"],
-                    )
-                    # Same truthfulness bound as the first pass: the repair's
-                    # fix_map must not claim fields that did not change.
-                    revised_plan["fix_map"] = {
-                        str(blocker_id): sorted(
-                            {
-                                str(field)
-                                for field in fields
-                                if str(field) in revision_material_changes
-                            }
-                        )
-                        for blocker_id, fields in revised_plan.get("fix_map", {}).items()
-                    }
-                    revision_fix_map_issues = fix_map_issues(
-                        revised_plan.get("fix_map"),
-                        open_blockers=open_blockers,
-                        changed_fields=revision_changed_fields,
-                        field_registry=frozen_policy[
-                            "canonical_contract_field_registry"
-                        ],
-                        field_aliases=frozen_policy["contract_field_aliases"],
-                    )
-                    if revision_fix_map_issues:
-                        raise ValueError(
-                            "MODEL_OUTPUT_VALIDATION_FAILURE:"
-                            + ";".join(revision_fix_map_issues)
-                        )
                 if dataset_profile:
                     revised_plan = self._bind_plan_to_dataset(revised_plan, dataset_profile)
                 revised_plan = self._attach_dataset_card(revised_plan, dataset_options)
@@ -6202,6 +6282,14 @@ class WorkflowEngine:
                     research_constraints_artifact_id=constraints_reference["artifact_id"],
                     research_constraints_reference=constraints_reference,
                 )
+                inherited_contract = plan.get("iteration_contract") or {}
+                if inherited_contract.get("implementation_reference"):
+                    revised_plan["iteration_contract"] = {
+                        **(revised_plan.get("iteration_contract") or {}),
+                        **{k: deepcopy(inherited_contract[k]) for k in
+                           ("implementation_reference", "source_result_ids", "feedback_iteration")
+                           if k in inherited_contract},
+                    }
                 revised_plan = self._synchronize_iteration_contract(revised_plan)
                 next_candidate = self.repository.add_artifact(
                     run_id,
@@ -7631,6 +7719,12 @@ class WorkflowEngine:
             },
             "context_policy": "compact_summaries_only_no_unbounded_artifact_injection",
         }
+        latest_feedback = latest.get("revision")
+        if latest_feedback and latest_feedback.content.get("research_context"):
+            result["iteration_context"] = {
+                k: deepcopy(latest_feedback.content.get(k)) for k in
+                ("research_context", "selected_direction", "scientific_synthesis", "implementation_reference")
+            }
         result["context_telemetry"] = context_telemetry(
             [("research_problem_summary", problem), ("literature", evidence),
              ("selected_hypothesis_digest", selected_digest), ("current_research_plan", plan)],

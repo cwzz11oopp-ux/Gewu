@@ -11,6 +11,11 @@ Identify the research object, desired outcome, constraints, available evidence, 
 Return a structured object with:
 
 - `problem_statement`: one falsifiable research problem.
+- `research_intent`: `kind` is `verification` for testing a specified claim or
+  `optimization` for improving a measurable outcome. Include `goal_quote`, an
+  exact short quote from the user's request, and a brief `reason`. Interpret a
+  normal research question; do not require the user to request multiple rounds.
+  Ambiguous intent defaults to verification. Never invent a performance goal.
 - `constraints`: explicit data, compute, time, deployment, and reporting limits.
 - `knowledge_gaps`: questions that require literature or experiment evidence.
 - `literature_queries`: 3–5 non-overlapping objects with `query`, `intent`, and

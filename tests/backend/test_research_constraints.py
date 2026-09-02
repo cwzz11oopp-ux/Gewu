@@ -26,3 +26,21 @@ def test_normalize_constraints_rejects_ambiguous_non_collection_values():
     with pytest.raises(ValueError, match="RESEARCH_CONSTRAINT_SEED_POLICY_INVALID"):
         normalize_constraints({"seed_policy": 3})
 
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "exactly 3 fixed paired seeds: 101, 202, 303",
+        "固定种子 101/202/303",
+    ],
+)
+def test_normalize_constraints_preserves_explicit_seeds_from_string_shorthand(
+    description,
+):
+    normalized = normalize_constraints({"seed_policy": description})
+
+    assert normalized["seed_policy"] == {
+        "description": description,
+        "seeds": [101, 202, 303],
+        "count": 3,
+    }

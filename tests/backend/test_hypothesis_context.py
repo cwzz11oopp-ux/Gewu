@@ -259,10 +259,10 @@ def test_first_sentence_extractor():
 
 def test_max_tokens_override_for_bounded_tasks():
     # Bounded-output tasks win over both no-cap and a global cap: hypothesis
-    # generation is kept tight (4000); full-plan regeneration is capped high
+    # generation has an expanded finite budget (12000); full-plan regeneration is capped high
     # enough to never truncate a real plan but stops runaway generation (30000).
-    assert _max_tokens_payload("hypothesis.generate", 0) == {"max_tokens": 4000}
-    assert _max_tokens_payload("hypothesis.generate", 3000) == {"max_tokens": 4000}
+    for global_cap in (0, 3000, 16000):
+        assert _max_tokens_payload("hypothesis.generate", global_cap) == {"max_tokens": 12000}
     assert _max_tokens_payload("planning.build_plan", 0) == {"max_tokens": 30000}
     assert _max_tokens_payload("planning.build_plan", 3000) == {"max_tokens": 30000}
     assert _max_tokens_payload("planning.revise_from_review", 0) == {"max_tokens": 30000}
@@ -272,6 +272,29 @@ def test_max_tokens_override_for_bounded_tasks():
     assert _max_tokens_payload("research.structure_problem", 3000) == {"max_tokens": 3000}
     assert _max_tokens_payload("critic.evidence_reasoning", 0) == {}
     assert _max_tokens_payload("critic.evidence_reasoning", 3000) == {"max_tokens": 3000}
+
+
+@pytest.mark.parametrize("global_cap", [0, 3000, 16000])
+def test_hypothesis_request_sends_expanded_output_cap(global_cap):
+    payload = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload.update(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"candidates": []}'}, "finish_reason": "stop"}],
+        })
+
+    settings = Settings.from_env({
+        "LLM_PROVIDER": "qwen",
+        "QWEN_API_KEY": "test-key",
+        "QWEN_MAX_TOKENS": str(global_cap),
+    })
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = QwenLLMProvider(settings, client=client)
+        provider.generate_json("hypothesis.generate", {}, {"candidates": "array"})
+
+    assert payload["max_tokens"] == 12000
+    assert payload["enable_thinking"] is False
 
 
 def test_compact_card_serialization_stays_small():

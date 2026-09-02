@@ -18,7 +18,7 @@ from backend.app.workflow.plan_contract import (
 REVIEW_SEVERITIES = frozenset({"BLOCKER", "WARNING", "SUGGESTION"})
 ISSUE_STATUSES = frozenset({"OPEN", "CLOSED", "REOPENED", "DEFERRED", "REJECTED"})
 POLICY_SCHEMA_VERSION = 3
-GOVERNANCE_IMPLEMENTATION_SEMANTIC_VERSION = "plan-review-governance-v4"
+GOVERNANCE_IMPLEMENTATION_SEMANTIC_VERSION = "plan-review-governance-v5"
 MIGRATION_SCHEMA_VERSION = 2
 RECOVERY_SCHEMA_VERSION = 1
 
@@ -617,6 +617,40 @@ def fix_map_issues(
     if required_ids and not material_changes:
         issues.append("PLAN_REVIEW_REVISION_NO_CONTRACT_CHANGE")
     return list(dict.fromkeys(issues))
+
+
+def deterministic_fix_map(
+    open_blockers: Iterable[Mapping[str, Any]],
+    *,
+    changed_fields: Iterable[str],
+    field_registry: Mapping[str, Any] | None = None,
+    field_aliases: Mapping[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Attribute a revision from the verified contract diff, not model prose.
+
+    ``fix_map`` is audit metadata. It should never require a second model call
+    merely to restate which top-level fields changed. For each still-open
+    blocker, retain only its authorized canonical fields that the engine
+    observed to change. A blocker with no such field is deliberately emitted
+    as an empty list so :func:`fix_map_issues` can reject the incomplete repair.
+    """
+    registry = dict(field_registry or CANONICAL_PLAN_CONTRACT_FIELDS)
+    aliases = dict(field_aliases or FIELD_ALIAS_TO_CANONICAL)
+    changed = set(_canonical_fields(changed_fields, registry, aliases))
+    result: dict[str, list[str]] = {}
+    for blocker in open_blockers:
+        if not isinstance(blocker, Mapping):
+            continue
+        issue_id = str(blocker.get("issue_id") or "").strip()
+        if not issue_id:
+            continue
+        allowed = set(
+            _canonical_fields(
+                blocker.get("contract_fields") or (), registry, aliases
+            )
+        )
+        result[issue_id] = sorted(allowed & changed)
+    return result
 
 
 def canonicalize_fix_map(

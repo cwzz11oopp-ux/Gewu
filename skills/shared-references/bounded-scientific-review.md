@@ -95,6 +95,7 @@ Maintain an append-only `plan_review_issue_ledger`.
 
 - Revision N receives the previous candidate plus all `OPEN` validated blockers and the ledger of `CLOSED` items.
 - The reviser must patch the smallest necessary fields and return a `fix_map` from each open blocker to changed Plan Contract fields.
+- A `CLAIM_PLAN_MISMATCH` has a transitive semantic closure: the revision schema may expose all claim-bearing and interpretive fields so the reviser can remove every occurrence of the same contradicted framing. Only fields actually changed enter `fix_map`; this does not authorize a wider claim or promote warnings into blockers.
 - A `CLOSED` issue stays closed unless policy-authorized regression or new evidence proves that the condition is active again.
 - Regression reopening requires changed affected fields, current-candidate evidence, and `reopen_basis=regression`; reviewer preference changes are not a valid basis.
 - Policy-authorized `new_evidence` reopening requires a source artifact newer than the prior review and recorded in chronology. A bare `closed_issue_ids` or repeated finding never changes ledger state.

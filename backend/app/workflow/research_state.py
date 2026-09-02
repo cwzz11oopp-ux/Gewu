@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from copy import deepcopy
 from typing import Any, Iterable
+from backend.app.workflow.serial_iteration import build_iteration_memory, prompt_memory
 
 
 # A research-state artifact is a snapshot of the ledger, not a scientific input.
@@ -197,8 +198,10 @@ def build_research_state(artifacts: Iterable[Any]) -> dict:
             "scope": experiment_scope,
         },
     ]
+    optimization = build_iteration_memory(values)
     return {
         "schema_version": 3,
+        **({"optimization": prompt_memory(optimization)} if optimization.get("enabled") else {}),
         "ledger_policy": {
             "coverage": "all_process_artifacts",
             "excluded_types": sorted(LEDGER_EXCLUDED_TYPES),

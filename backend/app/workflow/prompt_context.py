@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any
 
+from backend.app.workflow.literature_contract import literature_summary_text
 from backend.app.workflow.research_synthesis import stable_paper_id
 
 
@@ -21,6 +22,7 @@ class PromptContextBudget:
 def literature_card(card: dict[str, Any]) -> dict[str, Any]:
     identifiers = card.get("identifiers") or {}
     verified_identifier = identifiers.get("doi") or identifiers.get("arxiv") or ""
+    summary = literature_summary_text(card)
     return {
         "reference_id": f"doi:{identifiers['doi']}" if identifiers.get("doi") else (
             f"arxiv:{identifiers['arxiv']}" if identifiers.get("arxiv") else card.get("title", "")
@@ -31,8 +33,8 @@ def literature_card(card: dict[str, Any]) -> dict[str, Any]:
         "verified_identifier": str(verified_identifier),
         "intent": str(card.get("retrieval_intent") or "RELATED_APPLICATION"),
         "relevance": float(card.get("relevance") or 0.0),
-        "evidence_summary": str(card.get("abstract") or ""),
-        "claim": str(card.get("abstract") or ""),
+        "evidence_summary": summary,
+        "claim": summary,
         "url": str(card.get("url") or ""),
         "method_summary": "",
         "supports_or_limits": list(card.get("conflict_notes") or []),
@@ -248,7 +250,7 @@ def build_hypothesis_context(card: dict[str, Any], index: int = 0) -> dict[str, 
     rather than invented.  No LLM is called to fill them.  The card keeps its
     stable paper_id so downstream provenance still resolves.
     """
-    abstract = str(card.get("abstract") or "")
+    abstract = literature_summary_text(card)
     identifiers = card.get("identifiers") if isinstance(card.get("identifiers"), dict) else {}
     identifier = str(
         identifiers.get("doi") or identifiers.get("arxiv")

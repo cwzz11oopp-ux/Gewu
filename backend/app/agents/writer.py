@@ -7,6 +7,8 @@ from typing import Any
 
 from backend.app.providers.llm import LLMProvider
 from backend.app.report_visualization import build_report_spec
+from backend.app.workflow.literature_contract import literature_summary_text
+from backend.app.workflow.research_synthesis import stable_paper_id
 from backend.app.workflow.research_state import (
     active_plan_for_report,
     build_research_state,
@@ -120,6 +122,8 @@ HARD_AUDIT_CODES = frozenset(
         "cross_section_contradiction",
     }
 )
+
+PAPER_CITATION_PATTERN = re.compile(r"\bPAPER-[a-z0-9]+\b", re.IGNORECASE)
 
 NUMERIC_CLAIM_PATTERN = re.compile(
     r"(?<![\d.])(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
@@ -250,6 +254,7 @@ class ReportFactAuditError(ValueError):
         abstract: str,
         sections: list[dict],
         audit: dict,
+        facts: dict | None = None,
     ) -> None:
         codes = list(dict.fromkeys(item["code"] for item in failures))
         super().__init__("REPORT_FACT_AUDIT_FAILED:" + ",".join(codes))
@@ -259,6 +264,7 @@ class ReportFactAuditError(ValueError):
             "Paper Title": title,
             "Paper Abstract": abstract,
             "Narrative Sections": sections,
+            "Report Evidence": deepcopy(facts or {}),
             "Report Status": {
                 "complete": False,
                 "grounded_in_artifacts": False,
@@ -318,7 +324,6 @@ class WriterAgent:
             or hypothesis.get("claim")
             or "实验迭代与科学假设验证报告"
         )
-        selected_reference_tokens = list(outline.get("reference_selection") or [])
         section_plans = {
             str(item.get("id")): item
             for item in (outline.get("section_plans") or [])
@@ -383,19 +388,13 @@ class WriterAgent:
                     + "；".join(hard_issues)
                 )
             sections.append(section)
-            selected_reference_tokens.extend(section.get("citations") or [])
             previous_tail = self._section_tail(section)
 
         abstract_response = self.llm_provider.generate_json(
             "writer.report_abstract",
             {
                 "title": title,
-                "facts": {
-                    "research_question": facts["research_question"],
-                    "hypothesis": facts["hypothesis"],
-                    "final_result": facts["final_result"],
-                    "final_revision": facts["final_revision"],
-                },
+                "facts": facts,
                 "sections": sections,
             },
             {"abstract": "string", "keywords": ["string"]},
@@ -433,8 +432,11 @@ class WriterAgent:
                 "hard_failures只列出应用替换段落后仍无法解决的事实或证据问题；单个套话、段落偏短、"
                 "语言正式或可预测只能进入soft_style_issues，绝不能单独阻止导出。"
                 "每个hard_failure必须包含code、section_id、非负整数paragraph_index、claim、"
-                "source_path、source_fact和required_correction，其中source_path必须指向facts中的"
-                "现有字段。code只能是numeric_mismatch、unit_mismatch、"
+                "source_path、source_fact和required_correction，其中source_path必须指向facts中的现有字段。"
+                "paragraph_index统一从0开始；摘要用section_id=abstract、paragraph_index=0。"
+                "numeric_mismatch还须给出claimed_value，即claim中有争议的单个数值及其单位，"
+                "不能用同段其他指标的正确数字代替该数值。"
+                "code只能是numeric_mismatch、unit_mismatch、"
                 "fabricated_fact、fabricated_citation、verdict_inversion、scope_overreach、"
                 "unverified_reference、missing_core_section、internal_leak或"
                 "cross_section_contradiction；grounding、quality、style等笼统标签无效，"
@@ -464,6 +466,7 @@ class WriterAgent:
             audit.get("hard_failures"),
             facts=facts,
             sections=sections,
+            abstract=abstract,
         )
         if hard_failures:
             repair = self.llm_provider.generate_json(
@@ -488,71 +491,17 @@ class WriterAgent:
             )
             abstract, sections = self._apply_audit_revisions(abstract, sections, repair)
             self._ensure_sections_exportable(sections)
-            verification = self.llm_provider.generate_json(
-                "writer.verify_report_audit",
-                {
-                    "title": title,
-                    "abstract": abstract,
-                    "sections": sections,
-                    "facts": facts,
-                    "previous_hard_failures": hard_failures,
-                },
-                {"hard_failures": ["object"]},
-                instructions=(
-                    "复核修订稿中先前指出的事实问题是否仍然存在。只有能够同时提供合法code、"
-                    "section_id、paragraph_index、claim、source_path、source_fact和"
-                    "required_correction的"
-                    "未解决问题才可返回为hard_failures；grounding、quality、style等笼统标签无效。"
-                    "partial只是流程状态，不能脱离supported_claims、unsupported_claims和failed_criteria"
-                    "单独作为verdict_inversion的证据。"
-                    "按正文显示精度正确四舍五入的数值必须视为一致；派生差值必须引用对应的差值事实路径，"
-                    "不得用单个基线或实验组均值作为差值错误的唯一证据。"
-                    "比例事实x与100x%等价；绝对差值、标准差、标准误或置信区间宽度中的100x个百分点"
-                    "也等价。不要把等价换算或术语偏好重复列为hard_failure。"
-                    "p值不显著或置信区间包含零不能证明等效、无差异、无法提升或机制无效；没有预设"
-                    "等效界值与等效性检验时，必须保留‘未建立差异证据’这一边界。"
-                ),
-            )
-            hard_failures = self._validated_hard_failures(
-                verification.get("hard_failures"),
-                facts=facts,
-                sections=sections,
-            )
-            if hard_failures:
-                raise ReportFactAuditError(
-                    hard_failures,
-                    title=title,
-                    abstract=abstract,
-                    sections=sections,
-                    audit=verification,
-                )
         abstract, sections = self._repair_scientific_boundaries(
             title,
             abstract,
             sections,
             facts,
         )
-        references = self._select_references(
-            verified_references,
-            selected_reference_tokens,
-            [item for section in sections for item in section.get("citations") or []],
-            context=" ".join(
-                [
-                    title,
-                    self._clean_text(facts.get("research_question")),
-                    self._clean_text(
-                        (facts.get("hypothesis") or {}).get("claim")
-                        if isinstance(facts.get("hypothesis"), dict)
-                        else facts.get("hypothesis")
-                    ),
-                    self._clean_text(
-                        (facts.get("plan") or {}).get("objective")
-                        if isinstance(facts.get("plan"), dict)
-                        else ""
-                    ),
-                ]
-            ),
-        )
+        self._verify_report(title, abstract, sections, facts)
+        # The bibliography is a trace of the whole evidence search for this
+        # run, not only of the subset the narrative happened to cite.  Inline
+        # citations are still audited independently in ``_verify_report``.
+        references = self._all_exportable_references(verified_references)
 
         report = {
             "Report Title": title,
@@ -587,6 +536,7 @@ class WriterAgent:
                 "procedure": plan.get("procedure") or {},
             },
             "Results": result,
+            "Report Evidence": deepcopy(facts),
             "References": references,
             "Iteration Summary": iteration_summary,
             "Limitations": self._limitations(result, revision),
@@ -650,6 +600,9 @@ class WriterAgent:
             research_state,
             deterministic_evidence,
         )
+        # Continue from the same source snapshot that the reviewer saw.
+        if isinstance(report.get("Report Evidence"), dict):
+            facts = deepcopy(report["Report Evidence"])
         candidate = deepcopy(report)
         sections = deepcopy(candidate.get("Narrative Sections") or [])
         abstract = self._clean_text(candidate.get("Paper Abstract"))
@@ -669,19 +622,89 @@ class WriterAgent:
             instructions=(
                 "只修复blocking_issues直接指出的段落，不重写整篇报告。section_revisions中的每项"
                 "必须给出section_id、paragraph_index和replacement_paragraph；paragraph_index从0开始。"
+                "涉及引用时同时返回该节完整citations，只用facts.verified_references中的paper_id，"
+                "正文用[PAPER-...]标记；无法由来源原文支持的论点应删改，不得换一篇文献凑数。"
                 "除非问题明确涉及摘要，否则revised_abstract返回空字符串。保留所有真实数值、否定结果、"
                 "不确定性和适用边界，不得新增事实、实验、引用或图表，也不要解释修改过程。"
             ),
         )
         abstract, sections = self._apply_audit_revisions(abstract, sections, repaired)
         self._ensure_sections_exportable(sections)
+        abstract, sections = self._repair_scientific_boundaries(
+            str(candidate.get("Paper Title") or ""), abstract, sections, facts,
+        )
+        self._verify_report(str(candidate.get("Paper Title") or ""), abstract, sections, facts)
+        references = self._all_exportable_references(
+            facts.get("verified_references") or [],
+        )
         candidate["Paper Abstract"] = abstract
         candidate["Narrative Sections"] = sections
+        candidate["Report Evidence"] = deepcopy(facts)
+        candidate["References"] = references
+        candidate["Source"] = [item["title"] for item in references]
+        candidate.setdefault("Report Status", {})["verified_reference_count"] = len(references)
         if len(sections) > 1:
             candidate["Rationale"] = self._section_text(sections[1])
         if sections:
             candidate["Research Conclusion"] = self._section_text(sections[-1])
         return candidate
+
+    @staticmethod
+    def _report_citations(abstract: str, sections: list[dict]) -> list[str]:
+        citations = PAPER_CITATION_PATTERN.findall(abstract)
+        for section in sections:
+            citations.extend(str(item) for item in section.get("citations") or [])
+            paragraphs = list(section.get("paragraphs") or [])
+            for child in section.get("subsections") or []:
+                paragraphs.extend(child.get("paragraphs") or [])
+            for paragraph in paragraphs:
+                citations.extend(PAPER_CITATION_PATTERN.findall(str(paragraph)))
+        return list(dict.fromkeys(citations))
+
+    def _verify_report(self, title: str, abstract: str, sections: list[dict], facts: dict) -> None:
+        """One final gate for both newly written and repaired reports."""
+        references = facts.get("verified_references") or []
+        unresolved = [
+            token for token in self._report_citations(abstract, sections)
+            if len(self._select_references(references, [], [token])) != 1
+        ]
+        if unresolved:
+            failures = [{
+                "code": "unverified_reference", "section_id": "references",
+                "paragraph_index": 0, "claim": token,
+                "source_path": "verified_references", "source_fact": "本次已验证文献清单",
+                "required_correction": "引用必须唯一对应已有来源；无法支持的论点应删改，不得补造引用。",
+            } for token in unresolved]
+            raise ReportFactAuditError(
+                failures, title=title, abstract=abstract, sections=sections, audit={}, facts=facts,
+            )
+        verification = self.llm_provider.generate_json(
+            "writer.verify_report_audit",
+            {"title": title, "abstract": abstract, "sections": sections, "facts": facts},
+            {"hard_failures": ["object"]},
+            instructions=(
+                "核对最终正文和摘要的数值、单位、比较方向、检验方法、引用支持关系与结论边界。"
+                "仅使用同一份facts；实验统计以deterministic_result_evidence为准，计划不是已执行证据。"
+                "每个hard_failure给出code、section_id、从0开始的paragraph_index、claim、source_path、"
+                "source_fact、required_correction；摘要用abstract和0，子章节段落接在所属章节段落之后编号。"
+                "numeric_mismatch须给claimed_value（争议的单个数值及单位），不要拿同段其他数字代替。"
+                "按显示精度正确四舍五入不算错误；比例x与100x%等价，绝对差值或标准差可用百分点；"
+                "差值必须对应差值事实，不得用单侧均值判错。"
+                "每个引用不仅要存在，还必须由verified_references中available_text或abstract支持具体论点；"
+                "仅标题相关或元数据已验证不能证明论点。无法核实的断言必须删改或明确标为假设。"
+                "partial不是主张得到支持的证据；非显著或跨零区间不证明等效、无效或机制成立。"
+                "只列出有原文位置和事实依据的未解决问题，无问题返回hard_failures=[]。"
+            ),
+        )
+        if not isinstance(verification.get("hard_failures"), list):
+            raise ValueError("REPORT_AUDIT_INVALID:hard_failures_required")
+        failures = self._validated_hard_failures(
+            verification.get("hard_failures"), facts=facts, sections=sections, abstract=abstract,
+        )
+        if failures:
+            raise ReportFactAuditError(
+                failures, title=title, abstract=abstract, sections=sections, audit=verification, facts=facts,
+            )
 
     def _repair_scientific_boundaries(
         self,
@@ -724,11 +747,11 @@ class WriterAgent:
                     "只改写hard_failures点名的摘要或段落，并保持段落原有主题和可核对数值。"
                     "section_revisions必须给出section_id、从0开始的paragraph_index和完整"
                     "replacement_paragraph；摘要问题必须返回完整revised_abstract。"
-                    "配对t检验t(2)=1.721、p=0.227且95%置信区间包含零，只能表述为当前三个"
-                    "种子未建立显著提升或下降证据；点估计为+0.27个百分点，但不能据此证明等效、"
+                    "统计数值、样本量和检验方法只能来自facts.deterministic_result_evidence；"
+                    "缺失则明确未计算。非显著检验或跨零置信区间不能据此证明等效、"
                     "中性、无法提升、没有退化、预测方向被否定或某种机制成立。"
-                    "5 epoch只来自冻结实验计划的预设预算；没有独立收敛预实验，也没有持久化完整"
-                    "逐epoch曲线，因此不得声称5 epoch足以确保某组进入收敛阶段或可观察收敛滞后。"
+                    "训练预算只能读取facts.plan或实际结果；计划中的收敛理由不等于已执行的预实验。"
+                    "没有对应实测证据，不得声称训练预算确保收敛或观察到收敛滞后。"
                     "不要新增实验、引用、数值、因果解释或内部字段，也不要解释修订过程。"
                 ),
             )
@@ -776,14 +799,14 @@ class WriterAgent:
         """Remove only a still-invalid sentence and append restrained wording."""
         by_id = {str(item.get("id") or ""): item for item in sections}
         inferential_fallback = (
-            "当前三个随机种子的配对结果仅表明尚未建立总体方向性差异证据。"
+            "当前统计证据尚未建立总体方向性差异证据。"
             "点估计可以描述本次样本中的观测方向，但非显著检验结果及跨零置信区间不能证明"
             "两种方案等效、证明某种变化不存在，或认定某种作用机制已经成立；"
             "结论只适用于本次数据、模型和冻结训练预算。"
         )
         convergence_fallback = (
-            "本次5个Epoch来自冻结实验计划规定的训练预算；现有产物未包含独立收敛预实验"
-            "或完整逐Epoch曲线，因此不能据此判断任一组已经收敛、存在收敛滞后或发生欠训练。"
+            "冻结实验计划规定的训练预算本身不能证明收敛；判断收敛、收敛滞后或欠训练"
+            "需要对应的实测证据。"
         )
 
         for issue in issues:
@@ -836,6 +859,8 @@ class WriterAgent:
         facts: dict,
     ) -> list[dict]:
         inconclusive = cls._has_inconclusive_statistical_evidence(facts)
+        test = (facts.get("deterministic_result_evidence") or {}).get("paired_t_test") or {}
+        test_performed = test.get("status") == "computed" or isinstance(test.get("p_value"), (int, float))
         has_epoch_history = cls._has_epoch_history(facts)
         locations: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -889,7 +914,7 @@ class WriterAgent:
                         "非显著检验或跨零置信区间不能证明等效、中性、无提升/下降或机制成立；改为未建立方向性差异证据。",
                         rule_id,
                     )
-                if UNPERFORMED_TEST_PATTERN.search(paragraph):
+                if test_performed and UNPERFORMED_TEST_PATTERN.search(paragraph):
                     add_issue(
                         section_id,
                         index,
@@ -903,7 +928,7 @@ class WriterAgent:
                         section_id,
                         index,
                         paragraph,
-                        "5 epoch是冻结计划预算；没有收敛预实验或完整逐epoch曲线，不能声称该预算足以确保收敛或显现收敛滞后。",
+                        "冻结计划预算不是收敛预实验；缺少对应实测曲线时不能声称预算确保收敛或显现收敛滞后。",
                         "unobserved_convergence_claim",
                     )
 
@@ -939,7 +964,7 @@ class WriterAgent:
         evidence = facts.get("deterministic_result_evidence")
         if not isinstance(evidence, dict):
             return False
-        tests = []
+        tests = [evidence]
         direct = evidence.get("paired_t_test")
         if isinstance(direct, dict):
             tests.append(direct)
@@ -949,7 +974,8 @@ class WriterAgent:
         for test in tests:
             p_value = test.get("p_value")
             interval = test.get("confidence_interval_95")
-            if isinstance(p_value, (int, float)) and float(p_value) >= 0.05:
+            alpha = test.get("alpha", 0.05)
+            if isinstance(p_value, (int, float)) and isinstance(alpha, (int, float)) and p_value >= alpha:
                 return True
             if (
                 isinstance(interval, list)
@@ -967,6 +993,7 @@ class WriterAgent:
             "避免执行摘要、Source、Target等字段式章节，避免在多个章节重复同一结论。"
             "section_plans必须覆盖给定的八个章节ID，并说明每章承担的论证任务、所用证据和与前后章节的连接。"
             "reference_selection只选择与研究对象、方法或评价设计直接相关的已验证文献，不得凑数。"
+            "reference_selection填写facts.verified_references中的paper_id。"
             "图表由固定报告模板根据持久化数据自动选择，写作模型不得补造数值、曲线，"
             "也不得把工程修复解释为科学结果。"
         )
@@ -979,6 +1006,9 @@ class WriterAgent:
             f"正文应有{spec['paragraphs']}个有实质内容的中文段落，总长度不少于{spec['min_chars']}字。"
             "每段围绕一个中心意思展开，包含必要的事实、方法、数值或解释，并与相邻段自然衔接。"
             "不要使用条目堆砌结论，不要照抄artifact字段，不要输出路径、ID、哈希、英文状态值或审计内部字段。"
+            "引用除外：正文用[PAPER-...]引用facts.verified_references中已有paper_id，citations列出同样编号。"
+            "只能引用available_text或abstract确实支持的论点；不得用相关标题代替证据。"
+            "统计值、单位、比较方向与检验名称直接取facts.deterministic_result_evidence，缺失则写未计算。"
             "专业名称可保留英文，但整段论述必须使用中文。不能补造输入中不存在的事实。"
             "若双侧显著性检验不显著或置信区间包含零，只能写‘未建立显著差异/提升证据’；"
             "可以如实报告点估计方向，但不得写成统计等效、相同、无本质区别、证实无法提升、"
@@ -1083,25 +1113,35 @@ class WriterAgent:
         revised_abstract = cls._redact_reader_text(
             cls._clean_text(audit.get("revised_abstract"))
         )
-        if len(revised_abstract) >= 180:
+        if revised_abstract:
             abstract = revised_abstract
         by_id = {item["id"]: item for item in sections}
         for revision in audit.get("section_revisions") or []:
             if not isinstance(revision, dict):
                 continue
             section = by_id.get(str(revision.get("section_id") or ""))
+            if section is not None and isinstance(revision.get("citations"), list):
+                section["citations"] = [str(item) for item in revision["citations"]]
             paragraph_index = revision.get("paragraph_index")
             replacement_paragraph = cls._redact_reader_text(
                 cls._clean_text(revision.get("replacement_paragraph"))
             )
+            paragraph_slots = []
+            if section is not None:
+                for container in [section, *(section.get("subsections") or [])]:
+                    paragraph_slots.extend(
+                        (container["paragraphs"], index)
+                        for index in range(len(container.get("paragraphs") or []))
+                    )
             if (
                 section is not None
                 and isinstance(paragraph_index, int)
                 and not isinstance(paragraph_index, bool)
-                and 0 <= paragraph_index < len(section.get("paragraphs") or [])
+                and 0 <= paragraph_index < len(paragraph_slots)
                 and replacement_paragraph
             ):
-                section["paragraphs"][paragraph_index] = replacement_paragraph
+                paragraphs, index = paragraph_slots[paragraph_index]
+                paragraphs[index] = replacement_paragraph
                 continue
             replacements = [
                 cls._redact_reader_text(item)
@@ -1120,6 +1160,7 @@ class WriterAgent:
         *,
         facts: dict | None = None,
         sections: list[dict] | None = None,
+        abstract: str | None = None,
     ) -> list[dict]:
         failures = []
         for item in value if isinstance(value, list) else []:
@@ -1144,6 +1185,25 @@ class WriterAgent:
                 or paragraph_index < 0
             ):
                 continue
+            # A few provider responses put a correctly verified statement in
+            # ``hard_failures`` while their own correction explicitly says
+            # that no error exists.  Such a self-negating item cannot describe
+            # an unresolved hard failure and must not block report export.
+            normalized_correction = re.sub(r"\s+", "", correction).casefold()
+            if any(
+                phrase in normalized_correction
+                for phrase in (
+                    "原文表述正确",
+                    "数值匹配",
+                    "逻辑正确",
+                    "支持关系成立",
+                    "无错误",
+                    "无需修正",
+                    "noerror",
+                    "nomismatch",
+                )
+            ):
+                continue
             resolved_fact = (
                 resolve_fact_path(facts, source_path) if facts is not None else None
             )
@@ -1156,6 +1216,7 @@ class WriterAgent:
                     claim,
                     source_path,
                     resolved_fact,
+                    claimed_value=item.get("claimed_value"),
                 )
             ):
                 continue
@@ -1185,8 +1246,11 @@ class WriterAgent:
                 # must cite the supported/unsupported claim or failed criterion
                 # that the report actually contradicts.
                 continue
-            if sections is not None and not cls._failure_claim_exists(
-                sections, section_id, paragraph_index, claim
+            locations = list(sections or [])
+            if abstract is not None:
+                locations.append({"id": "abstract", "paragraphs": [abstract]})
+            if (sections is not None or abstract is not None) and not cls._failure_claim_exists(
+                locations, section_id, paragraph_index, claim
             ):
                 continue
             failures.append(
@@ -1198,6 +1262,7 @@ class WriterAgent:
                     "source_path": source_path,
                     "source_fact": source_fact,
                     "required_correction": correction,
+                    **({"claimed_value": item["claimed_value"]} if "claimed_value" in item else {}),
                 }
             )
         return failures
@@ -1232,6 +1297,8 @@ class WriterAgent:
         claim: str,
         source_path: str,
         resolved_fact: Any,
+        *,
+        claimed_value: Any = None,
     ) -> bool:
         """Reject audit-model false positives before they can block export.
 
@@ -1243,12 +1310,42 @@ class WriterAgent:
         """
         expected = cls._decimal_fact(resolved_fact)
         if expected is None:
-            # Preserve the existing behavior for non-scalar legacy evidence;
-            # numeric fact paths are handled deterministically below.
+            # Structured statistical facts are often cited as a whole.  A
+            # confidence interval is still mechanically verifiable when both
+            # displayed endpoints round to the saved endpoints.
+            if cls._claim_contains_rounded_interval(claim, resolved_fact):
+                return False
+            # Preserve the existing behavior for other non-scalar legacy
+            # evidence; scalar fact paths are handled deterministically below.
             return True
 
-        if cls._claim_contains_rounded_fact(claim, expected):
-            return False
+        normalize_sign = lambda text: re.sub(r"[−–—]|负(?=[\d.])", "-", text)
+        numeric_claim = normalize_sign(claim)
+        if claimed_value is not None:
+            token = normalize_sign(str(claimed_value).strip())
+            matches = [match.group(0).strip() for match in NUMERIC_CLAIM_PATTERN.finditer(numeric_claim)]
+            compact = lambda text: re.sub(r"\s+", "", text)
+            if not NUMERIC_CLAIM_PATTERN.fullmatch(token) or compact(token) not in {compact(text) for text in matches}:
+                return False  # An invented display value is not evidence of a mismatch.
+            numeric_claim = token
+        # Only a single identified value can exonerate a numeric claim. A correct
+        # baseline elsewhere in the paragraph must not hide an incorrect variant.
+        if len(list(NUMERIC_CLAIM_PATTERN.finditer(numeric_claim))) == 1:
+            if cls._claim_contains_rounded_fact(numeric_claim, expected):
+                return False
+            # Chinese report prose commonly presents a signed delta as an
+            # unsigned magnitude after an explicitly neutral phrase such as
+            # ``差值为``.  The compared levels carry the direction, while the
+            # displayed number answers "how large is the gap?".  Treat that as
+            # the same fact, but keep positively directional wording (for
+            # example ``提升``) blocking when the authoritative delta is
+            # negative.
+            if (
+                expected < 0
+                and cls._claim_contains_rounded_fact(numeric_claim, abs(expected))
+                and cls._negative_fact_is_expressed_as_magnitude(numeric_claim)
+            ):
+                return False
 
         normalized_claim = claim.casefold()
         normalized_path = source_path.casefold()
@@ -1260,6 +1357,38 @@ class WriterAgent:
         # the cited paragraph.  Otherwise there is nothing deterministic to
         # compare and the issue must not block export.
         return bool(NUMERIC_CLAIM_PATTERN.search(claim))
+
+    @staticmethod
+    def _negative_fact_is_expressed_as_magnitude(claim: str) -> bool:
+        normalized = re.sub(r"\s+", "", claim).casefold()
+        if any(term in normalized for term in ("提升", "增加", "高于", "上升", "改善", "增益")):
+            return False
+        return any(
+            term in normalized
+            for term in ("差值", "差距", "相差", "幅度", "下降", "降低", "低于", "减少")
+        )
+
+    @classmethod
+    def _claim_contains_rounded_interval(cls, claim: str, resolved_fact: Any) -> bool:
+        interval = resolved_fact
+        if isinstance(resolved_fact, dict):
+            interval = resolved_fact.get("confidence_interval_95")
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+            return False
+        expected = [cls._decimal_fact(value) for value in interval]
+        if any(value is None for value in expected):
+            return False
+
+        bracketed = re.search(r"[\[\uff3b\u3010]\s*(.*?)\s*[\]\uff3d\u3011]", claim)
+        if bracketed is None:
+            return False
+        displayed = [match.group(0).strip() for match in NUMERIC_CLAIM_PATTERN.finditer(bracketed.group(1))]
+        if len(displayed) != 2:
+            return False
+        return all(
+            cls._claim_contains_rounded_fact(token, endpoint)
+            for token, endpoint in zip(displayed, expected)
+        )
 
     @staticmethod
     def _decimal_fact(value: Any) -> Decimal | None:
@@ -1363,7 +1492,7 @@ class WriterAgent:
             paragraphs.extend(subsection.get("paragraphs") or [])
         if not paragraphs:
             return False
-        index = 0 if paragraph_index == 0 else paragraph_index - 1
+        index = paragraph_index
         if index < 0 or index >= len(paragraphs):
             return False
         normalized_claim = re.sub(r"[\s，。；：、“”‘’（）()]+", "", claim).lower()
@@ -1403,17 +1532,23 @@ class WriterAgent:
             "plan": cls._sanitize(plan),
             "iterations": cls._sanitize(iteration_summary),
             "final_result": cls._sanitize(result),
+            **({"optimization": cls._sanitize(research_state["optimization"])}
+               if research_state.get("optimization") else {}),
             "deterministic_result_evidence": cls._sanitize(
                 deterministic_evidence or {}
             ),
             "final_revision": cls._sanitize(revision),
             "verified_references": [
                 {
+                    "paper_id": item.get("paper_id") or stable_paper_id(item),
                     "title": item.get("title", ""),
                     "authors": item.get("authors") or [],
                     "year": item.get("year"),
                     "identifiers": item.get("identifiers") or {},
-                    "abstract": item.get("abstract") or item.get("summary") or "",
+                    "abstract": literature_summary_text(item),
+                    "available_text": item.get("available_text") or "",
+                    "url": item.get("url") or item.get("source_url") or "",
+                    "verified": item.get("verified") is True,
                     "relevance": item.get("relevance"),
                     "reliability": item.get("reliability"),
                 }
@@ -1568,7 +1703,7 @@ class WriterAgent:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                references.append(item)
+                references.append({**item, "paper_id": item.get("paper_id") or stable_paper_id(item)})
         return references
 
     @staticmethod
@@ -1588,56 +1723,31 @@ class WriterAgent:
         for reference in references:
             identifiers = reference.get("identifiers") if isinstance(reference.get("identifiers"), dict) else {}
             fields = [
+                str(reference.get("paper_id") or stable_paper_id(reference)).lower(),
                 str(reference.get("title") or "").lower(),
                 str(reference.get("url") or "").lower(),
                 str(identifiers.get("doi") or "").lower(),
                 str(identifiers.get("arxiv") or "").lower(),
             ]
             if requested and any(
-                request == field or request in field or field in request
+                request == field
                 for request in requested
                 for field in fields
                 if field
             ):
                 matched.append(reference)
-        if matched:
-            return matched[:10]
-        generic_tokens = {
-            "research", "experiment", "experimental", "result", "results", "data",
-            "model", "models", "neural", "network", "networks", "training", "testing",
-            "test", "accuracy", "method", "methods", "study", "learning",
-        }
-        context_tokens = set(re.findall(r"[a-z0-9]{3,}", context.lower())) - generic_tokens
-        lexical_matches = []
-        for reference in references:
-            haystack = " ".join(
-                [
-                    str(reference.get("title") or ""),
-                    str(reference.get("abstract") or reference.get("summary") or ""),
-                ]
-            ).lower()
-            overlap = len(context_tokens.intersection(re.findall(r"[a-z0-9]{3,}", haystack)))
-            if overlap:
-                lexical_matches.append((overlap, reference))
-        if lexical_matches:
-            lexical_matches.sort(
-                key=lambda item: (
-                    item[0],
-                    float(item[1].get("relevance") or 0),
-                    float(item[1].get("reliability") or 0),
-                ),
-                reverse=True,
-            )
-            return [item[1] for item in lexical_matches[:8]]
-        ranked = sorted(
-            references,
-            key=lambda item: (
-                float(item.get("relevance") or 0),
-                float(item.get("reliability") or 0),
-            ),
-            reverse=True,
-        )
-        return ranked[:5]
+        return matched
+
+    @staticmethod
+    def _all_exportable_references(references: list[dict]) -> list[dict]:
+        """Return every verified, de-duplicated source collected for this run.
+
+        ``_verified_references`` is the single evidence snapshot that already
+        filters unverified cards and assigns stable paper IDs.  Reusing its
+        order keeps Word, HTML, and paper-package exports reproducible while
+        making the final bibliography complete.
+        """
+        return list(references)
 
     @staticmethod
     def _iteration_summary(artifacts: list, result: dict, revision: dict) -> dict:

@@ -13,6 +13,9 @@ import re
 from collections import defaultdict
 from typing import Any
 
+from backend.app.workflow.literature_contract import literature_evidence_text
+from backend.app.workflow.research_synthesis import stable_paper_id
+
 
 EVIDENCE_TYPES = {
     "METHOD",
@@ -36,9 +39,7 @@ def extract_claim_evidence(papers: list[dict[str, Any]]) -> list[dict[str, Any]]
     for paper_index, paper in enumerate(papers):
         if not isinstance(paper, dict) or not paper.get("verified"):
             continue
-        text = str(
-            paper.get("available_text") or paper.get("abstract") or ""
-        ).strip()
+        text = literature_evidence_text(paper)
         if not text:
             continue
         paper_id = _paper_id(paper, paper_index)
@@ -168,9 +169,7 @@ def targeted_queries(candidate: dict[str, Any], evidence_map: dict[str, Any], cr
 
 
 def _paper_id(paper: dict[str, Any], index: int) -> str:
-    identifiers = paper.get("identifiers") or {}
-    stable = identifiers.get("doi") or identifiers.get("arxiv") or paper.get("url") or paper.get("title") or str(index)
-    return "PAPER-" + hashlib.sha256(str(stable).encode("utf-8")).hexdigest()[:12]
+    return stable_paper_id(paper, index)
 
 
 def _sentences(text: str) -> list[str]:

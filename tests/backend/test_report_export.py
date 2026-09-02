@@ -1,9 +1,11 @@
 import pytest
+from copy import deepcopy
 
 from backend.app.agents.writer import WriterAgent
 from backend.app.models.artifact import Artifact
 from backend.app.reporting import render_report_html
 from backend.app.workflow.policies import competition_export_allowed
+from backend.app.workflow.research_synthesis import stable_paper_id
 
 
 class ReportLLM:
@@ -17,7 +19,7 @@ class ReportLLM:
                 "central_question": "real problem",
                 "narrative_logic": "problem to result",
                 "section_plans": [],
-                "reference_selection": ["paper", "verified"],
+                "reference_selection": [item["paper_id"] for item in inputs["facts"]["verified_references"]],
                 "selected_figure_ids": ["research_workflow", "main_comparison", "workflow_timeline"],
                 "figure_rationale": "选择可由已保存研究事实直接支持的流程图、主要对比图和时间线。",
             }
@@ -33,7 +35,7 @@ class ReportLLM:
                     "本段承接前述分析并为下一章节提供必要背景，避免把同一结论拆分成多个简短判断重复陈述。" * 8,
                 ],
                 "subsections": [],
-                "citations": ["paper", "verified"],
+                "citations": [item["paper_id"] for item in inputs["facts"]["verified_references"]],
             }
         if task == "writer.report_abstract":
             return {
@@ -47,6 +49,8 @@ class ReportLLM:
                 "revised_abstract": "",
                 "section_revisions": [],
             }
+        if task == "writer.verify_report_audit":
+            return {"hard_failures": []}
         raise AssertionError(task)
 
 
@@ -75,7 +79,7 @@ class RepairableFactAuditLLM(ReportLLM):
         return {
             "code": "numeric_mismatch",
             "section_id": "results",
-            "paragraph_index": 1,
+            "paragraph_index": 0,
             "claim": "本段根据已经保存的研究事实说明问题",
             "source_path": "authoritative_research_state.canonical",
             "source_fact": "研究事实必须以权威状态表为准。",
@@ -130,6 +134,211 @@ def artifact(artifact_type: str, content: dict) -> Artifact:
         source_step=artifact_type,
         created_by="test",
     )
+
+
+class EvidenceRecorder(ReportLLM):
+    def __init__(self):
+        self.calls = []
+        self.repair = {"section_revisions": [], "revised_abstract": ""}
+        self.verification = {"hard_failures": []}
+
+    def generate_json(self, task, inputs, schema_hint, instructions=""):
+        self.calls.append((task, deepcopy(inputs), instructions))
+        if task == "writer.repair_supervisor_report":
+            return self.repair
+        if task == "writer.verify_report_audit":
+            return self.verification
+        return super().generate_json(task, inputs, schema_hint, instructions)
+
+
+def test_report_and_every_writer_stage_share_the_same_evidence_snapshot():
+    llm = EvidenceRecorder()
+    source = {"title": "Sea clutter", "verified": True, "identifiers": {"doi": "10.1/ABC"},
+              "abstract": "Measured sea clutter only.", "available_text": "A specific source passage."}
+    evidence = {"metric": "AUC", "mean_delta": -0.02689279047,
+                "paired_t_test": {"p_value": 0.06378557524, "status": "computed"}}
+    report = WriterAgent(llm).build_report([
+        artifact("evidence", {"references": [source]}), artifact("result_evidence", evidence),
+    ])
+    facts = report["Report Evidence"]
+    assert facts["deterministic_result_evidence"] == evidence
+    assert facts["verified_references"][0]["paper_id"] == stable_paper_id(source)
+    assert facts["verified_references"][0]["available_text"] == source["available_text"]
+    assert all(inputs["facts"] == facts for _, inputs, _ in llm.calls)
+    assert llm.calls[-1][0] == "writer.verify_report_audit"
+
+
+def test_repair_reuses_snapshot_refreshes_references_and_verifies_again():
+    llm = EvidenceRecorder()
+    refs = [{"title": name, "verified": True, "identifiers": {"doi": f"10.1/{name}"}}
+            for name in ("first", "second")]
+    report = WriterAgent(llm).build_report([artifact("evidence", {"references": refs})])
+    first_id, second_id = [stable_paper_id(item) for item in refs]
+    for section in report["Narrative Sections"]:
+        section["citations"] = []
+    report["Narrative Sections"][0]["citations"] = [first_id]
+    llm.repair = {"revised_abstract": "简短但完整的修订摘要。", "section_revisions": [{
+        "section_id": "background", "paragraph_index": 0,
+        "replacement_paragraph": f"来源仅支持这个论点[{second_id}]。" * 10,
+        "citations": [second_id],
+    }]}
+    repaired = WriterAgent(llm).repair_report(report, [artifact("result_evidence", {"p_value": 999})], ["修复引用"])
+    assert repaired["Report Evidence"] == report["Report Evidence"]
+    assert [item["paper_id"] for item in repaired["References"]] == [first_id, second_id]
+    assert repaired["Source"] == ["first", "second"]
+    assert repaired["Paper Abstract"] == "简短但完整的修订摘要。"
+    assert llm.calls[-1][0] == "writer.verify_report_audit"
+    assert llm.calls[-1][1]["sections"] == repaired["Narrative Sections"]
+    assert report["Narrative Sections"][0]["citations"] == [first_id]
+
+
+def test_unknown_inline_citation_is_blocked_even_if_citations_list_omits_it():
+    from backend.app.agents.writer import ReportFactAuditError
+    llm = EvidenceRecorder()
+    report = WriterAgent(llm).build_report([])
+    llm.repair = {"revised_abstract": "这个断言来自[PAPER-deadbeef1234]。"}
+    with pytest.raises(ReportFactAuditError, match="unverified_reference") as error:
+        WriterAgent(llm).repair_report(report, [], ["修改摘要"])
+    assert error.value.draft["Report Evidence"] == report["Report Evidence"]
+
+
+def test_reference_selection_is_exact_complete_and_never_substitutes_sources():
+    refs = [{"title": f"Sea clutter paper {index}", "identifiers": {"doi": f"10.1/{index}"}}
+            for index in range(16)]
+    ids = [stable_paper_id(item) for item in refs]
+    assert WriterAgent._select_references(refs, [], ids) == refs
+    assert WriterAgent._select_references(refs, [], ["Sea clutter"], context="Sea clutter") == []
+    assert WriterAgent._select_references(refs, [], ["PAPER-unknown"], context="Sea clutter") == []
+
+
+def test_abstract_and_second_paragraph_failures_are_not_dropped():
+    claim = "Variant AUC is 0.99."
+    failure = {"code": "numeric_mismatch", "section_id": "abstract", "paragraph_index": 0,
+               "claim": claim, "source_path": "final_result.metrics.auc", "source_fact": "0.8",
+               "required_correction": "Use 0.8."}
+    facts = {"final_result": {"metrics": {"auc": .8}}}
+    assert WriterAgent._validated_hard_failures([failure], facts=facts, sections=[], abstract=claim) == [failure]
+    sections = [{"id": "results", "paragraphs": ["first", claim]}]
+    failure.update(section_id="results", paragraph_index=1)
+    assert WriterAgent._validated_hard_failures([failure], facts=facts, sections=sections) == [failure]
+    _, repaired = WriterAgent._apply_audit_revisions("", sections, {"section_revisions": [{
+        "section_id": "results", "paragraph_index": 1, "replacement_paragraph": "Variant AUC is 0.8.",
+    }]})
+    assert repaired[0]["paragraphs"] == ["first", "Variant AUC is 0.8."]
+
+
+def test_subsection_repair_uses_the_same_flattened_zero_based_index():
+    sections = [{"id": "results", "paragraphs": ["first"],
+                 "subsections": [{"paragraphs": ["wrong"]}]}]
+    assert WriterAgent._failure_claim_exists(sections, "results", 1, "wrong")
+    _, repaired = WriterAgent._apply_audit_revisions("", sections, {"section_revisions": [{
+        "section_id": "results", "paragraph_index": 1, "replacement_paragraph": "correct",
+    }]})
+    assert repaired[0]["subsections"][0]["paragraphs"] == ["correct"]
+
+
+def test_numeric_audit_binds_the_disputed_value_not_another_matching_number():
+    claim = "baseline 0.80, variant 0.99"
+    assert WriterAgent._numeric_mismatch_is_evidenced(claim, "final_result.metrics.variant", .8)
+    assert WriterAgent._numeric_mismatch_is_evidenced(claim, "final_result.metrics.variant", .8, claimed_value="0.99")
+    assert not WriterAgent._numeric_mismatch_is_evidenced("AUC=0.8123", "final_result.metrics.auc", .812345, claimed_value="0.8123")
+    assert not WriterAgent._numeric_mismatch_is_evidenced(claim, "final_result.metrics.variant", .8, claimed_value="0.91")
+    assert WriterAgent._numeric_mismatch_is_evidenced("delta=−0.08", "mean_delta", -.1, claimed_value="-0.08")
+    assert not WriterAgent._numeric_mismatch_is_evidenced("差值为负0.1000", "mean_delta", -.10001, claimed_value="-0.1000")
+
+
+def test_numeric_audit_accepts_unsigned_magnitude_for_negative_delta():
+    claim = "差值仅为0.06个百分点"
+    delta = -0.0005666666666666043
+
+    assert not WriterAgent._numeric_mismatch_is_evidenced(
+        claim, "deterministic_result_evidence.paired_delta", delta
+    )
+    assert WriterAgent._numeric_mismatch_is_evidenced(
+        "提升幅度为0.06个百分点",
+        "deterministic_result_evidence.paired_delta",
+        delta,
+    )
+
+
+def test_numeric_audit_accepts_rounded_confidence_interval_from_structured_fact():
+    fact = {
+        "p_value": 0.09260712843783957,
+        "confidence_interval_95": [-0.0013652052178109286, 0.00023187188447772004],
+    }
+
+    assert not WriterAgent._numeric_mismatch_is_evidenced(
+        "双侧配对t检验的95%置信区间为[-0.14%, 0.02%]",
+        "deterministic_result_evidence.paired_t_test",
+        fact,
+    )
+    assert WriterAgent._numeric_mismatch_is_evidenced(
+        "95%置信区间为[-0.10%, 0.02%]",
+        "deterministic_result_evidence.paired_t_test",
+        fact,
+    )
+
+
+def test_self_negating_audit_item_cannot_block_export():
+    claim = "组合方法较基线仅下降零点零六个百分点"
+    failure = {
+        "code": "numeric_mismatch",
+        "section_id": "abstract",
+        "paragraph_index": 0,
+        "claim": claim,
+        "source_path": "deterministic_result_evidence.paired_delta",
+        "source_fact": "{'mean_delta': -0.0005666666666666043}",
+        "required_correction": "原文表述正确。无错误。",
+    }
+
+    assert WriterAgent._validated_hard_failures(
+        [failure],
+        facts={"deterministic_result_evidence": {"paired_delta": {"mean_delta": -0.0005666666666666043}}},
+        sections=[],
+        abstract=claim,
+    ) == []
+
+
+def test_malformed_final_audit_is_not_treated_as_acceptance():
+    llm = EvidenceRecorder()
+    llm.verification = {"ok": True}
+    with pytest.raises(ValueError, match="REPORT_AUDIT_INVALID"):
+        WriterAgent(llm).build_report([])
+
+
+def test_final_verification_checks_citation_support_not_only_identity():
+    llm = EvidenceRecorder()
+    ref = {"title": "Denoising", "verified": True, "abstract": "Denoising experiment only."}
+    report = WriterAgent(llm).build_report([artifact("evidence", {"references": [ref]})])
+    claim = "该论文证明海杂波具有重尾分布。"
+    llm.repair = {"revised_abstract": claim}
+    llm.verification = {"hard_failures": [{
+        "code": "fabricated_citation", "section_id": "abstract", "paragraph_index": 0,
+        "claim": claim, "source_path": "verified_references.0.abstract",
+        "source_fact": ref["abstract"], "required_correction": "来源不支持该论点，应删改。",
+    }]}
+    with pytest.raises(ValueError, match="fabricated_citation"):
+        WriterAgent(llm).repair_report(report, [], ["修改摘要"])
+    assert "不能证明论点" in llm.calls[-1][2]
+
+
+def test_scientific_boundary_repairs_do_not_inject_fixed_experiment_settings():
+    class BoundaryLLM(EvidenceRecorder):
+        def generate_json(self, task, inputs, schema_hint, instructions=""):
+            if task == "writer.repair_report_audit":
+                self.calls.append((task, deepcopy(inputs), instructions))
+                return {"section_revisions": []}
+            return super().generate_json(task, inputs, schema_hint, instructions)
+    llm = BoundaryLLM()
+    facts = {"plan": {"parameters": {"epochs": 50}, "seeds": [1, 2, 3, 4, 5]},
+             "final_result": {}, "deterministic_result_evidence": {"confidence_interval_95": [-.1, .2]}}
+    abstract, _ = WriterAgent(llm)._repair_scientific_boundaries(
+        "title", "50个Epoch足以使基线进入收敛阶段。结果呈现统计中性状态。", [], facts,
+    )
+    for token in ("1.721", "0.227", "+0.27", "5 epoch", "本次5个Epoch", "当前三个随机种子"):
+        assert token not in abstract
+        assert token not in llm.calls[0][2]
+    assert "未建立总体方向性差异证据" in abstract
 
 
 def test_report_has_all_competition_fields():
@@ -315,6 +524,7 @@ def test_numeric_audit_accepts_display_precision_rounding_and_requires_derived_p
             "section_id": "results",
             "paragraph_index": 0,
             "claim": rounded_claim,
+            "claimed_value": "0.0015",
             "source_path": "final_result.metric_summary.CCFE_ROC-AUC.std",
             "source_fact": "0.0014661747071507423",
             "required_correction": "修正标准差。",
@@ -448,7 +658,7 @@ def test_unit_audit_accepts_percentage_points_for_spread_but_not_metric_level():
         {
             "code": "unit_mismatch",
             "section_id": "results",
-            "paragraph_index": 2,
+            "paragraph_index": 1,
             "claim": level_claim,
             "source_path": "final_result.metric_summary.Baseline_Test_Accuracy.mean",
             "source_fact": "0.883",

@@ -222,6 +222,7 @@ def test_online_literature_search_reuses_configured_provider(tmp_path):
     assert payload["provider"] == "mock_literature"
     assert len(payload["results"]) == 2
     assert "claim" in payload["results"][0]
+    assert payload["results"][0]["claim"] == payload["results"][0]["abstract"]
 
 
 def test_duplicate_literature_upload_returns_409_with_existing_id(tmp_path):

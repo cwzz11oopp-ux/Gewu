@@ -13,6 +13,8 @@ import re
 from collections import defaultdict
 from typing import Any
 
+from backend.app.workflow.literature_contract import literature_evidence_text
+
 
 _FUTURE_WORK = (
     "future work", "future research", "future direction", "further work",
@@ -77,7 +79,7 @@ def build_research_synthesis(references: list[dict[str, Any]]) -> dict[str, Any]
         })
         theme["source_paper_ids"].append(paper_id)
 
-        source_text = _text(raw.get("available_text"), raw.get("abstract"), raw.get("summary"))
+        source_text = literature_evidence_text(raw)
         sentences = _sentences(source_text) or [title]
         for sentence_index, sentence in enumerate(sentences):
             if len(sentence) < 12:

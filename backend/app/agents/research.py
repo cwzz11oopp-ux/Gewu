@@ -13,6 +13,11 @@ class ResearchAgent:
             {"problem_input": problem_input},
             {
                 "problem_statement": "Chinese string",
+                "research_intent": {
+                    "kind": "verification|optimization. Classify the user's goal, not the number of experiments. Use optimization for an open goal to improve a measurable outcome; verification for testing a specified claim. Default to verification if ambiguous.",
+                    "goal_quote": "Exact short quote from problem_input supporting this classification; never invent a goal.",
+                    "reason": "Brief explanation in the user's language",
+                },
                 "constraints": ["Chinese string"],
                 "knowledge_gaps": ["Chinese string"],
                 "literature_queries": [

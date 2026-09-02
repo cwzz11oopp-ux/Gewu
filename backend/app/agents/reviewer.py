@@ -76,6 +76,12 @@ class ReviewerAgent:
                         if step_id == "evidence_reasoning"
                         else (
                             "For report_export, the later feedback_revision/final_revision is the "
+                            "claim-level authority. The candidate's Report Evidence contains the same "
+                            "source snapshot used by the writer: use its deterministic_result_evidence "
+                            "for statistics and verified_references for paper IDs and source passages. "
+                            "Do not declare evidence absent merely because it is not in the Wiki summary. "
+                            "A matching citation ID is necessary but the source passage must also support the claim. "
+                            "The later feedback_revision/final_revision is the "
                             "authoritative claim-level verdict when it conflicts with an earlier "
                             "experiment analysis label. Measured metrics remain authoritative. "
                             "Accept an honest negative or inconclusive conclusion when it reports "

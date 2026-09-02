@@ -11,12 +11,12 @@ from math import isfinite, sqrt
 from statistics import mean, median, stdev
 from typing import Any
 
-from backend.app.workflow.plan_contract import canonical_training_epochs
+from backend.app.workflow.plan_contract import execution_training_budget
 
 SUPPORTED_TASK_TYPES = {"classification", "forecasting", "anomaly_detection"}
 LOWER_IS_BETTER = (
     "loss", "mse", "mae", "rmse", "error", "mape", "confusion",
-    "misclassification",
+    "misclassification", "brier", "ece", "calibration error",
 )
 PROPORTION_METRICS = {"accuracy", "acc", "f1", "f1_score", "f1score", "auc", "roc_auc", "auroc", "pd", "probability_of_detection"}
 
@@ -153,7 +153,7 @@ def fair_experiment_contract(dataset: dict[str, Any], baseline: dict[str, Any], 
         )
         primary_metric_directions[metric] = metric_direction(
             metric,
-            constraints.get("primary_metric_direction")
+            constraints.get("primary_metric_direction") or matching_evaluation.get("direction")
             if metric == primary else matching_evaluation.get("direction"),
         )
     primary_direction = primary_metric_directions[primary]
@@ -165,11 +165,14 @@ def fair_experiment_contract(dataset: dict[str, Any], baseline: dict[str, Any], 
         or [7, 11]
     )
     if isinstance(seeds, int): seeds = [seeds]
-    epochs = canonical_training_epochs(plan)
-    if epochs is None:
+    training_budget = execution_training_budget(plan)
+    if training_budget is None:
         raise ValueError("MODEL_PLANNED_TRAINING_EPOCHS_REQUIRED")
+    runtime_passes = int(
+        training_budget.get("epochs") or training_budget["runtime_passes"]
+    )
     preprocessing = constraints.get("preprocessing") or plan.get("preprocessing") or {}
-    return {"schema_version": 1, "dataset_contract_id": dataset.get("contract_id", ""), "split": deepcopy((dataset.get("task_profile") or {}).get("split") or {}), "preprocessing": deepcopy(preprocessing), "primary_metric": primary, "primary_metric_direction": primary_direction, "primary_metrics": primary_metrics, "primary_metric_directions": primary_metric_directions, "secondary_metrics": list(secondary), "seeds": list(seeds), "epochs": epochs, "training_config": deepcopy(baseline.get("training_config") or {}), "statistical_summary": deepcopy(plan.get("statistical_summary") or {}), "evaluation_protocol": {"same_seed_pairing": True, "same_baseline": baseline.get("name"), "task_type": (dataset.get("task_profile") or {}).get("task_type")}, "baseline": baseline.get("name"), "frozen": True}
+    return {"schema_version": 1, "dataset_contract_id": dataset.get("contract_id", ""), "split": deepcopy((dataset.get("task_profile") or {}).get("split") or {}), "preprocessing": deepcopy(preprocessing), "primary_metric": primary, "primary_metric_direction": primary_direction, "primary_metrics": primary_metrics, "primary_metric_directions": primary_metric_directions, "secondary_metrics": list(secondary), "seeds": list(seeds), "epochs": runtime_passes, "training_budget": training_budget, "training_config": deepcopy(baseline.get("training_config") or {}), "statistical_summary": deepcopy(plan.get("statistical_summary") or {}), "evaluation_protocol": {"same_seed_pairing": True, "same_baseline": baseline.get("name"), "task_type": (dataset.get("task_profile") or {}).get("task_type")}, "baseline": baseline.get("name"), "frozen": True}
 
 
 def progressive_protocol(contract: dict[str, Any], stage: str) -> dict[str, Any]:
@@ -319,7 +322,7 @@ def _paired_t_test(deltas: list[float]) -> tuple[dict[str, Any], list[float]]:
             **unavailable,
             "status": "degenerate_zero_variance",
             "reason": "ALL_PAIRED_DIFFERENCES_IDENTICAL",
-        }, [delta_mean, delta_mean]
+        }, []
 
     statistic = delta_mean / standard_error
     try:
@@ -363,6 +366,10 @@ def result_evidence(baseline_seed_metrics: dict[int, float], idea_seed_metrics: 
         return {"schema_version": 1, "metric": metric, "status": "not_comparable", "reason": "PAIRED_SEEDS_REQUIRED", "route": "engineering_diagnosis", "paired_t_test": {"method": "paired_t_test", "status": "unavailable", "reason": "PAIRED_SEEDS_REQUIRED", "n_pairs": 0}}
     baseline = [float(baseline_seed_metrics[seed]) for seed in shared]
     idea = [float(idea_seed_metrics[seed]) for seed in shared]
+    if set(baseline_seed_metrics) != set(idea_seed_metrics) or not all(isfinite(value) for value in baseline + idea):
+        return {"schema_version": 1, "metric": metric, "status": "not_comparable",
+                "reason": "COMPLETE_FINITE_PAIRED_METRICS_REQUIRED", "route": "engineering_diagnosis",
+                "paired_t_test": {"method": "paired_t_test", "status": "unavailable"}}
     orient = 1.0 if metric_direction(metric, direction) == "maximize" else -1.0
     deltas = [orient * (candidate - control) for control, candidate in zip(baseline, idea)]
     delta_mean = mean(deltas)
@@ -370,16 +377,18 @@ def result_evidence(baseline_seed_metrics: dict[int, float], idea_seed_metrics: 
     paired_test, ci = _paired_t_test(deltas)
     paired_test["metric"] = metric
     paired_test["paired_seed_ids"] = shared
-    if not ci:
-        se = delta_std / sqrt(len(deltas)) if deltas else 0.0
-        ci = [delta_mean - 1.96 * se, delta_mean + 1.96 * se]
     pooled = sqrt(((stdev(baseline) if len(baseline) > 1 else 0.0) ** 2 + (stdev(idea) if len(idea) > 1 else 0.0) ** 2) / 2)
-    effect = delta_mean / pooled if pooled > 1e-12 else (0.0 if abs(delta_mean) < 1e-12 else float("inf"))
+    effect = delta_mean / pooled if pooled > 1e-12 else None
     noise = max(delta_std, pooled)
     positive = sum(value > 0 for value in deltas)
-    status = "positive_stable" if delta_mean > 0 and ci[0] > 0 and positive / len(deltas) >= 0.75 else "inconclusive" if abs(delta_mean) <= max(noise, 1e-12) or ci[0] <= 0 <= ci[1] else "negative"
+    status = "inconclusive"
+    if paired_test.get("status") == "computed" and ci:
+        if ci[0] > 0 and positive / len(deltas) >= 0.75:
+            status = "positive_stable"
+        elif ci[1] < 0:
+            status = "negative"
     route = {"positive_stable": "expand_validation", "inconclusive": "add_seeds", "negative": "scientific_review"}[status]
-    return {"schema_version": 1, "metric": metric, "direction": metric_direction(metric, direction), "paired_seeds": shared, "baseline": {"mean": mean(baseline), "std": stdev(baseline) if len(baseline) > 1 else 0.0}, "idea": {"mean": mean(idea), "std": stdev(idea) if len(idea) > 1 else 0.0}, "paired_delta": {str(seed): delta for seed, delta in zip(shared, deltas)}, "mean_delta": delta_mean, "median_delta": median(deltas), "delta_std": delta_std, "positive_direction_count": positive, "positive_direction_ratio": positive / len(deltas), "confidence_interval_95": ci, "confidence_interval_method": "student_t" if paired_test.get("status") == "computed" else "normal_approximation", "paired_t_test": paired_test, "effect_size": effect, "noise_magnitude": noise, "status": status, "route": route}
+    return {"schema_version": 1, "metric": metric, "direction": metric_direction(metric, direction), "paired_seeds": shared, "baseline": {"mean": mean(baseline), "std": stdev(baseline) if len(baseline) > 1 else 0.0}, "idea": {"mean": mean(idea), "std": stdev(idea) if len(idea) > 1 else 0.0}, "paired_delta": {str(seed): delta for seed, delta in zip(shared, deltas)}, "mean_delta": delta_mean, "median_delta": median(deltas), "delta_std": delta_std, "positive_direction_count": positive, "positive_direction_ratio": positive / len(deltas), "confidence_interval_95": ci, "confidence_interval_method": "student_t" if paired_test.get("status") == "computed" else "unavailable", "paired_t_test": paired_test, "effect_size": effect, "noise_magnitude": noise, "status": status, "route": route}
 
 
 def route_result(evidence: dict[str, Any], *, anomalies: list[str] | None = None, seed_limit_reached: bool = False) -> str:

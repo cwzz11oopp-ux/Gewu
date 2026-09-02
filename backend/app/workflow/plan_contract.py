@@ -30,13 +30,13 @@ CANONICAL_PLAN_CONTRACT_FIELDS = {
     "parameters": "Training budget, optimizer, and other fixed parameters.",
     "seeds": "Preregistered random seeds and seed policy.",
     "statistical_summary": "Aggregation, uncertainty, and statistical interpretation.",
-    "success_criteria": "Conditions that support the scoped primary claim.",
-    "failure_criteria": "Conditions that refute or limit the scoped primary claim.",
+    "success_criteria": "Conditions that support every required endpoint of the scoped primary claim, including preregistered minimum meaningful effects.",
+    "failure_criteria": "Conditions that refute or limit any required endpoint of the scoped primary claim without leaving an undecided outcome gap.",
     "expected_artifacts": "Durable outputs required to audit the experiment.",
-    "stop_conditions": "Early-stop and execution-blocking conditions.",
+    "stop_conditions": "Early-stop, validation no-improvement rollback, iteration-budget, and execution-blocking conditions.",
     "primary_experiment": "The smallest primary experiment that tests the claim.",
     "optional_ablations": "Optional diagnostics kept outside the primary inference.",
-    "traceability": "Claim-to-mechanism-to-metric decision traceability.",
+    "traceability": "Claim-to-mechanism-to-every-required-metric decision traceability.",
     "resources": "Frozen compute, time, data, and runtime constraints.",
     "risks": "Known scientific and execution risks with boundaries.",
     "additional_sections": "Explicit supplementary design fields that do not fit another canonical field.",
@@ -49,7 +49,7 @@ CANONICAL_PLAN_CONTRACT_FIELDS = {
     "feasibility_risks": "Feasibility risks and their mitigations.",
     "staged_gates": "Static, overfit, smoke, pilot, and formal execution gates.",
     "formal_experiment_entry_conditions": "Conditions required before formal execution.",
-    "positive_negative_inconclusive_rules": "Preregistered outcome interpretation rules.",
+    "positive_negative_inconclusive_rules": "Exhaustive preregistered multi-endpoint positive, negative, mixed, and uncertainty interpretation rules.",
     "remaining_unknowns": "Unknowns retained without silently becoming blockers.",
     "capacity_confounder": "Capacity confounder, control strategy, and justified claim boundary.",
     "local_dataset_loader_verification": "Loader verification procedure and failure policy.",
@@ -240,6 +240,55 @@ def canonical_training_epochs(plan: object) -> int | None:
     if numeric != epochs or epochs < 1 or epochs > 100_000:
         raise ValueError("PLAN_TRAINING_EPOCHS_INVALID")
     return epochs
+
+
+def execution_training_budget(plan: object) -> dict[str, int | str] | None:
+    """Return an executable budget without inventing epoch-loop semantics.
+
+    Epoch-trained methods must declare ``parameters.epochs``.  A converged
+    Single-fit sklearn estimators such as LogisticRegression and SVC instead
+    have an iteration cap (``max_iter``), so they get a ``single_fit`` contract
+    and one runtime pass without claiming that the estimator runs an epoch loop.
+    """
+    epochs = canonical_training_epochs(plan)
+    if epochs is not None:
+        return {"mode": "epochs", "epochs": epochs}
+
+    candidate = _as_dict(plan)
+    parameters = _as_dict(candidate.get("parameters"))
+    max_iter = _positive_int(parameters.get("max_iter"))
+    method_text = " ".join(_strings(candidate.get("method"))).casefold()
+    compact_method = method_text.replace(" ", "")
+    single_fit_method = any(
+        name in compact_method
+        for name in ("logisticregression", "linearsvc", "svc", "supportvectormachine", "svm")
+    )
+    if max_iter and single_fit_method:
+        return {
+            "mode": "single_fit",
+            "fit_count": 1,
+            "max_iter": max_iter,
+            "runtime_passes": 1,
+        }
+    return None
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number > 0 else None
+
+
+def _strings(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [str(item) for item in value.values()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value]
+    return [str(value or "")]
 
 
 def _as_list(value: object) -> list:

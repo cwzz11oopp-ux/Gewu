@@ -1,13 +1,17 @@
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
 
 from backend.app.config import Settings
 from backend.app.providers.llm import (
+    DeepSeekLLMProvider,
     LLMRequestCancelled,
+    ModelRoleRouter,
     MockLLMProvider,
     QwenLLMProvider,
+    _ConfiguredProvider,
     get_llm_provider,
     normalize_task_output_shape,
 )
@@ -121,8 +125,8 @@ def test_qwen_llm_routes_tasks_to_reasoning_general_code_and_fast_models():
         "code-model",
     ]
     assert payloads[0]["enable_thinking"] is False
-    assert payloads[1]["enable_thinking"] is True
-    assert "enable_thinking" not in payloads[2]
+    assert payloads[1]["enable_thinking"] is False
+    assert payloads[2]["enable_thinking"] is False
 
 
 def test_qwen_llm_falls_back_within_the_same_task_route_and_records_it():
@@ -159,7 +163,7 @@ def test_qwen_llm_falls_back_within_the_same_task_route_and_records_it():
         "model_route": "reasoning",
         "model_fallback_used": True,
         "model_fallback_reason": "reasoning-model:http_429",
-        "thinking_enabled": True,
+        "thinking_enabled": False,
         "json_repaired": False,
         "shape_normalized": False,
     }
@@ -317,6 +321,75 @@ def test_qwen_llm_labels_an_empty_structured_response_as_recoverable_output_fail
 
     with pytest.raises(ValueError, match="MODEL_EMPTY_OUTPUT:provider=qwen"):
         provider.generate_json("research", {}, {})
+
+
+def test_deepseek_uses_its_documented_thinking_parameter_and_json_example():
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    provider = DeepSeekLLMProvider(
+        Settings.from_env({"DEEPSEEK_API_KEY": "key", "DEEPSEEK_MODEL": "deepseek-v4-flash"}),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    provider.generate_json("critic.review_result", {}, {})
+
+    payload = payloads[0]
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "enable_thinking" not in payload
+    assert "for example" in payload["messages"][0]["content"]
+
+
+def test_router_falls_back_to_qwen_when_deepseek_feedback_json_is_empty():
+    deepseek_requests = []
+    qwen_requests = []
+
+    def deepseek_handler(request: httpx.Request) -> httpx.Response:
+        deepseek_requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]
+        })
+
+    def qwen_handler(request: httpx.Request) -> httpx.Response:
+        qwen_requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"verdict":"supported","decision":"REPORT"}'}}]
+        })
+
+    settings = Settings.from_env({"QWEN_API_KEY": "key", "QWEN_RETRIES_PER_MODEL": "0"})
+    deepseek = _ConfiguredProvider(
+        replace(settings, qwen_api_key="deepseek-key", qwen_model="deepseek-v4-flash"),
+        "deepseek",
+        client=httpx.Client(transport=httpx.MockTransport(deepseek_handler)),
+    )
+    qwen = QwenLLMProvider(
+        replace(settings, qwen_model="qwen3.7-plus"),
+        client=httpx.Client(transport=httpx.MockTransport(qwen_handler)),
+    )
+    qwen.mode = "provider_4"
+    routed = replace(settings, model_role_assignments={
+        "CRITIC": {"provider_id": "deepseek", "model": "deepseek-v4-flash"}
+    })
+    router = ModelRoleRouter(
+        routed,
+        {
+            ("deepseek", "deepseek-v4-flash"): deepseek,
+            ("provider_4", "qwen3.7-plus"): qwen,
+        },
+    )
+
+    result = router.generate_json("critic.review_result", {}, {})
+
+    assert result["verdict"] == "supported"
+    assert result["deepseek_empty_output_fallback"] is True
+    assert len(deepseek_requests) == 1
+    assert deepseek_requests[0]["thinking"] == {"type": "disabled"}
+    assert "enable_thinking" not in deepseek_requests[0]
+    assert len(qwen_requests) == 1
+    assert router.consume_call_metadata()["provider_fallback_used"] is True
 
 
 def test_qwen_llm_wraps_timeouts_in_actionable_error():

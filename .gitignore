@@ -52,6 +52,32 @@ docs/superpowers/specs/2026-07-06-ai-scientist-local-loop-design.md
 .superpowers/
 .worktrees/
 
+# Local report production and visual QA output (not source artifacts).
+.codex_tmp/
+.codex-report-review-*/
+.qa/
+.work/
+design-audit/
+design-qa/
+historical_reports_export_*/
+附件案例材料_评委版/
+作品提交/
+*.docx
+*.pdf
+
+# Local run snapshots and one-off forensic exports.
+*_state.json
+new_run*.json
+run*_state.json
+start*.json
+roles.json
+engine_current.py
+experiment_current.py
+OBSERVED_STRUCTURE_CHANGE.diff
+*_REPORT.md
+*_LOG.md
+skills*.zip
+
 # Generated forensic packages and historical experiment evidence.
 forensics/
 ROUND5_GPT_REVIEW_PACKAGE/
